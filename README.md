@@ -17,7 +17,7 @@ xedoc is a single React Router Framework Mode app, built with Vite, for managing
 The easiest local install is the npm CLI:
 
 ```bash
-npx xedoc
+npx xedoc-cli
 ```
 
 By default the CLI creates a SQLite database under the workspace root at
