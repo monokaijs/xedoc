@@ -1,0 +1,159 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:../.xedoc/xedoc.db"
+}
+
+enum AccountStatus {
+  DISCONNECTED
+  AUTHENTICATING
+  CONNECTED
+  ERROR
+}
+
+enum ChatStatus {
+  IDLE
+  RUNNING
+  ARCHIVED
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+  TOOL
+}
+
+enum MessageStatus {
+  PENDING
+  STREAMING
+  COMPLETED
+  FAILED
+}
+
+enum MessageKind {
+  CHAT
+  THINKING
+  TOOL_ACTIVITY
+  COMMAND_EXECUTION
+  FILE_CHANGE
+  PLAN
+  APPROVAL
+  USER_INPUT_PROMPT
+  ERROR
+}
+
+enum RunStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model ServerAuth {
+  id           String   @id @default("server")
+  passwordHash String
+  tokenSecret  String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model CodexAccount {
+  id          String        @id @default(uuid())
+  displayName String
+  status      AccountStatus @default(DISCONNECTED)
+  command     String        @default("codex")
+  args        Json          @default("[\"app-server\"]")
+  environment Json?
+  defaultModel String?
+  defaultPermissionMode String?
+  defaultReasoningEffort String?
+  defaultServiceTier String?
+  lastAuthUrl String?
+  lastAuthMode String?
+  lastAuthLoginId String?
+  lastAuthUserCode String?
+  lastError   String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  chats       Chat[]
+  runs        ChatRun[]
+}
+
+model Chat {
+  id                String        @id @default(uuid())
+  accountId         String?
+  autoRotateAccount Boolean       @default(false)
+  title             String
+  workingDirectory  String?
+  model             String?
+  reasoningEffort   String?
+  serviceTier       String?
+  collaborationMode String        @default("default")
+  permissionMode    String        @default("default")
+  status            ChatStatus    @default(IDLE)
+  externalThreadId  String?
+  lastActivityAt    DateTime      @default(now())
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  account           CodexAccount? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  messages          ChatMessage[]
+  runs              ChatRun[]
+
+  @@index([updatedAt])
+  @@index([lastActivityAt])
+  @@index([accountId])
+}
+
+model ChatMessage {
+  id          String        @id @default(uuid())
+  chatId      String
+  runId       String?
+  sequence    Int
+  role        MessageRole
+  kind        MessageKind   @default(CHAT)
+  status      MessageStatus @default(COMPLETED)
+  turnId      String?
+  itemId      String?
+  requestId   String?
+  content     String
+  metadata    Json?
+  rawPayload  Json?
+  createdAt   DateTime      @default(now())
+  completedAt DateTime?
+  chat        Chat          @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  run         ChatRun?      @relation(fields: [runId], references: [id], onDelete: SetNull)
+
+  @@unique([chatId, sequence])
+  @@index([chatId, sequence])
+  @@index([chatId, turnId])
+  @@index([chatId, itemId])
+  @@index([requestId])
+  @@index([runId])
+}
+
+model ChatRun {
+  id        String        @id @default(uuid())
+  chatId    String
+  accountId String
+  status    RunStatus     @default(QUEUED)
+  request   Json
+  error     String?
+  externalTurnId String?
+  interruptRequestedAt DateTime?
+  startedAt DateTime?
+  endedAt   DateTime?
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  chat      Chat          @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  account   CodexAccount  @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  messages  ChatMessage[]
+
+  @@index([chatId, createdAt])
+  @@index([accountId])
+  @@index([externalTurnId])
+}
