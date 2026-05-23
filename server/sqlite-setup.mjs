@@ -26,6 +26,7 @@ export async function setupSqliteDatabase() {
         }
       }
     }
+    await migrateLegacyChatPreferences(prisma)
   } finally {
     await prisma.$disconnect()
   }
@@ -228,6 +229,65 @@ function createChatTable(tableName) {
       )`
 }
 
+function createThreadPreferenceTable(tableName) {
+  return `CREATE TABLE IF NOT EXISTS "${tableName}" (
+        "threadId" TEXT NOT NULL PRIMARY KEY,
+        "accountId" TEXT,
+        "autoRotateAccount" BOOLEAN NOT NULL DEFAULT false,
+        "title" TEXT,
+        "workingDirectory" TEXT,
+        "model" TEXT,
+        "reasoningEffort" TEXT,
+        "serviceTier" TEXT,
+        "collaborationMode" TEXT NOT NULL DEFAULT 'default',
+        "permissionMode" TEXT NOT NULL DEFAULT 'default',
+        "archivedAt" DATETIME,
+        "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        "updatedAt" DATETIME NOT NULL,
+        CONSTRAINT "${tableName}_accountId_fkey" FOREIGN KEY ("accountId") REFERENCES "CodexAccount" ("id") ON DELETE SET NULL ON UPDATE CASCADE
+      )`
+}
+
+async function migrateLegacyChatPreferences(prisma) {
+  try {
+    await prisma.$executeRawUnsafe(`
+      INSERT OR IGNORE INTO "ThreadPreference" (
+        "threadId",
+        "accountId",
+        "autoRotateAccount",
+        "title",
+        "workingDirectory",
+        "model",
+        "reasoningEffort",
+        "serviceTier",
+        "collaborationMode",
+        "permissionMode",
+        "archivedAt",
+        "createdAt",
+        "updatedAt"
+      )
+      SELECT
+        "externalThreadId",
+        "accountId",
+        "autoRotateAccount",
+        "title",
+        "workingDirectory",
+        "model",
+        "reasoningEffort",
+        "serviceTier",
+        "collaborationMode",
+        "permissionMode",
+        CASE WHEN "status" = 'ARCHIVED' THEN "updatedAt" ELSE NULL END,
+        "createdAt",
+        "updatedAt"
+      FROM "Chat"
+      WHERE "externalThreadId" IS NOT NULL AND TRIM("externalThreadId") != ''
+    `)
+  } catch {
+    // Fresh installs or heavily customized old databases may not have legacy Chat rows.
+  }
+}
+
 const schemaStatements = [
   `CREATE TABLE IF NOT EXISTS "ServerAuth" (
         "id" TEXT NOT NULL PRIMARY KEY DEFAULT 'server',
@@ -238,6 +298,7 @@ const schemaStatements = [
       )`,
   createCodexAccountTable("CodexAccount"),
   createChatTable("Chat"),
+  createThreadPreferenceTable("ThreadPreference"),
   `CREATE TABLE IF NOT EXISTS "ChatMessage" (
         "id" TEXT NOT NULL PRIMARY KEY,
         "chatId" TEXT NOT NULL,
@@ -293,4 +354,6 @@ const schemaStatements = [
   'CREATE INDEX IF NOT EXISTS "ChatRun_chatId_createdAt_idx" ON "ChatRun"("chatId", "createdAt")',
   'CREATE INDEX IF NOT EXISTS "ChatRun_accountId_idx" ON "ChatRun"("accountId")',
   'CREATE INDEX IF NOT EXISTS "ChatRun_externalTurnId_idx" ON "ChatRun"("externalTurnId")',
+  'CREATE INDEX IF NOT EXISTS "ThreadPreference_accountId_idx" ON "ThreadPreference"("accountId")',
+  'CREATE INDEX IF NOT EXISTS "ThreadPreference_archivedAt_idx" ON "ThreadPreference"("archivedAt")',
 ]

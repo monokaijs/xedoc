@@ -22,6 +22,7 @@ function statusBadgeVariant(status: Status): BadgeVariant {
   switch (status) {
     case "ERROR":
     case "FAILED":
+    case "INVALIDATED":
     case "OFFLINE":
       return "destructive"
     case "CONNECTED":

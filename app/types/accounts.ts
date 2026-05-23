@@ -9,12 +9,13 @@ export type AccountStatus =
   | 'DISCONNECTED'
   | 'AUTHENTICATING'
   | 'CONNECTED'
+  | 'INVALIDATED'
   | 'ERROR';
 
 export type AccountAuthMode = 'browser' | 'device';
 
 export interface CreateAccountRequest {
-  displayName: string;
+  displayName?: string;
   command?: string;
   args?: string[];
   environment?: Record<string, string>;
@@ -83,6 +84,18 @@ export interface AccountRuntimeSettingsRequest {
   defaultPermissionMode?: CodexPermissionMode | null;
   defaultReasoningEffort?: CodexReasoningEffort | null;
   defaultServiceTier?: CodexServiceTier | null;
+}
+
+export interface AccountPersonalizationResponse {
+  accountId: string;
+  codexHome: string;
+  instructionsPath: string;
+  instructions: string;
+  maxBytes: number;
+}
+
+export interface UpdateAccountPersonalizationRequest {
+  instructions: string;
 }
 
 export interface ImportAccountsRequest {

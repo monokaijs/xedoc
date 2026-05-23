@@ -11,6 +11,7 @@ enum AccountStatus {
   DISCONNECTED
   AUTHENTICATING
   CONNECTED
+  INVALIDATED
   ERROR
 }
 
@@ -82,6 +83,27 @@ model CodexAccount {
   updatedAt   DateTime      @updatedAt
   chats       Chat[]
   runs        ChatRun[]
+  threadPreferences ThreadPreference[]
+}
+
+model ThreadPreference {
+  threadId          String        @id
+  accountId         String?
+  autoRotateAccount Boolean       @default(false)
+  title             String?
+  workingDirectory  String?
+  model             String?
+  reasoningEffort   String?
+  serviceTier       String?
+  collaborationMode String        @default("default")
+  permissionMode    String        @default("default")
+  archivedAt        DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  account           CodexAccount? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+
+  @@index([accountId])
+  @@index([archivedAt])
 }
 
 model Chat {

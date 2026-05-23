@@ -1,24 +1,29 @@
 import { Prisma, type CodexAccount } from "@prisma/client"
-import { readFileSync } from "node:fs"
+import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
 import type {
   AccountAuthMode,
   AuthenticateAccountResponse,
   CodexJsonRpcResponse,
   AccountExportDocument,
   AccountImportEntry,
+  AccountPersonalizationResponse,
   AccountRuntimeSettingsRequest,
   AccountResponse,
   ImportAccountsRequest,
   ImportAccountsResponse,
   CreateAccountRequest,
   JsonObject,
+  UpdateAccountPersonalizationRequest,
   UpdateAccountRequest,
 } from "@/types"
 import { normalizeEnvironment } from "./env.server"
 import { HttpError } from "./http.server"
 import { asJsonObject, readString } from "./json.server"
 import {
+  clearCodexAccountInvalidated,
   codexRuntimeService,
+  ensureAccountCodexHome,
   resolveAccountCodexHome,
 } from "./codex-runtime.server"
 import { prisma } from "./prisma.server"
@@ -41,10 +46,13 @@ type NormalizedImportAccount = Required<
   id?: string
 }
 
+const PERSONALIZATION_FILE_NAME = "AGENTS.md"
+const PERSONALIZATION_MAX_BYTES = 32 * 1024
+
 export async function createAccount(dto: CreateAccountRequest) {
-  return prisma.codexAccount.create({
+  const account = await prisma.codexAccount.create({
     data: {
-      displayName: dto.displayName,
+      displayName: normalizedInitialDisplayName(dto.displayName),
       command: dto.command ?? process.env.CODEX_COMMAND ?? "codex",
       args: toJsonInput(dto.args ?? parseDefaultCodexArgs()),
       defaultModel: normalizeNullableRuntimeOption(dto.defaultModel),
@@ -54,12 +62,16 @@ export async function createAccount(dto: CreateAccountRequest) {
       environment: toJsonInput(dto.environment),
     },
   })
+  prepareAccountCodexHome(account.id)
+  return account
 }
 
-export function listAccounts() {
-  return prisma.codexAccount.findMany({
+export async function listAccounts() {
+  const accounts = await prisma.codexAccount.findMany({
     orderBy: { createdAt: "asc" },
   })
+  prepareAccountCodexHomes(accounts)
+  return accounts
 }
 
 export async function exportAccounts(): Promise<AccountExportDocument> {
@@ -153,6 +165,7 @@ export async function getAccount(accountId: string) {
   if (!account) {
     throw new HttpError(404, "Codex account not found.")
   }
+  prepareAccountCodexHome(account.id)
   return account
 }
 
@@ -209,10 +222,84 @@ export async function updateAccountRuntimeSettings(
   )
 }
 
-export async function deleteAccount(accountId: string) {
+export async function getAccountPersonalization(
+  accountId: string,
+): Promise<AccountPersonalizationResponse> {
   await getAccount(accountId)
+  const codexHome = ensureAccountCodexHome(accountId)
+  const instructionsPath = join(codexHome, PERSONALIZATION_FILE_NAME)
+
+  let instructions = ""
+  try {
+    instructions = readFileSync(instructionsPath, "utf8")
+  } catch (error) {
+    if (!isMissingFileError(error)) {
+      throw error
+    }
+  }
+
+  return {
+    accountId,
+    codexHome,
+    instructionsPath,
+    instructions,
+    maxBytes: PERSONALIZATION_MAX_BYTES,
+  }
+}
+
+export async function updateAccountPersonalization(
+  accountId: string,
+  dto: UpdateAccountPersonalizationRequest,
+): Promise<AccountPersonalizationResponse> {
+  const instructions = normalizePersonalizationInstructions(dto.instructions)
+  await getAccount(accountId)
+  const codexHome = ensureAccountCodexHome(accountId)
+  const instructionsPath = join(codexHome, PERSONALIZATION_FILE_NAME)
+
+  writeFileSync(instructionsPath, instructions, {
+    encoding: "utf8",
+    mode: 0o600,
+  })
+  chmodSync(instructionsPath, 0o600)
+
+  return {
+    accountId,
+    codexHome,
+    instructionsPath,
+    instructions,
+    maxBytes: PERSONALIZATION_MAX_BYTES,
+  }
+}
+
+export async function deleteAccount(accountId: string) {
+  const account = await getAccount(accountId)
   codexRuntimeService.stopRuntime(accountId)
-  return prisma.codexAccount.delete({ where: { id: accountId } })
+  clearCodexAccountInvalidated(accountId)
+  return prisma.$transaction(async (tx) => {
+    await tx.chat.updateMany({
+      where: { accountId },
+      data: { accountId: null },
+    })
+    await tx.threadPreference.updateMany({
+      where: { accountId },
+      data: { accountId: null },
+    })
+    const runs = await tx.chatRun.findMany({
+      select: { id: true },
+      where: { accountId },
+    })
+    const runIds = runs.map((run) => run.id)
+    if (runIds.length) {
+      await tx.chatMessage.updateMany({
+        where: { runId: { in: runIds } },
+        data: { runId: null },
+      })
+      await tx.chatRun.deleteMany({
+        where: { id: { in: runIds } },
+      })
+    }
+    return tx.codexAccount.delete({ where: { id: account.id } })
+  })
 }
 
 export async function authenticateAccount(
@@ -220,11 +307,12 @@ export async function authenticateAccount(
   mode: AccountAuthMode = "browser",
 ): Promise<AuthenticateAccountResponse> {
   const account = await getAccount(accountId)
-  if (accountHasAuthFile(accountId)) {
+  const authTokenInvalidated = account.status === "INVALIDATED"
+  if (accountHasAuthFile(accountId) && !authTokenInvalidated) {
     codexRuntimeService.stopRuntime(accountId)
     await prisma.codexAccount.update({
       where: { id: accountId },
-      data: connectedAccountAuthData(),
+      data: connectedAccountAuthData(accountId),
     })
     return {
       accountId,
@@ -235,6 +323,10 @@ export async function authenticateAccount(
       userCode: null,
       message: "Codex account is connected.",
     }
+  }
+  if (authTokenInvalidated) {
+    codexRuntimeService.stopRuntime(accountId)
+    removeAccountAuthFile(accountId)
   }
 
   await prisma.codexAccount.update({
@@ -251,28 +343,35 @@ export async function authenticateAccount(
 
   try {
     const runtime = getRuntime(account)
-    const existingAccount = await runtime.request("account/read", {
-      refreshToken: false,
-    })
-    if (asJsonObject(asJsonObject(existingAccount.result)?.account)) {
-      await prisma.codexAccount.update({
-        where: { id: accountId },
-        data: connectedAccountAuthData(),
+    if (!authTokenInvalidated) {
+      const existingAccount = await runtime.request("account/read", {
+        refreshToken: false,
       })
-      return {
-        accountId,
-        status: "CONNECTED",
-        authMode: null,
-        authUrl: null,
-        verificationUrl: null,
-        userCode: null,
-        message: "Codex account is connected.",
+      const existingRuntimeAccount = asJsonObject(
+        asJsonObject(existingAccount.result)?.account,
+      )
+      if (existingRuntimeAccount) {
+        await prisma.codexAccount.update({
+          where: { id: accountId },
+          data: connectedAccountAuthData(accountId, existingRuntimeAccount),
+        })
+        return {
+          accountId,
+          status: "CONNECTED",
+          authMode: null,
+          authUrl: null,
+          verificationUrl: null,
+          userCode: null,
+          message: "Codex account is connected.",
+        }
       }
     }
 
     const response = await runtime.request(
       "account/login/start",
-      mode === "device" ? { type: "chatgptDeviceCode" } : { type: "chatgpt" },
+      mode === "device"
+        ? { type: "chatgptDeviceCode" }
+        : { type: "chatgpt", codexStreamlinedLogin: true },
     )
     const result = asJsonObject(response.result)
     const responseMode =
@@ -292,7 +391,7 @@ export async function authenticateAccount(
       where: { id: accountId },
       data:
         nextStatus === "CONNECTED"
-          ? connectedAccountAuthData()
+          ? connectedAccountAuthData(accountId)
           : {
               status: nextStatus,
               lastAuthUrl: authUrl,
@@ -320,7 +419,7 @@ export async function authenticateAccount(
           ? "Codex account is connected."
           : responseMode === "device"
             ? "Open the verification URL and enter the device code to finish Codex authentication."
-            : "Open the returned URL to finish Codex authentication.",
+            : "Complete Codex authentication in the opened browser. xedoc will connect automatically when the Codex callback is received.",
     }
   } catch (error) {
     const message =
@@ -406,7 +505,7 @@ export async function completeAuthentication(
       codexRuntimeService.stopRuntime(accountId)
       await prisma.codexAccount.update({
         where: { id: accountId },
-        data: connectedAccountAuthData(),
+        data: connectedAccountAuthData(accountId),
       })
       return {
         accountId,
@@ -461,42 +560,85 @@ function watchAuthenticationCompletion(
   accountId: string,
   loginId: string | null,
 ) {
-  const unsubscribe = runtime.onEvent((event) => {
+  let settled = false
+  let unsubscribe = () => {}
+  const finish = () => {
+    if (settled) {
+      return
+    }
+    settled = true
+    cleanup()
+    void prisma.codexAccount.update({
+      where: { id: accountId },
+      data: connectedAccountAuthData(accountId),
+    })
+  }
+  const fail = (message: string) => {
+    if (settled) {
+      return
+    }
+    settled = true
+    cleanup()
+    void prisma.codexAccount.update({
+      where: { id: accountId },
+      data: {
+        status: "ERROR",
+        lastError: message,
+      },
+    })
+  }
+  const poll = setInterval(() => {
+    if (accountHasAuthFile(accountId)) {
+      finish()
+      return
+    }
+    void readAccountConnected(accountId, runtime)
+      .then((connected) => {
+        if (connected) {
+          settled = true
+          cleanup()
+        }
+      })
+      .catch(() => {})
+  }, 1500)
+  const timeout = setTimeout(() => {
+    cleanup()
+  }, 5 * 60_000)
+  const cleanup = () => {
+    clearInterval(poll)
+    clearTimeout(timeout)
+    unsubscribe()
+  }
+
+  unsubscribe = runtime.onEvent((event) => {
     const params = asJsonObject(event.params)
     if (event.method === "account/login/completed") {
       const eventLoginId = readString(params?.loginId)
       if (loginId && eventLoginId && eventLoginId !== loginId) {
         return
       }
-      unsubscribe()
       if (params?.success === false) {
-        void prisma.codexAccount.update({
-          where: { id: accountId },
-          data: {
-            status: "ERROR",
-            lastError: readString(params.error) ?? "Login failed.",
-          },
-        })
+        fail(readString(params.error) ?? "Login failed.")
         return
       }
-      void prisma.codexAccount.update({
-        where: { id: accountId },
-        data: connectedAccountAuthData(),
-      })
+      finish()
       return
     }
     if (event.method === "account/updated" && readString(params?.authMode)) {
-      unsubscribe()
-      void prisma.codexAccount.update({
-        where: { id: accountId },
-        data: connectedAccountAuthData(),
-      })
+      finish()
     }
   })
 }
 
-function connectedAccountAuthData() {
+function connectedAccountAuthData(
+  accountId: string,
+  runtimeAccount?: JsonObject,
+) {
+  clearCodexAccountInvalidated(accountId)
+  const displayName =
+    readRuntimeAccountEmail(runtimeAccount) ?? readAccountAuthEmail(accountId)
   return {
+    ...(displayName ? { displayName } : {}),
     status: "CONNECTED" as const,
     lastAuthUrl: null,
     lastAuthMode: null,
@@ -556,14 +698,19 @@ async function readAccountConnected(
   const response = await runtime.request("account/read", {
     refreshToken: false,
   })
-  if (!asJsonObject(asJsonObject(response.result)?.account)) {
+  const runtimeAccount = asJsonObject(asJsonObject(response.result)?.account)
+  if (!runtimeAccount) {
     return false
   }
   await prisma.codexAccount.update({
     where: { id: accountId },
-    data: connectedAccountAuthData(),
+    data: connectedAccountAuthData(accountId, runtimeAccount),
   })
   return true
+}
+
+function normalizedInitialDisplayName(value: unknown): string {
+  return readString(value)?.trim() || "Codex account"
 }
 
 function parseDefaultCodexArgs(): string[] {
@@ -579,11 +726,7 @@ function parseDefaultCodexArgs(): string[] {
 
 export function accountHasAuthFile(accountId: string): boolean {
   try {
-    const raw = readFileSync(
-      `${resolveAccountCodexHome(accountId)}/auth.json`,
-      "utf8",
-    )
-    const auth = JSON.parse(raw) as Record<string, unknown>
+    const auth = readAccountAuthFile(accountId)
     return (
       readString(auth.auth_mode) === "chatgpt" &&
       (!!asJsonObject(auth.tokens) || !!readString(auth.OPENAI_API_KEY))
@@ -591,6 +734,128 @@ export function accountHasAuthFile(accountId: string): boolean {
   } catch {
     return false
   }
+}
+
+function readAccountAuthEmail(accountId: string): string | null {
+  try {
+    const auth = readAccountAuthFile(accountId)
+    return readAccountEmailFromAuth(auth)
+  } catch {
+    return null
+  }
+}
+
+function readAccountAuthFile(accountId: string): JsonObject {
+  const raw = readFileSync(
+    `${resolveAccountCodexHome(accountId)}/auth.json`,
+    "utf8",
+  )
+  return asJsonObject(JSON.parse(raw)) ?? {}
+}
+
+function removeAccountAuthFile(accountId: string): void {
+  rmSync(`${resolveAccountCodexHome(accountId)}/auth.json`, {
+    force: true,
+  })
+}
+
+function readAccountEmailFromAuth(auth: JsonObject): string | null {
+  return (
+    normalizeEmail(readString(auth.email)) ??
+    normalizeEmail(readString(asJsonObject(auth.account)?.email)) ??
+    normalizeEmail(readString(asJsonObject(auth.profile)?.email)) ??
+    normalizeEmail(readString(asJsonObject(auth.user)?.email)) ??
+    readEmailFromToken(readString(asJsonObject(auth.tokens)?.id_token)) ??
+    readEmailFromToken(readString(asJsonObject(auth.tokens)?.idToken)) ??
+    readEmailFromToken(readString(auth.id_token)) ??
+    readEmailFromToken(readString(auth.idToken))
+  )
+}
+
+function readRuntimeAccountEmail(account: JsonObject | undefined): string | null {
+  if (!account) {
+    return null
+  }
+  return (
+    normalizeEmail(readString(account.email)) ??
+    normalizeEmail(readString(account.accountEmail)) ??
+    normalizeEmail(readString(account.chatgptEmail)) ??
+    normalizeEmail(readString(asJsonObject(account.profile)?.email)) ??
+    normalizeEmail(readString(asJsonObject(account.user)?.email))
+  )
+}
+
+function readEmailFromToken(token: string | undefined): string | null {
+  if (!token) {
+    return null
+  }
+  const [, payload] = token.split(".")
+  if (!payload) {
+    return null
+  }
+  try {
+    const decoded = JSON.parse(decodeBase64Url(payload)) as unknown
+    return normalizeEmail(readString(asJsonObject(decoded)?.email))
+  } catch {
+    return null
+  }
+}
+
+function decodeBase64Url(value: string): string {
+  const normalized = value.replaceAll("-", "+").replaceAll("_", "/")
+  const padded = normalized.padEnd(
+    normalized.length + ((4 - (normalized.length % 4)) % 4),
+    "=",
+  )
+  return Buffer.from(padded, "base64").toString("utf8")
+}
+
+function normalizeEmail(value: string | undefined): string | null {
+  const trimmed = value?.trim()
+  if (!trimmed || !trimmed.includes("@")) {
+    return null
+  }
+  return trimmed
+}
+
+function prepareAccountCodexHomes(accounts: Pick<CodexAccount, "id">[]) {
+  for (const account of accounts) {
+    prepareAccountCodexHome(account.id)
+  }
+}
+
+function prepareAccountCodexHome(accountId: string): void {
+  try {
+    ensureAccountCodexHome(accountId)
+  } catch (error) {
+    console.warn(
+      `Failed to prepare Codex account home for ${accountId}.`,
+      error instanceof Error ? error.message : error,
+    )
+  }
+}
+
+function normalizePersonalizationInstructions(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new HttpError(400, "instructions must be a string.")
+  }
+  const normalized = value.replace(/\r\n?/g, "\n")
+  if (Buffer.byteLength(normalized, "utf8") > PERSONALIZATION_MAX_BYTES) {
+    throw new HttpError(
+      400,
+      `instructions must be ${PERSONALIZATION_MAX_BYTES} bytes or fewer.`,
+    )
+  }
+  return normalized
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return (
+    !!error &&
+    typeof error === "object" &&
+    "code" in error &&
+    (error as NodeJS.ErrnoException).code === "ENOENT"
+  )
 }
 
 function parseLoopbackCallbackUrl(value: string): URL {

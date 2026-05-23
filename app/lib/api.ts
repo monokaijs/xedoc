@@ -1,6 +1,7 @@
 import type {
   AccountResponse,
   AccountRuntimeSettingsRequest,
+  AccountPersonalizationResponse,
   AccountExportDocument,
   AuthenticateAccountRequest,
   AuthenticateAccountResponse,
@@ -25,11 +26,13 @@ import type {
   AuthStatusResponse,
   ChatContextResponse,
   UpdateAccountRequest,
+  UpdateAccountPersonalizationRequest,
   UpdateChatRequest,
   GitActionRequest,
   GitActionResponse,
   GitBranchesResponse,
   GitDiffResponse,
+  GitHistoryResponse,
   GitStatusResponse,
   WorkspaceDirectoryResponse,
   WorkspaceFileResponse,
@@ -179,6 +182,33 @@ export async function updateAccountRuntimeSettings(
   return fetchJson<AccountResponse>(
     session.serverUrl,
     `/api/accounts/${accountId}/runtime-settings`,
+    {
+      body,
+      method: "PATCH",
+      token: session.token,
+    },
+  )
+}
+
+export async function getAccountPersonalization(
+  session: ApiSession,
+  accountId: string,
+): Promise<AccountPersonalizationResponse> {
+  return fetchJson<AccountPersonalizationResponse>(
+    session.serverUrl,
+    `/api/accounts/${accountId}/personalization`,
+    { token: session.token },
+  )
+}
+
+export async function updateAccountPersonalization(
+  session: ApiSession,
+  accountId: string,
+  body: UpdateAccountPersonalizationRequest,
+): Promise<AccountPersonalizationResponse> {
+  return fetchJson<AccountPersonalizationResponse>(
+    session.serverUrl,
+    `/api/accounts/${accountId}/personalization`,
     {
       body,
       method: "PATCH",
@@ -404,6 +434,17 @@ export async function getGitDiff(
   return fetchJson<GitDiffResponse>(
     session.serverUrl,
     `/api/chats/${chatId}/git/diff${query}`,
+    { token: session.token },
+  )
+}
+
+export async function getGitHistory(
+  session: ApiSession,
+  chatId: string,
+): Promise<GitHistoryResponse> {
+  return fetchJson<GitHistoryResponse>(
+    session.serverUrl,
+    `/api/chats/${chatId}/git/history`,
     { token: session.token },
   )
 }

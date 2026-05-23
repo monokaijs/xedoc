@@ -3,6 +3,7 @@ import {
   performGitAction,
   readGitBranches,
   readGitDiff,
+  readGitHistory,
   readGitStatus,
 } from "@/server/git.server"
 import {
@@ -36,6 +37,9 @@ export async function loader({ request, params }: RouteArgs) {
     }
     if (operation === "diff") {
       return jsonResponse(await readGitDiff(chatId, url.searchParams.get("path")))
+    }
+    if (operation === "history") {
+      return jsonResponse(await readGitHistory(chatId))
     }
     throw new HttpError(404, "Git operation not found.")
   } catch (error) {

@@ -14,7 +14,7 @@ import {
 import { cn } from "@/lib/utils"
 import { Loader2, Plus, Terminal as TerminalIcon, X } from "lucide-react"
 import type { PointerEvent as ReactPointerEvent } from "react"
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 import { Button } from "./ui/button"
 
@@ -53,11 +53,6 @@ export function TerminalDock({
   const [terminals, setTerminals] = useState<TerminalSession[]>([])
   const heightRef = useRef(height)
   const compactLayout = useCompactTerminalLayout()
-
-  const activeTerminal = useMemo(
-    () => terminals.find((terminal) => terminal.id === activeTerminalId) ?? null,
-    [activeTerminalId, terminals],
-  )
 
   const request = useCallback(
     <TResponse extends Record<string, unknown>>(
@@ -318,20 +313,23 @@ export function TerminalDock({
             </Button>
           ) : null}
         </div>
-        <div className="min-h-0 bg-zinc-950">
+        <div className="relative min-h-0 bg-zinc-950">
           {error ? (
             <div className="grid h-full place-items-center p-4 text-sm text-red-200">
               {error}
             </div>
-          ) : activeTerminal ? (
-            <TerminalPane
-              key={activeTerminal.id}
-              compactLayout={compactLayout}
-              resizeSignal={height}
-              socket={socket}
-              terminal={activeTerminal}
-              onTerminalUpdated={updateTerminal}
-            />
+          ) : terminals.length ? (
+            terminals.map((terminal) => (
+              <TerminalPane
+                active={terminal.id === activeTerminalId}
+                compactLayout={compactLayout}
+                key={terminal.id}
+                resizeSignal={height}
+                socket={socket}
+                terminal={terminal}
+                onTerminalUpdated={updateTerminal}
+              />
+            ))
           ) : (
             <div className="grid h-full place-items-center p-4 text-sm text-zinc-400">
               {loading ? "Starting terminal..." : "No terminal"}
@@ -344,12 +342,14 @@ export function TerminalDock({
 }
 
 function TerminalPane({
+  active,
   compactLayout,
   onTerminalUpdated,
   resizeSignal,
   socket,
   terminal,
 }: {
+  active: boolean
   compactLayout: boolean
   onTerminalUpdated: (terminal: TerminalSession) => void
   resizeSignal: number
@@ -360,6 +360,7 @@ function TerminalPane({
   const fitAddonRef = useRef<GhosttyFitAddon | null>(null)
   const fitFrameRef = useRef<number | null>(null)
   const terminalRef = useRef<GhosttyTerminal | null>(null)
+  const [ready, setReady] = useState(false)
 
   const requestFit = useCallback(() => {
     if (fitFrameRef.current !== null) {
@@ -382,6 +383,17 @@ function TerminalPane({
   }, [requestFit, resizeSignal])
 
   useEffect(() => {
+    if (!active) {
+      return
+    }
+    requestFit()
+    requestAnimationFrame(() => {
+      fitAddonRef.current?.fit()
+      terminalRef.current?.focus()
+    })
+  }, [active, requestFit])
+
+  useEffect(() => {
     const element = containerRef.current
     if (!socket || !element) {
       return
@@ -390,6 +402,8 @@ function TerminalPane({
     let disposed = false
     let attached = false
     const disposables: GhosttyDisposable[] = []
+    setReady(false)
+    element.replaceChildren()
 
     const emitInput = (data: string) => {
       socket.emit("terminal:input", {
@@ -411,6 +425,7 @@ function TerminalPane({
         if (disposed || !containerRef.current) {
           return
         }
+        containerRef.current.replaceChildren()
         const term = new Terminal({
           cursorBlink: true,
           fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
@@ -474,7 +489,12 @@ function TerminalPane({
         attached = true
         requestAnimationFrame(() => {
           fitAddon.fit()
-          term.focus()
+          if (!disposed) {
+            setReady(true)
+            if (active) {
+              term.focus()
+            }
+          }
         })
         requestFit()
       })
@@ -498,17 +518,35 @@ function TerminalPane({
         disposable.dispose()
       }
       terminalRef.current?.dispose()
+      element.replaceChildren()
       terminalRef.current = null
       fitAddonRef.current = null
+      setReady(false)
     }
-  }, [compactLayout, onTerminalUpdated, requestFit, socket, terminal.id])
+  }, [active, compactLayout, onTerminalUpdated, requestFit, socket, terminal.id])
 
   return (
     <div
-      className="relative h-full min-h-0 overflow-hidden p-1 outline-none sm:p-2 [&_canvas]:block"
-      ref={containerRef}
+      className={cn(
+        "absolute inset-0 h-full min-h-0 overflow-hidden bg-zinc-950 p-1 outline-none sm:p-2",
+        active ? "z-10 opacity-100" : "z-0 opacity-0 pointer-events-none",
+      )}
+      aria-hidden={!active}
       style={{ caretColor: "transparent" }}
-    />
+    >
+      {!ready && active ? (
+        <div className="absolute inset-0 grid place-items-center bg-zinc-950 text-xs text-zinc-500">
+          Loading terminal...
+        </div>
+      ) : null}
+      <div
+        className={cn(
+          "h-full min-h-0 transition-opacity [&_canvas]:block",
+          ready ? "opacity-100" : "opacity-0",
+        )}
+        ref={containerRef}
+      />
+    </div>
   )
 }
 

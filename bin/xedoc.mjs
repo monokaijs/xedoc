@@ -34,6 +34,12 @@ const accountsHome = resolveHomePath(
     process.env.CODEX_ACCOUNTS_HOME ??
     join(appHome, "accounts"),
 )
+const sharedChatHome = resolveHomePath(
+  options.sharedChatHome ??
+    process.env.CODEX_SHARED_CHAT_HOME ??
+    process.env.CODEX_HOME ??
+    "~/.codex",
+)
 const workspaceRoot = resolveHomePath(
   options.workspaceRoot ?? process.env.CODEX_WORKSPACE_ROOT ?? homedir(),
 )
@@ -47,6 +53,7 @@ const env = {
   CODEX_ACCOUNTS_HOME: accountsHome,
   CODEX_ARGS: options.codexArgs ?? process.env.CODEX_ARGS ?? `${codexBin} app-server`,
   CODEX_COMMAND: options.codexCommand ?? process.env.CODEX_COMMAND ?? process.execPath,
+  CODEX_SHARED_CHAT_HOME: sharedChatHome,
   CODEX_WORKSPACE_ROOT: workspaceRoot,
   DATABASE_URL: databaseUrl,
   HOST: host,
@@ -66,6 +73,7 @@ const url = `http://${host === "0.0.0.0" ? "localhost" : host}:${port}`
 console.log(`xedoc: ${url}`)
 console.log("Set the server password in your browser on first visit.")
 console.log(`Workspace root: ${workspaceRoot}`)
+console.log(`Shared chat store: ${sharedChatHome}`)
 console.log("Press Ctrl+C to stop.")
 
 await runServer(env)
@@ -115,6 +123,9 @@ function assignOption(parsed, name, value) {
       return
     case "--port":
       parsed.port = value
+      return
+    case "--shared-chat-home":
+      parsed.sharedChatHome = value
       return
     case "--workspace-root":
       parsed.workspaceRoot = value
@@ -220,6 +231,7 @@ Options:
   --host <host>                 Web server host. Defaults to 127.0.0.1.
   --workspace-root <path>       Directory tree visible in the app. Defaults to your home directory.
   --accounts-home <path>        Codex account state directory. Defaults to ~/.xedoc/accounts.
+  --shared-chat-home <path>     Shared Codex chat store. Defaults to ~/.codex.
   --skip-setup                  Do not create the SQLite database schema.
   --codex-command <command>     Codex command used for new accounts.
   --codex-args <args>           Codex command arguments used for new accounts.

@@ -2,7 +2,7 @@ import { open, realpath, stat } from "node:fs/promises"
 import { basename, extname, isAbsolute, relative, resolve } from "node:path"
 import type { WorkspaceFileResponse } from "@/types"
 import { HttpError } from "./http.server"
-import { prisma } from "./prisma.server"
+import { resolveThreadWorkingDirectory } from "./thread-preferences.server"
 import { resolveDirectory } from "./workspaces.server"
 
 const MAX_VIEW_BYTES = 1_000_000
@@ -19,18 +19,12 @@ export async function readChatWorkspaceFile(
   inputPath: string,
   requestedLine?: number | null,
 ): Promise<WorkspaceFileResponse> {
-  const chat = await prisma.chat.findUnique({
-    where: { id: chatId },
-    select: { workingDirectory: true },
-  })
-  if (!chat) {
-    throw new HttpError(404, "Chat not found.")
-  }
-  if (!chat.workingDirectory) {
+  const workingDirectory = await resolveThreadWorkingDirectory(chatId)
+  if (!workingDirectory) {
     throw new HttpError(400, "Chat does not have a working directory.")
   }
 
-  const root = resolveDirectory(chat.workingDirectory)
+  const root = resolveDirectory(workingDirectory)
   const parsed = parseWorkspaceFileReference(inputPath)
   const target = await resolveWorkspaceFilePath(root, parsed.path)
   const info = await statWorkspaceFile(target, root)

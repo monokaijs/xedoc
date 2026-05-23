@@ -24,6 +24,10 @@ export default [
     "api/accounts/:accountId/runtime-settings",
     "routes/api.accounts.$accountId.runtime-settings.ts",
   ),
+  route(
+    "api/accounts/:accountId/personalization",
+    "routes/api.accounts.$accountId.personalization.ts",
+  ),
   route("api/accounts/:accountId/models", "routes/api.accounts.$accountId.models.ts"),
   route(
     "api/accounts/:accountId/rate-limits",

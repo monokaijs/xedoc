@@ -28,7 +28,6 @@ export async function action({ request }: { request: Request }) {
     const body = await readJsonBody<CreateAccountRequest>(request)
     const dto: CreateAccountRequest = {
       displayName: readStringField(body.displayName, "displayName", {
-        required: true,
         maxLength: 128,
       }),
       command: readStringField(body.command, "command"),

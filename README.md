@@ -4,11 +4,11 @@ xedoc is a single React Router Framework Mode app, built with Vite, for managing
 
 ## What It Does
 
-- Stores shared Codex accounts, chat metadata, runs, and live message projections in a local SQLite database through Prisma.
+- Stores shared Codex accounts and per-thread preferences in xedoc SQLite; chat history stays in the root Codex store.
 - Starts browser or device-code Codex account authentication through the local `codex app-server` JSON-RPC flow.
-- Isolates each Codex account with a separate `CODEX_HOME`.
+- Isolates each Codex account with a separate `CODEX_HOME` while sharing Codex chat sessions through the system Codex chat store.
 - Stores a working directory on each chat so different chats can target different local projects.
-- Executes chat prompts against the selected Codex account and reads settled transcripts back from Codex runtime/session data.
+- Executes chat prompts against the selected Codex account and reads settled chat lists/transcripts from the root Codex store.
 - Serves the ChatGPT-style web UI and `/api/*` resource routes from one same-origin app.
 - Streams live chat updates through authenticated Socket.IO rooms on `/socket.io`.
 
@@ -30,6 +30,7 @@ Common CLI options:
 - `--port <port>` changes the web server port.
 - `--workspace-root <path>` changes the directory tree visible to the app.
 - `--accounts-home <path>` changes where Codex account state is stored.
+- `--shared-chat-home <path>` changes where shared Codex chat sessions are stored.
 - `--skip-setup` skips SQLite schema setup.
 
 For repository development:
@@ -69,11 +70,30 @@ npmjs.com with this GitHub repository and the workflow file
 
 ## Codex Account Isolation
 
-Each Codex account runs as its own local `codex app-server` process. The server sets `CODEX_HOME` per account so auth files, config, sessions, cache, and other Codex state stay under:
+Each Codex account runs as its own local `codex app-server` process. The server sets `CODEX_HOME` per account so auth files, config, cache, and other non-chat account state stay under:
 
 ```text
 ~/.xedoc/accounts/<accountId>
 ```
+
+Codex chat data and personalization are centralized separately. By default,
+each account home gets symlinks for `sessions/`, `session_index.jsonl`, Codex
+`state_*.sqlite` chat state files, and `AGENTS.md` pointing at the system Codex
+chat store:
+
+```text
+~/.codex
+```
+
+Set `CODEX_SHARED_CHAT_HOME` to change the shared chat store. Existing
+per-account chat storage and non-empty personalization files are copied or
+merged into the shared store when safe, then kept as timestamped
+`.pre-shared-*` backups before the symlinks are created.
+
+For existing installations, saved account homes are prepared when the app lists
+accounts after upgrade. This migrates old per-account chat storage into the
+shared store without changing each account's `auth.json` or other
+account-specific files.
 
 Set `CODEX_ACCOUNTS_HOME` to change the base directory. This isolates Codex account state only; Codex still runs as the same host user and can access whatever that user can access.
 

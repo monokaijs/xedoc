@@ -400,38 +400,95 @@ function CodexRenderItemContent({
 
 function UserMessageRow({ message }: { message: ChatMessageResponse }) {
   const attachments = messageAttachments(message)
+  const imageTaggedParts = useMemo(
+    () => splitImageTags(message.content),
+    [message.content],
+  )
+  const textContent = textFromImageTaggedParts(imageTaggedParts)
+  const imageItems = useMemo(
+    () => userImagePreviewItems(imageTaggedParts, attachments),
+    [attachments, imageTaggedParts],
+  )
+  const fileAttachments = attachments.filter(
+    (attachment) => attachment.kind === "file",
+  )
+  const [previewImage, setPreviewImage] = useState<UserImagePreviewItem | null>(
+    null,
+  )
+  const hasTextBubble = textContent || fileAttachments.length
+
   return (
     <article className="flex min-w-0 max-w-full justify-end overflow-hidden">
-      <div className="min-w-0 max-w-[84%] overflow-hidden rounded-xl bg-foreground px-3 py-2 text-sm leading-6 text-background">
-        <div className="mb-1 flex items-center gap-2">
-          <UserRound className="size-3.5 opacity-70" />
-          <span className="text-xs font-medium opacity-70">You</span>
-        </div>
-        <ImageTaggedPlainText text={message.content} />
-        {attachments.length ? (
-          <div className="mt-2 flex min-w-0 flex-wrap gap-1.5">
-            {attachments.map((attachment) => (
-              <span
-                className="inline-flex max-w-full items-center gap-1 rounded-md border border-background/20 bg-background/10 px-2 py-1 text-xs"
-                key={attachment.id}
+      <div className="flex min-w-0 max-w-[84%] flex-col items-end gap-2 overflow-hidden">
+        {imageItems.length ? (
+          <div className="flex max-w-full flex-wrap justify-end gap-1.5">
+            {imageItems.map((item) => (
+              <button
+                className="size-16 overflow-hidden rounded-lg border bg-muted outline-none ring-offset-background transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                key={item.id}
+                title={item.name}
+                type="button"
+                onClick={() => setPreviewImage(item)}
               >
-                {attachment.kind === "image" ? (
-                  <img
-                    alt=""
-                    className="size-6 rounded object-cover"
-                    src={attachment.url}
-                  />
-                ) : (
-                  <FileCode className="size-3.5 shrink-0 opacity-80" />
-                )}
-                <span className="min-w-0 truncate">
-                  {attachment.kind === "file" ? attachment.path : attachment.name}
-                </span>
-              </span>
+                <img
+                  alt={item.name}
+                  className="size-full object-cover"
+                  loading="lazy"
+                  src={item.src}
+                />
+              </button>
             ))}
           </div>
         ) : null}
+        {hasTextBubble ? (
+          <div className="min-w-0 max-w-full overflow-hidden rounded-lg border border-border bg-card px-3 py-2 text-sm leading-6 text-card-foreground">
+            <div className="mb-1 flex items-center gap-2 text-muted-foreground">
+              <UserRound className="size-3.5 opacity-80" />
+              <span className="text-xs font-medium">You</span>
+            </div>
+            {textContent ? (
+              <div className="whitespace-pre-wrap break-words">{textContent}</div>
+            ) : null}
+            {fileAttachments.length ? (
+              <div className="mt-2 flex min-w-0 flex-wrap gap-1.5">
+                {fileAttachments.map((attachment) => (
+                  <span
+                    className="inline-flex max-w-full items-center gap-1 rounded-md border bg-muted/35 px-2 py-1 text-xs text-muted-foreground"
+                    key={attachment.id}
+                  >
+                    <FileCode className="size-3.5 shrink-0 opacity-80" />
+                    <span className="min-w-0 truncate">{attachment.path}</span>
+                  </span>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
       </div>
+      <Dialog
+        open={!!previewImage}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPreviewImage(null)
+          }
+        }}
+      >
+        <DialogContent className="flex h-[min(90vh,900px)] w-[min(92vw,1000px)] max-w-none flex-col overflow-hidden p-0">
+          <DialogHeader className="sr-only">
+            <DialogTitle>{previewImage?.name ?? "Image preview"}</DialogTitle>
+            <DialogDescription>Full size image preview.</DialogDescription>
+          </DialogHeader>
+          {previewImage ? (
+            <div className="flex min-h-0 flex-1 items-center justify-center bg-black p-2">
+              <img
+                alt={previewImage.name}
+                className="max-h-full max-w-full object-contain"
+                src={previewImage.src}
+              />
+            </div>
+          ) : null}
+        </DialogContent>
+      </Dialog>
     </article>
   )
 }
@@ -706,35 +763,59 @@ export function AssistantMarkdown({ text }: { text: string }) {
   )
 }
 
-function ImageTaggedPlainText({ text }: { text: string }) {
-  const parts = splitImageTags(text)
-  return (
-    <div className="grid min-w-0 gap-2">
-      {parts.map((part, index) =>
-        part.type === "image" ? (
-          <img
-            alt=""
-            className="max-h-[28rem] max-w-full rounded-md border border-background/20 object-contain"
-            key={`${part.src}-${index}`}
-            loading="lazy"
-            src={part.src}
-          />
-        ) : part.text.trim() ? (
-          <div
-            className="whitespace-pre-wrap break-words"
-            key={`${part.text.slice(0, 32)}-${index}`}
-          >
-            {part.text}
-          </div>
-        ) : null,
-      )}
-    </div>
-  )
-}
-
 type ImageTaggedTextPart =
   | { text: string; type: "text" }
   | { src: string; type: "image" }
+
+type UserImagePreviewItem = {
+  id: string
+  name: string
+  src: string
+}
+
+function textFromImageTaggedParts(parts: ImageTaggedTextPart[]): string {
+  return parts
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .join("")
+    .trim()
+}
+
+function userImagePreviewItems(
+  parts: ImageTaggedTextPart[],
+  attachments: ChatMessageAttachment[],
+): UserImagePreviewItem[] {
+  const items: UserImagePreviewItem[] = []
+  const seen = new Set<string>()
+  const pushItem = (item: UserImagePreviewItem) => {
+    if (seen.has(item.src)) {
+      return
+    }
+    seen.add(item.src)
+    items.push(item)
+  }
+
+  parts.forEach((part, index) => {
+    if (part.type === "image") {
+      pushItem({
+        id: `inline-image:${index}:${part.src}`,
+        name: "Attached image",
+        src: part.src,
+      })
+    }
+  })
+
+  attachments.forEach((attachment) => {
+    if (attachment.kind === "image") {
+      pushItem({
+        id: attachment.id,
+        name: attachment.name,
+        src: attachment.url,
+      })
+    }
+  })
+
+  return items
+}
 
 function imageTagsToMarkdown(text: string): string {
   return splitImageTags(text)
@@ -759,6 +840,10 @@ function splitImageTags(text: string): ImageTaggedTextPart[] {
 
     const src = normalizeImageTagSource(match[1])
     parts.push(src ? { src, type: "image" } : { text: match[0], type: "text" })
+    const trailingCloseTag = /^\s*<\/image>/i.exec(text.slice(pattern.lastIndex))
+    if (src && trailingCloseTag) {
+      pattern.lastIndex += trailingCloseTag[0].length
+    }
     lastIndex = pattern.lastIndex
   }
 
@@ -769,7 +854,13 @@ function splitImageTags(text: string): ImageTaggedTextPart[] {
 }
 
 function normalizeImageTagSource(value: string): string | null {
-  const src = value.trim()
+  let src = value.trim()
+  while (/^<image>/i.test(src)) {
+    src = src.replace(/^<image>\s*/i, "").trim()
+  }
+  while (/<\/image>$/i.test(src)) {
+    src = src.replace(/\s*<\/image>$/i, "").trim()
+  }
   if (
     !src ||
     /[\u0000-\u001f\u007f]/.test(src) ||
@@ -2761,11 +2852,30 @@ function groupTimelineEntries(messages: ChatMessageResponse[]): TimelineEntry[] 
       previous.messages.push(message)
       continue
     }
+    if (
+      previous?.type === "codex" &&
+      shouldMergeAdjacentCodexResponse(previous.messages.at(-1), message)
+    ) {
+      previous.messages.push(message)
+      continue
+    }
 
     entries.push({ id: groupId, messages: [message], type: "codex" })
   }
 
   return entries
+}
+
+function shouldMergeAdjacentCodexResponse(
+  previous: ChatMessageResponse | undefined,
+  next: ChatMessageResponse,
+): boolean {
+  return (
+    previous?.role === "ASSISTANT" &&
+    previous.kind === "CHAT" &&
+    next.role === "ASSISTANT" &&
+    next.kind === "CHAT"
+  )
 }
 
 function codexTurnGroupId(message: ChatMessageResponse): string {

@@ -11,12 +11,13 @@ import type {
   CodexPermissionMode,
   CodexRateLimitSnapshot,
   CodexRateLimitWindow,
-  CodexRateLimitsResponse,
   CodexReasoningEffort,
   CodexServiceTier,
   ExecuteChatRequest,
   MessagePageResponse,
   GitBranchesResponse,
+  GitCommit,
+  GitFileStatus,
   GitStatusResponse,
 } from "@/types"
 import {
@@ -29,11 +30,12 @@ import {
   Archive,
   ArrowUp,
   Brain,
+  ChevronDown,
   Check,
   Clock,
   Cpu,
-  Filter,
   File as FileIcon,
+  FileDiff,
   Folder,
   FolderOpen,
   Gauge,
@@ -47,7 +49,6 @@ import {
   Pencil,
   Paperclip,
   Plus,
-  Search,
   Shield,
   ShieldCheck,
   Settings,
@@ -67,6 +68,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Navigate,
   Outlet,
+  useLocation,
   useNavigate,
   useOutletContext,
   useParams,
@@ -89,6 +91,7 @@ import type {
   ProposedPlanRevisionAction,
 } from "@/components/timeline/chat-timeline"
 import { Button } from "@/components/ui/button"
+import { Badge } from "@/components/ui/badge"
 import {
   Dialog,
   DialogContent,
@@ -129,7 +132,6 @@ import {
   SidebarHeader,
   SidebarInset,
   SidebarMenu,
-  SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarProvider,
@@ -139,6 +141,7 @@ import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { WorkspacePickerDialog } from "@/components/workspace-picker-dialog"
 import {
+  ApiError,
   appendMessage,
   archiveChat,
   createChat,
@@ -148,6 +151,7 @@ import {
   getChatMessages,
   getGitBranches,
   getGitDiff,
+  getGitHistory,
   getGitStatus,
   interruptChatRun,
   listCodexModels,
@@ -160,6 +164,14 @@ import {
 } from "@/lib/api"
 import { applyChatEvent, highestSequence } from "@/lib/chat-events"
 import { useDocumentTitle } from "@/lib/document-title"
+import { highlightCode } from "@/lib/highlight"
+import {
+  clampPercent,
+  rateLimitWindowReached,
+  selectRateLimitSnapshot,
+  usageCapacityLabel,
+  usageCapacitySeverity,
+} from "@/lib/rate-limits"
 import { cn } from "@/lib/utils"
 import type { WebSession } from "@/lib/session-storage"
 import { connectChatEventSocket } from "@/lib/socket"
@@ -168,6 +180,7 @@ import {
   type TerminalSocket,
 } from "@/lib/terminal-socket"
 import { useSession } from "@/providers/session-provider"
+import "highlight.js/styles/github.css"
 
 const IMPLEMENT_LATEST_PLAN_PROMPT =
   "Implement the latest approved plan from the most recent proposed plan in this thread."
@@ -184,6 +197,7 @@ function reviseLatestPlanPrompt(feedback: string) {
 interface ShellContext {
   accounts: AccountResponse[]
   chats: ChatResponse[]
+  accountRateLimitFetching: Record<string, boolean>
   accountRateLimitSnapshots: Record<string, CodexRateLimitSnapshot>
   accountUsageSummaries: Record<string, string>
   activeProjectPath: string
@@ -198,13 +212,14 @@ interface ShellContext {
   session: WebSession
   setActiveProjectPath: (path: string) => void
   setTerminalOpen: (open: boolean) => void
+  terminalCount: number
   terminalOpen: boolean
   terminalSocket: TerminalSocket | null
   terminalSocketConnected: boolean
 }
 
 export function AppShell() {
-  const { clearSession, loading, refreshSession, session } = useSession()
+  const { loading, session } = useSession()
   const { chatId } = useParams()
   const terminalConnection = useTerminalConnection(session)
   const [activeProjectPath, setActiveProjectPath] = useState("")
@@ -212,7 +227,7 @@ export function AppShell() {
   const [accountCreateFocusKey, setAccountCreateFocusKey] = useState(0)
   const [serverSettingsOpen, setServerSettingsOpen] = useState(false)
   const [serverSettingsTab, setServerSettingsTab] =
-    useState<ServerSettingsTab>("server")
+    useState<ServerSettingsTab>("accounts")
   const [terminalOpen, setTerminalOpen] = useState(false)
   const [workspacePicker, setWorkspacePicker] = useState<{
     initialPath?: string | null
@@ -220,6 +235,7 @@ export function AppShell() {
     onSelect: (path: string) => void
   } | null>(null)
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
 
   const openAccountManagement = useCallback(
     (options?: { focusCreate?: boolean }) => {
@@ -241,7 +257,7 @@ export function AppShell() {
     setServerSettingsTab(tab)
   }, [])
 
-  const openServerSettings = useCallback((tab: ServerSettingsTab = "server") => {
+  const openServerSettings = useCallback((tab: ServerSettingsTab = "accounts") => {
     setServerSettingsTab(tab)
     setServerSettingsOpen(true)
   }, [])
@@ -250,6 +266,10 @@ export function AppShell() {
     enabled: !!session,
     queryKey: ["accounts"],
     queryFn: () => listAccounts(session!),
+    refetchInterval: (query) =>
+      query.state.data?.some((account) => account.status === "AUTHENTICATING")
+        ? 1500
+        : false,
   })
 
   const chatsQuery = useQuery({
@@ -260,12 +280,13 @@ export function AppShell() {
 
   const accounts = useMemo(() => accountsQuery.data ?? [], [accountsQuery.data])
   const chats = useMemo(() => chatsQuery.data ?? [], [chatsQuery.data])
-  const activeChatTitle = useMemo(() => {
+  const activeChat = useMemo(() => {
     if (!chatId) {
       return null
     }
-    return chats.find((chat) => chat.id === chatId)?.title ?? null
+    return chats.find((chat) => chat.id === chatId) ?? null
   }, [chatId, chats])
+  const activeChatTitle = activeChat?.title ?? null
   useEffect(() => {
     if (chatId) {
       setLastOpenedChatId(chatId)
@@ -321,6 +342,23 @@ export function AppShell() {
         .filter((entry): entry is [string, string] => !!entry),
     )
   }, [accountRateLimitSnapshots, connectedAccounts])
+  const accountRateLimitFetching = useMemo(() => {
+    return Object.fromEntries(
+      connectedAccounts.map((account, index) => [
+        account.id,
+        accountRateLimitQueries[index]?.isFetching ?? false,
+      ]),
+    )
+  }, [accountRateLimitQueries, connectedAccounts])
+  const hasInvalidatedRateLimitError = accountRateLimitQueries.some((query) =>
+    isAccountTokenInvalidatedError(query.error),
+  )
+
+  useEffect(() => {
+    if (hasInvalidatedRateLimitError) {
+      void queryClient.invalidateQueries({ queryKey: ["accounts"] })
+    }
+  }, [hasInvalidatedRateLimitError, queryClient])
 
   useEffect(() => {
     if (!activeProjectPath.trim()) {
@@ -338,6 +376,7 @@ export function AppShell() {
 
   const shellContext: ShellContext = {
     accounts,
+    accountRateLimitFetching,
     accountRateLimitSnapshots,
     accountUsageSummaries,
     activeProjectPath,
@@ -349,6 +388,7 @@ export function AppShell() {
     session,
     setActiveProjectPath,
     setTerminalOpen,
+    terminalCount: terminalConnection.count,
     terminalOpen,
     terminalSocket: terminalConnection.socket,
     terminalSocketConnected: terminalConnection.connected,
@@ -356,8 +396,8 @@ export function AppShell() {
 
   return (
     <>
-      <SidebarProvider>
-        <Sidebar className="border-r" collapsible="icon">
+      <SidebarProvider className="h-svh min-h-0 overflow-hidden">
+        <Sidebar collapsible="offcanvas" variant="inset">
           <SidebarHeader>
             <Button
               className="w-full justify-start"
@@ -365,13 +405,11 @@ export function AppShell() {
               onClick={() => navigate("/")}
             >
               <SquarePen />
-              <span className="group-data-[collapsible=icon]:hidden">
-                New chat
-              </span>
+              <span>New chat</span>
             </Button>
           </SidebarHeader>
           <SidebarContent>
-            <SidebarGroup>
+            <SidebarGroup className="p-0">
               <SidebarGroupLabel>Chats</SidebarGroupLabel>
               <SidebarGroupContent>
                 <ChatSidebar chats={chats} session={session} />
@@ -385,25 +423,43 @@ export function AppShell() {
               onClick={() => openServerSettings()}
             >
               <Settings />
-              <span className="group-data-[collapsible=icon]:hidden">
-                Settings
-              </span>
+              <span>Settings</span>
             </Button>
           </SidebarFooter>
         </Sidebar>
-        <SidebarInset className="h-svh min-w-0 overflow-hidden">
-          <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b px-3">
-            <div className="flex min-w-0 items-center gap-2">
+        <SidebarInset className="min-h-0 min-w-0 overflow-hidden">
+          <header className="flex h-12 shrink-0 items-center justify-between gap-2 border-b px-2">
+            <div className="flex min-w-0 flex-1 items-center gap-2">
               <SidebarTrigger variant="ghost">
                 <Menu />
               </SidebarTrigger>
+              <h1 className="min-w-0 flex-1 truncate text-sm font-semibold tracking-normal">
+                {activeChatTitle ?? (chatId ? "Chat" : "New chat")}
+              </h1>
             </div>
-            <div className="flex min-w-0 items-center gap-2">
-              <HeaderTerminalButton
-                active={terminalOpen}
-                disabled={!activeProjectPath.trim()}
-                onToggle={() => setTerminalOpen(!terminalOpen)}
-              />
+            <div className="flex shrink-0 items-center gap-1">
+              {activeChat ? (
+                <>
+                  <HeaderTerminalButton
+                    active={terminalOpen}
+                    className={cn(
+                      "md:hidden",
+                      terminalOpen && "text-foreground",
+                    )}
+                    compact
+                    count={terminalConnection.count}
+                    disabled={!activeProjectPath.trim()}
+                    onToggle={() => setTerminalOpen(!terminalOpen)}
+                  />
+                  <GitStatusChip
+                    chatId={activeChat.id}
+                    className="md:hidden"
+                    compact
+                    disabled={activeChat.status === "RUNNING"}
+                    session={session}
+                  />
+                </>
+              ) : null}
               <HeaderCreateMenu
                 onAddAccount={() => openAccountManagement({ focusCreate: true })}
                 onNewChat={() => navigate("/")}
@@ -420,17 +476,20 @@ export function AppShell() {
             </div>
           ) : null}
 
-          <Outlet context={shellContext} />
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+            <Outlet context={shellContext} />
+          </div>
         </SidebarInset>
       </SidebarProvider>
 
       <ServerSettingsDialog
         accounts={accounts}
+        accountRateLimitFetching={accountRateLimitFetching}
+        accountRateLimitSnapshots={accountRateLimitSnapshots}
+        accountUsageSummaries={accountUsageSummaries}
         activeTab={serverSettingsTab}
-        clearSession={clearSession}
         createFocusKey={accountCreateFocusKey}
         open={serverSettingsOpen}
-        refreshSession={refreshSession}
         session={session}
         onTabChange={changeServerSettingsTab}
         onOpenChange={setServerSettingsOpen}
@@ -485,25 +544,51 @@ function useTerminalConnection(session: WebSession | null) {
 
 function HeaderTerminalButton({
   active,
+  className,
+  compact = false,
+  count,
   disabled,
   onToggle,
 }: {
   active: boolean
+  className?: string
+  compact?: boolean
+  count?: number
   disabled: boolean
   onToggle: () => void
 }) {
+  const terminalCount = count ?? 0
   return (
     <Button
       aria-label="Terminal"
       aria-pressed={active}
+      className={cn(
+        compact
+          ? "relative"
+          : "h-7 max-w-56 justify-start gap-1.5 px-2 text-xs",
+        className,
+      )}
       disabled={disabled}
-      size="icon"
+      size={compact ? "icon" : "sm"}
       title={disabled ? "Choose a working directory" : "Terminal"}
       type="button"
-      variant={active ? "secondary" : "ghost"}
+      variant="ghost"
       onClick={onToggle}
     >
-      <TerminalIcon />
+      <TerminalIcon className="size-3.5" />
+      <span className={compact ? "sr-only" : "min-w-0 truncate"}>Terminal</span>
+      {terminalCount > 0 ? (
+        <span
+          className={cn(
+            "inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-sidebar-accent px-1 text-[0.65rem] leading-none text-sidebar-accent-foreground",
+            compact
+              ? "absolute -right-1 -top-1"
+              : "ml-0.5",
+          )}
+        >
+          {terminalCount}
+        </span>
+      ) : null}
     </Button>
   )
 }
@@ -517,7 +602,7 @@ function HeaderCreateMenu({
 }) {
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger render={<Button size="icon" variant="outline" />}>
+      <DropdownMenuTrigger render={<Button size="icon" variant="ghost" />}>
         <Plus className="size-4" />
         <span className="sr-only">Create</span>
       </DropdownMenuTrigger>
@@ -535,6 +620,24 @@ function HeaderCreateMenu({
   )
 }
 
+const CHAT_GROUP_VISIBLE_LIMIT = 4
+
+type ChatSidebarItem = {
+  chat: ChatResponse
+  dateLabel: string
+  folderKey: string
+  folderName: string
+  folderPath: string
+}
+
+type ChatSidebarGroup = {
+  items: ChatSidebarItem[]
+  key: string
+  latestActivityAt: number
+  name: string
+  path: string
+}
+
 function ChatSidebar({
   chats,
   session,
@@ -548,52 +651,60 @@ function ChatSidebar({
   const [renameTarget, setRenameTarget] = useState<ChatResponse | null>(null)
   const [renameTitle, setRenameTitle] = useState("")
   const [archiveTarget, setArchiveTarget] = useState<ChatResponse | null>(null)
-  const [searchQuery, setSearchQuery] = useState("")
-  const [folderFilter, setFolderFilter] = useState<string | null>(null)
+  const [collapsedFolderKeys, setCollapsedFolderKeys] = useState<Set<string>>(
+    () => new Set(),
+  )
+  const [expandedFolderKeys, setExpandedFolderKeys] = useState<Set<string>>(
+    () => new Set(),
+  )
 
   const chatItems = useMemo(
     () =>
       chats.map((chat) => ({
         chat,
         dateLabel: formatChatListDate(chat.lastActivityAt),
+        folderKey: chatFolderKey(chat.workingDirectory),
         folderName: chatFolderName(chat.workingDirectory),
+        folderPath: chatFolderPath(chat.workingDirectory),
       })),
     [chats],
   )
-  const folderOptions = useMemo(() => {
-    const counts = new Map<string, number>()
+  const chatGroups = useMemo<ChatSidebarGroup[]>(() => {
+    const groups = new Map<string, ChatSidebarGroup>()
     for (const item of chatItems) {
-      counts.set(item.folderName, (counts.get(item.folderName) ?? 0) + 1)
+      const activityTime = new Date(item.chat.lastActivityAt).getTime()
+      const group = groups.get(item.folderKey)
+      if (group) {
+        group.items.push(item)
+        group.latestActivityAt = Math.max(group.latestActivityAt, activityTime)
+        continue
+      }
+      groups.set(item.folderKey, {
+        items: [item],
+        key: item.folderKey,
+        latestActivityAt: activityTime,
+        name: item.folderName,
+        path: item.folderPath,
+      })
     }
-    return Array.from(counts, ([name, count]) => ({ count, name })).sort((a, b) =>
-      a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
-    )
+    return Array.from(groups.values())
+      .map((group) => ({
+        ...group,
+        items: group.items.sort(
+          (a, b) =>
+            new Date(b.chat.lastActivityAt).getTime() -
+              new Date(a.chat.lastActivityAt).getTime() ||
+            a.chat.title.localeCompare(b.chat.title, undefined, {
+              sensitivity: "base",
+            }),
+        ),
+      }))
+      .sort(
+        (a, b) =>
+          b.latestActivityAt - a.latestActivityAt ||
+          a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+      )
   }, [chatItems])
-  const filteredChatItems = useMemo(() => {
-    const normalizedSearch = searchQuery.trim().toLocaleLowerCase()
-    return chatItems.filter(({ chat, folderName }) => {
-      if (folderFilter && folderName !== folderFilter) {
-        return false
-      }
-      if (!normalizedSearch) {
-        return true
-      }
-      return [chat.title, folderName, chat.workingDirectory ?? ""]
-        .join(" ")
-        .toLocaleLowerCase()
-        .includes(normalizedSearch)
-    })
-  }, [chatItems, folderFilter, searchQuery])
-  const hasChatFilters = !!searchQuery.trim() || !!folderFilter
-
-  useEffect(() => {
-    if (
-      folderFilter &&
-      !folderOptions.some((option) => option.name === folderFilter)
-    ) {
-      setFolderFilter(null)
-    }
-  }, [folderFilter, folderOptions])
 
   const renameMutation = useMutation({
     mutationFn: () => {
@@ -626,155 +737,165 @@ function ChatSidebar({
 
   return (
     <>
-      <div className="mb-2 flex items-center gap-1 px-1 group-data-[collapsible=icon]:hidden">
-        <div className="relative min-w-0 flex-1">
-          <Search className="pointer-events-none absolute left-2 top-2 size-4 text-muted-foreground" />
-          <Input
-            aria-label="Search chats"
-            className="h-8 bg-background pl-7"
-            placeholder="Search chats"
-            value={searchQuery}
-            onChange={(event) => setSearchQuery(event.target.value)}
-          />
-        </div>
-        <Popover>
-          <PopoverTrigger
-            render={
-              <Button
-                aria-label="Filter chats by folder"
-                className={cn("relative", folderFilter && "text-foreground")}
-                size="icon"
-                variant={folderFilter ? "secondary" : "outline"}
-              />
-            }
-          >
-            <Filter className="size-4" />
-            {folderFilter ? (
-              <span
-                aria-hidden="true"
-                className="absolute right-1.5 top-1.5 size-2 rounded-full bg-red-500 ring-2 ring-background"
-              />
-            ) : null}
-          </PopoverTrigger>
-          <PopoverContent align="end" className="w-64" side="bottom">
-            <PopoverHeader>
-              <PopoverTitle>Folder</PopoverTitle>
-              <PopoverDescription>Show chats from one folder.</PopoverDescription>
-            </PopoverHeader>
-            <div className="max-h-72 overflow-y-auto">
-              <button
-                className={cn(
-                  "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none hover:bg-muted focus-visible:bg-muted",
-                  !folderFilter && "bg-muted",
-                )}
-                type="button"
-                onClick={() => setFolderFilter(null)}
-              >
-                <span className="min-w-0 flex-1 truncate">All folders</span>
-                <span className="text-xs text-muted-foreground">{chats.length}</span>
-                {!folderFilter ? <Check className="size-4" /> : null}
-              </button>
-              {folderOptions.map((option) => (
-                <button
-                  className={cn(
-                    "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none hover:bg-muted focus-visible:bg-muted",
-                    folderFilter === option.name && "bg-muted",
-                  )}
-                  key={option.name}
-                  type="button"
-                  onClick={() => setFolderFilter(option.name)}
-                >
-                  <Folder className="size-4 text-muted-foreground" />
-                  <span className="min-w-0 flex-1 truncate">{option.name}</span>
-                  <span className="text-xs text-muted-foreground">
-                    {option.count}
-                  </span>
-                  {folderFilter === option.name ? (
-                    <Check className="size-4" />
-                  ) : null}
-                </button>
-              ))}
-            </div>
-          </PopoverContent>
-        </Popover>
-      </div>
+	      <SidebarMenu className="gap-1">
+	        {chatGroups.length ? (
+	          chatGroups.map((group) => {
+	            const groupCollapsed = collapsedFolderKeys.has(group.key)
+	            const groupExpanded = expandedFolderKeys.has(group.key)
+	            const visibleItems = groupExpanded
+	              ? group.items
+	              : group.items.slice(0, CHAT_GROUP_VISIBLE_LIMIT)
+	            const hiddenCount = group.items.length - visibleItems.length
+	            const canStartInFolder = isConcreteFolderPath(group.path)
 
-      <SidebarMenu>
-        {filteredChatItems.length ? (
-          filteredChatItems.map(({ chat, dateLabel, folderName }) => (
-            <SidebarMenuItem key={chat.id}>
-              <SidebarMenuButton
-                className="h-14 min-w-0 items-start py-1.5 pr-2! group-has-data-[sidebar=menu-action]/menu-item:pr-2! group-data-[collapsible=icon]:items-center! group-data-[collapsible=icon]:justify-center!"
-                isActive={chat.id === chatId}
-                size="lg"
-                tooltip={`${chat.title} · ${dateLabel} · ${folderName}`}
-                onClick={() => navigate(`/chat/${chat.id}`)}
-              >
-                <MessageSquare className="mt-0.5 group-data-[collapsible=icon]:mt-0!" />
-                <span className="min-w-0 flex-1 group-data-[collapsible=icon]:hidden!">
-                  <span className="block truncate leading-5">{chat.title}</span>
-                  <span className="flex min-w-0 items-center gap-2 text-[11px] leading-4 font-normal text-muted-foreground">
-                    <span className="flex min-w-0 items-center gap-1">
-                      <Clock className="!size-3 shrink-0" />
-                      <span className="truncate">{dateLabel}</span>
-                    </span>
-                    <span className="flex min-w-0 items-center gap-1">
-                      <Folder className="!size-3 shrink-0" />
-                      <span className="truncate">{folderName}</span>
-                    </span>
-                  </span>
-                </span>
-              </SidebarMenuButton>
-              <DropdownMenu>
-                <DropdownMenuTrigger
-                  render={
-                    <SidebarMenuAction
-                      aria-label="Chat actions"
-                      className="right-2 top-3 size-7 pointer-events-none opacity-0 group-hover/menu-item:pointer-events-auto group-hover/menu-item:opacity-100 group-focus-within/menu-item:pointer-events-auto group-focus-within/menu-item:opacity-100 aria-expanded:pointer-events-auto aria-expanded:opacity-100 [&>svg]:size-5"
-                      showOnHover
-                    />
-                  }
-                >
-                  <MoreHorizontal />
-                  <span className="sr-only">Chat actions</span>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-40">
-                  <DropdownMenuItem
-                    onClick={() => {
-                      setRenameTarget(chat)
-                      setRenameTitle(chat.title)
-                    }}
-                  >
-                    <Pencil />
-                    Rename
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => setArchiveTarget(chat)}>
-                    <Archive />
-                    Archive
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </SidebarMenuItem>
-          ))
-        ) : (
-          <div className="px-2 py-3 text-sm text-muted-foreground group-data-[collapsible=icon]:hidden">
-            {chats.length ? "No matching chats." : "No chats yet."}
-            {hasChatFilters ? (
-              <Button
-                className="mt-2 h-7 px-2 text-xs"
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  setFolderFilter(null)
-                  setSearchQuery("")
-                }}
-              >
-                Clear filters
-              </Button>
-            ) : null}
-          </div>
-        )}
-      </SidebarMenu>
+	            return (
+	              <SidebarMenuItem key={group.key}>
+	                <div className="flex min-w-0 items-center gap-1 pr-1">
+	                  <button
+	                    className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-xs font-medium text-sidebar-foreground/75 outline-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:bg-sidebar-accent"
+	                    title={group.path}
+	                    type="button"
+	                    onClick={() =>
+	                      setCollapsedFolderKeys((current) => {
+	                        const next = new Set(current)
+	                        if (next.has(group.key)) {
+	                          next.delete(group.key)
+	                        } else {
+	                          next.add(group.key)
+	                        }
+	                        return next
+	                      })
+	                    }
+	                  >
+	                    <Folder className="size-3.5 shrink-0 text-cyan-500" />
+	                    <span className="min-w-0 flex-1 truncate">{group.name}</span>
+	                    <span className="shrink-0 text-[0.68rem] font-normal text-muted-foreground">
+	                      {group.items.length}
+	                    </span>
+	                    <ChevronDown
+	                      className={cn(
+	                        "size-3 shrink-0 text-muted-foreground transition-transform",
+	                        groupCollapsed && "-rotate-90",
+	                      )}
+	                    />
+	                  </button>
+	                  {canStartInFolder ? (
+	                    <Button
+	                      aria-label={`New chat in ${group.name}`}
+	                      className="size-7 shrink-0"
+	                      size="icon-sm"
+	                      title={`New chat in ${group.path}`}
+	                      type="button"
+	                      variant="ghost"
+	                      onClick={() =>
+	                        navigate("/", {
+	                          state: { workingDirectory: group.path },
+	                        })
+	                      }
+	                    >
+	                      <Plus className="size-3.5" />
+	                    </Button>
+	                  ) : null}
+	                </div>
+	                {groupCollapsed ? null : (
+	                  <SidebarMenu className="gap-0.5 pl-4">
+		                    {visibleItems.map(({ chat, dateLabel, folderName }) => (
+		                      <SidebarMenuItem
+		                        className="flex min-w-0 items-center"
+		                        key={chat.id}
+		                      >
+	                        <SidebarMenuButton
+	                          className="h-7 min-w-0 flex-1 px-2 pr-2! text-xs"
+	                          isActive={chat.id === chatId}
+	                          size="sm"
+	                          tooltip={`${chat.title} · ${dateLabel} · ${folderName}`}
+	                          onClick={() => navigate(`/chat/${chat.id}`)}
+	                        >
+	                          <MessageSquare className="size-3.5 text-muted-foreground" />
+	                          <span className="min-w-0 flex-1 truncate">
+	                            {chat.title}
+	                          </span>
+	                        </SidebarMenuButton>
+	                        <DropdownMenu>
+	                          <DropdownMenuTrigger
+	                            render={
+	                              <Button
+	                                aria-label="Chat actions"
+	                                className="pointer-events-none h-7 w-0 shrink-0 overflow-hidden opacity-0 transition-[width,opacity] group-hover/menu-item:pointer-events-auto group-hover/menu-item:ml-1 group-hover/menu-item:w-7 group-hover/menu-item:opacity-100 group-focus-within/menu-item:pointer-events-auto group-focus-within/menu-item:ml-1 group-focus-within/menu-item:w-7 group-focus-within/menu-item:opacity-100 aria-expanded:pointer-events-auto aria-expanded:ml-1 aria-expanded:w-7 aria-expanded:opacity-100"
+	                                size="icon-sm"
+	                                variant="ghost"
+	                              />
+	                            }
+	                          >
+	                            <MoreHorizontal className="size-4" />
+	                            <span className="sr-only">Chat actions</span>
+	                          </DropdownMenuTrigger>
+	                          <DropdownMenuContent align="end" className="w-40">
+	                            <DropdownMenuItem
+	                              onClick={() => {
+	                                setRenameTarget(chat)
+	                                setRenameTitle(chat.title)
+	                              }}
+	                            >
+	                              <Pencil />
+	                              Rename
+	                            </DropdownMenuItem>
+	                            <DropdownMenuItem
+	                              onClick={() => setArchiveTarget(chat)}
+	                            >
+	                              <Archive />
+	                              Archive
+	                            </DropdownMenuItem>
+	                          </DropdownMenuContent>
+	                        </DropdownMenu>
+	                      </SidebarMenuItem>
+	                    ))}
+	                    {hiddenCount > 0 ? (
+	                      <li>
+	                        <button
+	                          className="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-xs text-muted-foreground outline-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:bg-sidebar-accent"
+	                          type="button"
+	                          onClick={() =>
+	                            setExpandedFolderKeys((current) =>
+	                              new Set(current).add(group.key),
+	                            )
+	                          }
+	                        >
+	                          <ChevronDown className="size-3.5 shrink-0" />
+	                          <span className="min-w-0 truncate">
+	                            Show {hiddenCount} more
+	                          </span>
+	                        </button>
+	                      </li>
+	                    ) : groupExpanded && group.items.length > CHAT_GROUP_VISIBLE_LIMIT ? (
+	                      <li>
+	                        <button
+	                          className="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-xs text-muted-foreground outline-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:bg-sidebar-accent"
+	                          type="button"
+	                          onClick={() =>
+	                            setExpandedFolderKeys((current) => {
+	                              const next = new Set(current)
+	                              next.delete(group.key)
+	                              return next
+	                            })
+	                          }
+	                        >
+	                          <ChevronDown className="size-3.5 shrink-0 rotate-180" />
+	                          <span className="min-w-0 truncate">Show less</span>
+	                        </button>
+	                      </li>
+	                    ) : null}
+	                  </SidebarMenu>
+	                )}
+	              </SidebarMenuItem>
+	            )
+	          })
+	        ) : (
+	          <div className="px-2 py-3 text-sm text-muted-foreground">
+	            No chats yet.
+	          </div>
+	        )}
+	      </SidebarMenu>
 
       <Dialog
         open={!!renameTarget}
@@ -1004,6 +1125,7 @@ function AttachmentTray({
 
 export function NewChatPane() {
   const {
+    accountRateLimitFetching,
     accountRateLimitSnapshots,
     accountUsageSummaries,
     connectedAccounts,
@@ -1017,6 +1139,11 @@ export function NewChatPane() {
     terminalSocket,
     terminalSocketConnected,
   } = useShellContext()
+  const location = useLocation()
+  const routeWorkingDirectory = routeWorkingDirectoryFromState(location.state)
+  const routeWorkingDirectoryKey = routeWorkingDirectory
+    ? `${location.key}:${routeWorkingDirectory}`
+    : ""
   const [content, setContent] = useState("")
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
   const [collaborationMode, setCollaborationMode] =
@@ -1035,7 +1162,7 @@ export function NewChatPane() {
   const [runtimeAccountId, setRuntimeAccountId] = useState<string | null>(null)
   const [serviceTier, setServiceTier] = useState<CodexServiceTier | null>(null)
   const [workingDirectory, setWorkingDirectory] = useState(
-    lastOpenedChat?.workingDirectory?.trim() ?? "",
+    routeWorkingDirectory || lastOpenedChat?.workingDirectory?.trim() || "",
   )
   const queryClient = useQueryClient()
   const navigate = useNavigate()
@@ -1043,11 +1170,25 @@ export function NewChatPane() {
   const seededLastOpenedChatIdRef = useRef<string | null>(
     lastOpenedChat?.id ?? null,
   )
+  const appliedRouteWorkingDirectoryRef = useRef<string | null>(
+    routeWorkingDirectoryKey || null,
+  )
 
   useEffect(() => {
     setActiveProjectPath(workingDirectory.trim())
     return () => setActiveProjectPath("")
   }, [setActiveProjectPath, workingDirectory])
+
+  useEffect(() => {
+    if (
+      !routeWorkingDirectory ||
+      appliedRouteWorkingDirectoryRef.current === routeWorkingDirectoryKey
+    ) {
+      return
+    }
+    appliedRouteWorkingDirectoryRef.current = routeWorkingDirectoryKey
+    setWorkingDirectory(routeWorkingDirectory)
+  }, [routeWorkingDirectory, routeWorkingDirectoryKey])
 
   useEffect(() => {
     if (!lastOpenedChat || seededLastOpenedChatIdRef.current === lastOpenedChat.id) {
@@ -1111,14 +1252,11 @@ export function NewChatPane() {
     queryFn: () => listCodexModels(session, selectedConnectedAccount!.id),
     staleTime: 5 * 60 * 1000,
   })
-  const rateLimitsQuery = useQuery({
-    enabled: !!selectedConnectedAccount?.id,
-    queryKey: ["rate-limits", selectedConnectedAccount?.id],
-    queryFn: () => readCodexRateLimits(session, selectedConnectedAccount!.id),
-    refetchInterval: 60_000,
-    retry: false,
-    staleTime: 30_000,
-  })
+  useEffect(() => {
+    if (isAccountTokenInvalidatedError(modelsQuery.error)) {
+      void queryClient.invalidateQueries({ queryKey: ["accounts"] })
+    }
+  }, [modelsQuery.error, queryClient])
   const modelOptions = modelsQuery.data?.data ?? []
   const runtimeSelectionsApply = runtimeAccountId === selectedConnectedAccount?.id
   const effectiveModel = runtimeSelectionsApply ? model : null
@@ -1131,7 +1269,12 @@ export function NewChatPane() {
   const activeReasoningEffort =
     effectiveReasoningEffort ?? selectedModel?.defaultReasoningEffort ?? null
   const serviceTierOptions = selectedModel?.additionalSpeedTiers ?? []
-  const rateLimitSnapshot = selectRateLimitSnapshot(rateLimitsQuery.data)
+  const rateLimitSnapshot = selectedConnectedAccount
+    ? accountRateLimitSnapshots[selectedConnectedAccount.id]
+    : undefined
+  const rateLimitPending = selectedConnectedAccount
+    ? !!accountRateLimitFetching[selectedConnectedAccount.id]
+    : false
 
   const updateAccountDefaultsMutation = useMutation({
     mutationFn: ({
@@ -1216,26 +1359,21 @@ export function NewChatPane() {
   const showTerminalDock = terminalOpen && !!terminalProjectPath
 
   return (
-    <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
-      <div
-        className={cn(
-          "mx-auto flex w-full flex-1 flex-col gap-6 px-4",
-          showTerminalDock
-            ? "max-w-5xl justify-start py-4 sm:justify-center sm:py-8"
-            : "max-w-3xl justify-center py-8",
-        )}
+    <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+      <ScrollArea
+        className="min-h-0 min-w-0 flex-1"
+        viewportProps={{ className: "overflow-x-hidden" }}
       >
-        <div className="text-center">
-          <h1 className="text-2xl font-semibold tracking-normal">
-            What should Codex work on?
-          </h1>
-          <p className="mt-2 text-sm text-muted-foreground">
-            Select an account and workspace, then send the first message.
-          </p>
-        </div>
-
+        <div
+          className={cn(
+            "mx-auto flex min-h-full w-full flex-col px-4",
+            showTerminalDock
+              ? "max-w-5xl justify-start py-4 sm:justify-center sm:py-8"
+              : "max-w-[760px] justify-center py-8",
+          )}
+      >
         {!connectedAccounts.length ? (
-          <div className="rounded-md border bg-muted/35 p-4 text-sm">
+          <div className="mb-4 rounded-md border bg-muted/35 p-4 text-sm">
             <div className="font-medium">No connected account</div>
             <div className="mt-1 text-muted-foreground">
               Create and authenticate a Codex account before starting a chat.
@@ -1255,11 +1393,11 @@ export function NewChatPane() {
             socketConnected={terminalSocketConnected}
           />
         ) : (
-        <div className="grid gap-3 rounded-xl border bg-background p-3 shadow-sm">
-          <div className="flex min-w-0 items-center gap-2 rounded-lg border bg-muted/25 px-2 py-1.5">
+        <div className="grid gap-3 rounded-2xl border bg-card/80 p-3 shadow-sm dark:border-border/90 dark:bg-card/55">
+          <div className="flex min-w-0 items-center gap-2 rounded-xl border bg-transparent px-2 py-1.5 dark:bg-transparent">
             <Input
               autoCapitalize="none"
-              className="h-8 min-w-0 border-0 bg-transparent px-1 font-mono text-xs shadow-none focus-visible:ring-0"
+              className="h-8 min-w-0 border-0 bg-transparent px-1 font-mono text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
               placeholder="Working directory"
               spellCheck={false}
               value={workingDirectory}
@@ -1282,29 +1420,35 @@ export function NewChatPane() {
               <span className="sr-only">Choose directory</span>
             </Button>
           </div>
-          <Textarea
-            className="min-h-32 resize-none border-0 px-1 shadow-none focus-visible:ring-0"
-            placeholder="Message Codex"
-            value={content}
-            onChange={(event) => setContent(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault()
-                if (
-                  !createMutation.isPending &&
-                  canSend(content, workingDirectory, selectedConnectedAccount, attachments)
-                ) {
-                  createMutation.mutate()
+          <div className="relative min-w-0">
+            <ChatInputPlanModeBadge visible={collaborationMode === "plan"} />
+            <Textarea
+              className={cn(
+                "min-h-32 resize-none border-0 bg-transparent px-1 shadow-none focus-visible:ring-0 dark:bg-transparent",
+                collaborationMode === "plan" && "pr-24",
+              )}
+              placeholder="Message Codex"
+              value={content}
+              onChange={(event) => setContent(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault()
+                  if (
+                    !createMutation.isPending &&
+                    canSend(content, workingDirectory, selectedConnectedAccount, attachments)
+                  ) {
+                    createMutation.mutate()
+                  }
                 }
-              }
-            }}
-            onPaste={(event) => {
-              const files = imageFilesFromClipboard(event.clipboardData)
-              if (files.length) {
-                attachImages(files)
-              }
-            }}
-          />
+              }}
+              onPaste={(event) => {
+                const files = imageFilesFromClipboard(event.clipboardData)
+                if (files.length) {
+                  attachImages(files)
+                }
+              }}
+            />
+          </div>
           <AttachmentTray
             attachments={attachments}
             imageInputRef={imageInputRef}
@@ -1417,7 +1561,7 @@ export function NewChatPane() {
             </div>
             <div className="flex shrink-0 items-center gap-1 sm:gap-2">
               <UsageCapacityPill
-                pending={rateLimitsQuery.isFetching}
+                pending={rateLimitPending}
                 snapshot={rateLimitSnapshot}
               />
               <ComposerActionButton
@@ -1431,7 +1575,8 @@ export function NewChatPane() {
           </div>
         </div>
         )}
-      </div>
+        </div>
+      </ScrollArea>
     </main>
   )
 }
@@ -1440,6 +1585,7 @@ export function ChatDetailPane() {
   const { chatId } = useParams()
   const {
     accounts,
+    accountRateLimitFetching,
     accountRateLimitSnapshots,
     accountUsageSummaries,
     connectedAccounts,
@@ -1447,6 +1593,7 @@ export function ChatDetailPane() {
     session,
     setActiveProjectPath,
     setTerminalOpen,
+    terminalCount,
     terminalOpen,
     terminalSocket,
     terminalSocketConnected,
@@ -1454,9 +1601,6 @@ export function ChatDetailPane() {
     useShellContext()
   const [content, setContent] = useState("")
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
-  const [streamState, setStreamState] = useState<"OFFLINE" | "ONLINE">(
-    "OFFLINE",
-  )
   const [contextWindowUsage, setContextWindowUsage] =
     useState<ContextWindowUsagePayload | null>(null)
   const scrollViewportRef = useRef<HTMLDivElement | null>(null)
@@ -1550,14 +1694,17 @@ export function ChatDetailPane() {
     queryFn: () => listCodexModels(session, loadedAccount!.id),
     staleTime: 5 * 60 * 1000,
   })
-  const rateLimitsQuery = useQuery({
-    enabled: !!loadedAccount?.id && loadedAccount.status === "CONNECTED",
-    queryKey: ["rate-limits", loadedAccount?.id],
-    queryFn: () => readCodexRateLimits(session, loadedAccount!.id),
-    refetchInterval: 60_000,
-    retry: false,
-    staleTime: 30_000,
-  })
+  useEffect(() => {
+    if (isAccountTokenInvalidatedError(modelsQuery.error)) {
+      void queryClient.invalidateQueries({ queryKey: ["accounts"] })
+    }
+  }, [modelsQuery.error, queryClient])
+  const rateLimitSnapshot = loadedAccount?.id
+    ? accountRateLimitSnapshots[loadedAccount.id]
+    : undefined
+  const rateLimitPending = loadedAccount?.id
+    ? !!accountRateLimitFetching[loadedAccount.id]
+    : false
 
   const updateAccountMutation = useMutation({
     mutationFn: (input: { accountId: string; notify?: boolean }) =>
@@ -1785,17 +1932,17 @@ export function ChatDetailPane() {
         messagesQueryKey,
         (page) => applyChatEvent(page, type, payload),
       )
+      if (type === "message.completed" || type === "message.failed") {
+        void queryClient.invalidateQueries({ queryKey: messagesQueryKey })
+        void queryClient.invalidateQueries({ queryKey: chatQueryKey })
+        void queryClient.invalidateQueries({ queryKey: ["chats"] })
+      }
     }
 
     return connectChatEventSocket(session, chatId, {
-      onClose: () => setStreamState("OFFLINE"),
-      onError: (caught) => {
-        setStreamState("OFFLINE")
-        toast.error(readError(caught))
-      },
+      onError: (caught) => toast.error(readError(caught)),
       onEvent: applyEvent,
       onOpen: () => {
-        setStreamState("ONLINE")
         const page =
           queryClient.getQueryData<MessagePageResponse>(messagesQueryKey)
         void getChatMessages(session, chatId, highestSequence(page))
@@ -1850,12 +1997,16 @@ export function ChatDetailPane() {
   }
 
   if (chatQuery.isLoading || messagesQuery.isLoading) {
-    return <FullScreenLoader />
+    return (
+      <main className="flex min-h-0 min-w-0 flex-1 items-center justify-center overflow-hidden bg-background">
+        <Loader2 className="size-5 animate-spin text-muted-foreground" />
+      </main>
+    )
   }
 
   if (chatQuery.error) {
     return (
-      <main className="flex flex-1 items-center justify-center p-6">
+      <main className="flex min-h-0 min-w-0 flex-1 items-center justify-center overflow-hidden p-6">
         <div className="max-w-md rounded-md border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           <div className="font-medium">Chat not available</div>
           <div className="mt-1 whitespace-pre-wrap">
@@ -1879,75 +2030,43 @@ export function ChatDetailPane() {
   const activeReasoningEffort =
     chat?.reasoningEffort ?? selectedModel?.defaultReasoningEffort ?? null
   const serviceTierOptions = selectedModel?.additionalSpeedTiers ?? []
-  const rateLimitSnapshot = selectRateLimitSnapshot(rateLimitsQuery.data)
 
   return (
-    <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden">
-      <div className="flex min-h-12 items-center justify-between gap-3 border-b px-4 py-2">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <OnlineStatusDot state={streamState} />
-            <h1 className="truncate text-sm font-semibold tracking-normal">
-              {chat?.title ?? "Chat"}
-            </h1>
+    <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-sidebar">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-b-xl bg-background">
+        <ScrollArea
+          className="min-h-0 min-w-0 flex-1 overflow-hidden"
+          viewportRef={scrollViewportRef}
+          viewportProps={{
+            className: "overflow-x-hidden",
+            onScroll: (event) => {
+              stickToBottomRef.current = isNearScrollBottom(event.currentTarget)
+            },
+          }}
+        >
+          <div className="mx-auto flex w-full min-w-0 max-w-3xl flex-col gap-5 overflow-hidden px-4 pb-12 pt-6">
+            {messages.length ? (
+              <ChatTimeline
+                chatId={chatId}
+                fileChangeActionDisabled={isRunning}
+                fileChangeActionPending={sendMutation.isPending}
+                hiddenMessageIds={hiddenTimelineMessageIds}
+                messages={messages}
+                onImplementPlan={implementPlan}
+                onRevisePlan={revisePlan}
+                onReviewFileChanges={reviewFileChanges}
+                onUndoFileChanges={undoFileChanges}
+                planActionDisabled={isRunning}
+                planActionPending={sendMutation.isPending}
+                session={session}
+              />
+            ) : (
+              <div className="py-20 text-center text-sm text-muted-foreground">
+                No messages yet.
+              </div>
+            )}
           </div>
-          <div className="mt-1 flex min-w-0 items-center gap-3 text-xs text-muted-foreground">
-            <span className="flex min-w-0 items-center gap-1.5">
-              <UserRound className="size-3.5 shrink-0" />
-              <span className="truncate">
-                {account?.displayName ?? "No account selected"}
-              </span>
-            </span>
-            <span className="flex min-w-0 items-center gap-1.5">
-              <Folder className="size-3.5 shrink-0" />
-              <span className="truncate">
-                {chat?.workingDirectory ?? "No working directory"}
-              </span>
-            </span>
-          </div>
-        </div>
-        {chat ? (
-          <GitStatusChip
-            chatId={chat.id}
-            disabled={isRunning}
-            session={session}
-          />
-        ) : null}
-      </div>
-
-      <ScrollArea
-        className="min-h-0 min-w-0 flex-1 overflow-hidden"
-        viewportRef={scrollViewportRef}
-        viewportProps={{
-          className: "overflow-x-hidden",
-          onScroll: (event) => {
-            stickToBottomRef.current = isNearScrollBottom(event.currentTarget)
-          },
-        }}
-      >
-        <div className="mx-auto flex w-full min-w-0 max-w-3xl flex-col gap-5 overflow-hidden px-4 pb-12 pt-6">
-          {messages.length ? (
-            <ChatTimeline
-              chatId={chatId}
-              fileChangeActionDisabled={isRunning}
-              fileChangeActionPending={sendMutation.isPending}
-              hiddenMessageIds={hiddenTimelineMessageIds}
-              messages={messages}
-              onImplementPlan={implementPlan}
-              onRevisePlan={revisePlan}
-              onReviewFileChanges={reviewFileChanges}
-              onUndoFileChanges={undoFileChanges}
-              planActionDisabled={isRunning}
-              planActionPending={sendMutation.isPending}
-              session={session}
-            />
-          ) : (
-            <div className="py-20 text-center text-sm text-muted-foreground">
-              No messages yet.
-            </div>
-          )}
-        </div>
-      </ScrollArea>
+        </ScrollArea>
 
       <div
         className={cn(
@@ -1958,7 +2077,7 @@ export function ChatDetailPane() {
         )}
       >
         {terminalOpen && chat?.workingDirectory ? (
-          <div className="p-3">
+          <div className="p-2">
             <div className="mx-auto max-w-5xl">
               <TerminalDock
                 onClosePanel={() => setTerminalOpen(false)}
@@ -1975,40 +2094,48 @@ export function ChatDetailPane() {
               messages={messages}
               session={session}
             />
-            <div className="p-3">
+            <div className="p-2">
           <div className="mx-auto grid min-w-0 max-w-3xl gap-2 overflow-hidden rounded-xl border bg-background p-2 shadow-sm">
-            <Textarea
-              className="max-h-44 min-h-20 resize-none border-0 px-1 shadow-none focus-visible:ring-0"
-              placeholder={
-                !chat?.workingDirectory
-                  ? "Choose a directory first"
-                  : account
-                    ? "Message Codex"
-                    : "Choose an account first"
-              }
-              value={content}
-              onChange={(event) => setContent(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault()
-                  if (
-                    canSend(content, chat?.workingDirectory ?? "", account, attachments)
-                  ) {
-                    sendMutation.mutate({
-                      attachments: composerAttachmentsToRequest(attachments),
-                      clearComposer: true,
-                      delivery: isRunning ? "queue" : undefined,
-                    })
+            <div className="relative min-w-0">
+              <ChatInputPlanModeBadge
+                visible={(chat?.collaborationMode ?? "default") === "plan"}
+              />
+              <Textarea
+                className={cn(
+                  "max-h-32 min-h-12 bg-transparent! text-xs resize-none border-0 px-1 shadow-none focus-visible:ring-0",
+                  (chat?.collaborationMode ?? "default") === "plan" && "pr-24",
+                )}
+                placeholder={
+                  !chat?.workingDirectory
+                    ? "Choose a directory first"
+                    : account
+                      ? "Message Codex"
+                      : "Choose an account first"
+                }
+                value={content}
+                onChange={(event) => setContent(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault()
+                    if (
+                      canSend(content, chat?.workingDirectory ?? "", account, attachments)
+                    ) {
+                      sendMutation.mutate({
+                        attachments: composerAttachmentsToRequest(attachments),
+                        clearComposer: true,
+                        delivery: isRunning ? "queue" : undefined,
+                      })
+                    }
                   }
-                }
-              }}
-              onPaste={(event) => {
-                const files = imageFilesFromClipboard(event.clipboardData)
-                if (files.length) {
-                  attachImages(files)
-                }
-              }}
-            />
+                }}
+                onPaste={(event) => {
+                  const files = imageFilesFromClipboard(event.clipboardData)
+                  if (files.length) {
+                    attachImages(files)
+                  }
+                }}
+              />
+            </div>
             <AttachmentTray
               attachments={attachments}
               imageInputRef={imageInputRef}
@@ -2145,7 +2272,7 @@ export function ChatDetailPane() {
               <div className="flex shrink-0 items-center gap-1 sm:gap-2">
                 <ContextWindowPill usage={contextWindowUsage} />
                 <UsageCapacityPill
-                  pending={rateLimitsQuery.isFetching}
+                  pending={rateLimitPending}
                   snapshot={rateLimitSnapshot}
                 />
                 <ComposerActionButton
@@ -2171,6 +2298,29 @@ export function ChatDetailPane() {
           </>
         )}
       </div>
+      </div>
+      {chat ? (
+        <div className="hidden min-h-9 shrink-0 items-center justify-end gap-1 bg-sidebar px-3 py-1 md:-mb-2 md:flex">
+          <HeaderTerminalButton
+            active={terminalOpen}
+            className={cn(
+              "hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+              terminalOpen
+                ? "text-sidebar-accent-foreground"
+                : "text-sidebar-foreground/75",
+            )}
+            count={terminalCount}
+            disabled={!chat.workingDirectory?.trim()}
+            onToggle={() => setTerminalOpen(!terminalOpen)}
+          />
+          <GitStatusChip
+            chatId={chat.id}
+            className="text-sidebar-foreground/75 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground aria-expanded:bg-sidebar-accent aria-expanded:text-sidebar-accent-foreground"
+            disabled={isRunning}
+            session={session}
+          />
+        </div>
+      ) : null}
     </main>
   )
 }
@@ -2356,26 +2506,16 @@ function ContextWindowPill({
   )
 }
 
-function OnlineStatusDot({ state }: { state: "OFFLINE" | "ONLINE" }) {
-  const online = state === "ONLINE"
-  return (
-    <span
-      aria-label={online ? "Realtime connected" : "Realtime disconnected"}
-      className={cn(
-        "size-2.5 shrink-0 rounded-full",
-        online ? "bg-emerald-500" : "bg-muted-foreground/45",
-      )}
-      title={online ? "Realtime connected" : "Realtime disconnected"}
-    />
-  )
-}
-
 function GitStatusChip({
   chatId,
+  className,
+  compact = false,
   disabled,
   session,
 }: {
   chatId: string
+  className?: string
+  compact?: boolean
   disabled?: boolean
   session: WebSession
 }) {
@@ -2398,24 +2538,42 @@ function GitStatusChip({
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <Button
-        className="h-7 max-w-56 justify-start gap-1.5 px-2 text-xs"
+        aria-label={`Git${label ? `: ${label}` : ""}`}
+        className={cn(
+          compact
+            ? "relative"
+            : "h-7 max-w-56 justify-start gap-1.5 px-2 text-xs",
+          className,
+        )}
         disabled={statusQuery.isLoading && !status}
-        size="sm"
+        size={compact ? "icon" : "sm"}
+        title={label}
         type="button"
-        variant="outline"
+        variant="ghost"
         onClick={() => setOpen(true)}
       >
         <GitBranch className="size-3.5" />
-        <span className="min-w-0 truncate">{label}</span>
-        {aheadBehind ? (
-          <span className="shrink-0 text-muted-foreground">{aheadBehind}</span>
-        ) : null}
-        <span
-          className={cn(
-            "ml-0.5 size-1.5 shrink-0 rounded-full",
-            dirty ? "bg-amber-500" : "bg-emerald-500",
-          )}
-        />
+        {compact && status ? (
+          <span
+            className={cn(
+              "absolute -right-0.5 -top-0.5 size-2 rounded-full ring-2 ring-background",
+              dirty ? "bg-amber-500" : "bg-emerald-500",
+            )}
+          />
+        ) : (
+          <>
+            <span className="min-w-0 truncate">{label}</span>
+            {aheadBehind ? (
+              <span className="shrink-0 text-muted-foreground">{aheadBehind}</span>
+            ) : null}
+            <span
+              className={cn(
+                "ml-0.5 size-1.5 shrink-0 rounded-full",
+                dirty ? "bg-amber-500" : "bg-emerald-500",
+              )}
+            />
+          </>
+        )}
       </Button>
       {open ? (
         <GitDialog
@@ -2444,8 +2602,10 @@ function GitDialog({
   status?: GitStatusResponse
 }) {
   const [branchFilter, setBranchFilter] = useState("")
-  const [newBranchName, setNewBranchName] = useState("")
   const [commitMessage, setCommitMessage] = useState("")
+  const [newBranchName, setNewBranchName] = useState("")
+  const [selectedCommitHash, setSelectedCommitHash] = useState<string | null>(null)
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null)
   const branchesQuery = useQuery({
     enabled: !!chatId,
     queryKey: ["git-branches", chatId],
@@ -2454,8 +2614,14 @@ function GitDialog({
   })
   const diffQuery = useQuery({
     enabled: !!chatId,
-    queryKey: ["git-diff", chatId],
-    queryFn: () => getGitDiff(session, chatId),
+    queryKey: ["git-diff", chatId, selectedFilePath],
+    queryFn: () => getGitDiff(session, chatId, selectedFilePath),
+    retry: false,
+  })
+  const historyQuery = useQuery({
+    enabled: !!chatId,
+    queryKey: ["git-history", chatId],
+    queryFn: () => getGitHistory(session, chatId),
     retry: false,
   })
   const actionMutation = useMutation({
@@ -2468,208 +2634,854 @@ function GitDialog({
       queryClient.setQueryData(["git-status", chatId], response.status)
       void queryClient.invalidateQueries({ queryKey: ["git-branches", chatId] })
       void queryClient.invalidateQueries({ queryKey: ["git-diff", chatId] })
+      void queryClient.invalidateQueries({ queryKey: ["git-history", chatId] })
     },
   })
   const branches = filterGitBranches(branchesQuery.data, branchFilter)
-  const locked = disabled || actionMutation.isPending
-  const currentStatus = status ?? actionMutation.data?.status
+  const currentStatus = actionMutation.data?.status ?? status
+  const changedFiles = useMemo(
+    () => currentStatus?.changedFiles ?? [],
+    [currentStatus],
+  )
+  const commits = useMemo(
+    () => historyQuery.data?.commits ?? [],
+    [historyQuery.data],
+  )
+  const selectedCommit =
+    commits.find((commit) => commit.hash === selectedCommitHash) ?? null
+  const locked =
+    disabled || actionMutation.isPending || !currentStatus || currentStatus.isRepo === false
+  const diffText =
+    diffQuery.data?.diff?.trim() || diffQuery.data?.stat?.trim() || ""
+  const diffTitle = selectedFilePath ?? "All changes"
+
+  useEffect(() => {
+    setSelectedFilePath((current) => {
+      if (!changedFiles.length) {
+        return null
+      }
+      if (current && changedFiles.some((file) => file.path === current)) {
+        return current
+      }
+      return changedFiles[0]?.path ?? null
+    })
+  }, [changedFiles])
+
+  useEffect(() => {
+    setSelectedCommitHash((current) => {
+      if (!commits.length) {
+        return null
+      }
+      if (current && commits.some((commit) => commit.hash === current)) {
+        return current
+      }
+      return commits[0]?.hash ?? null
+    })
+  }, [commits])
 
   function runGitActionPayload(body: Parameters<typeof runGitAction>[2]) {
     return runGitAction(session, chatId, body)
   }
 
   return (
-    <DialogContent className="flex max-h-[88vh] max-w-5xl flex-col overflow-hidden p-0">
-      <DialogHeader className="gap-1 px-4 pb-2 pt-4">
-        <DialogTitle>Git</DialogTitle>
-        <DialogDescription className="truncate">
-          {currentStatus?.root ?? "Repository information"}
-        </DialogDescription>
-      </DialogHeader>
-      <div className="grid min-h-0 flex-1 gap-0 overflow-hidden border-y md:grid-cols-[18rem_minmax(0,1fr)]">
-        <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] border-b md:border-b-0 md:border-r">
-          <div className="grid gap-2 p-3">
-            <div className="flex min-w-0 items-center gap-2">
-              <GitBranch className="size-4 shrink-0 text-muted-foreground" />
-              <div className="min-w-0">
-                <div className="truncate font-medium">
-                  {currentStatus?.branch ?? "No branch"}
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  {currentStatus ? formatGitSummary(currentStatus) : "Loading..."}
-                </div>
-              </div>
-              <Button
-                className="ml-auto"
-                size="icon-sm"
-                title="Refresh git"
-                type="button"
-                variant="ghost"
-                onClick={() => {
-                  void queryClient.invalidateQueries({ queryKey: ["git-status", chatId] })
-                  void queryClient.invalidateQueries({ queryKey: ["git-branches", chatId] })
-                  void queryClient.invalidateQueries({ queryKey: ["git-diff", chatId] })
-                }}
-              >
-                <RefreshCw className={cn(actionMutation.isPending && "animate-spin")} />
-              </Button>
-            </div>
-            <Input
-              className="h-8"
-              placeholder="Find branch"
-              value={branchFilter}
-              onChange={(event) => setBranchFilter(event.target.value)}
-            />
-          </div>
-          <ScrollArea className="min-h-0">
-            <div className="grid gap-1 p-2">
-              {branches.map((branch) => (
-                <Button
-                  className="justify-start"
-                  disabled={locked || branch.current}
-                  key={branch.name}
-                  size="sm"
-                  type="button"
-                  variant={branch.current ? "secondary" : "ghost"}
-                  onClick={() => {
-                    if (window.confirm(`Switch to ${branch.name}?`)) {
-                      actionMutation.mutate({ action: "checkout", branch: branch.name })
-                    }
-                  }}
-                >
-                  <GitBranch />
-                  <span className="min-w-0 truncate">{branch.name}</span>
-                </Button>
-              ))}
-              {!branches.length ? (
-                <div className="px-2 py-6 text-center text-xs text-muted-foreground">
-                  No branches found.
-                </div>
-              ) : null}
-            </div>
-          </ScrollArea>
-          <div className="grid gap-2 border-t p-3">
-            <Input
-              className="h-8"
-              placeholder="New branch"
-              value={newBranchName}
-              onChange={(event) => setNewBranchName(event.target.value)}
-            />
+    <DialogContent className="flex h-[min(90vh,760px)] w-[min(1180px,calc(100vw-1rem))] max-w-none flex-col overflow-hidden p-0">
+      <DialogHeader className="gap-2 px-4 pb-3 pr-12 pt-4">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <DialogTitle className="flex min-w-0 items-center gap-2 text-base">
+            <GitCommitHorizontal className="size-4 shrink-0 text-muted-foreground" />
+            <span>Git</span>
+          </DialogTitle>
+          <GitBranchPopover
+            branches={branches}
+            branchFilter={branchFilter}
+            currentBranch={currentStatus?.branch}
+            loading={branchesQuery.isFetching && !branchesQuery.data}
+            locked={locked}
+            newBranchName={newBranchName}
+            onBranchFilterChange={setBranchFilter}
+            onCheckout={(branch) => {
+              if (window.confirm(`Switch to ${branch}?`)) {
+                actionMutation.mutate({ action: "checkout", branch })
+              }
+            }}
+            onCreateBranch={() =>
+              actionMutation.mutate({
+                action: "createBranch",
+                branch: newBranchName.trim(),
+              })
+            }
+            onNewBranchNameChange={setNewBranchName}
+          />
+          <span
+            className={cn(
+              "size-2 shrink-0 rounded-full",
+              currentStatus
+                ? currentStatus.clean
+                  ? "bg-emerald-500"
+                  : "bg-amber-500"
+                : "bg-muted-foreground/40",
+            )}
+          />
+          <span className="min-w-0 truncate text-xs text-muted-foreground">
+            {actionMutation.isPending
+              ? "Running git..."
+              : currentStatus
+                ? formatGitSummary(currentStatus)
+                : "Loading..."}
+          </span>
+          <div className="ml-auto flex min-w-0 items-center gap-1">
             <Button
-              disabled={locked || !newBranchName.trim()}
+              disabled={locked}
               size="sm"
               type="button"
               variant="outline"
-              onClick={() =>
-                actionMutation.mutate({
-                  action: "createBranch",
-                  branch: newBranchName.trim(),
-                })
-              }
+              onClick={() => {
+                if (window.confirm("Pull with rebase and autostash?")) {
+                  actionMutation.mutate({ action: "pull" })
+                }
+              }}
             >
-              <Plus />
-              Create branch
+              <Download />
+              Pull
+            </Button>
+            <Button
+              disabled={locked}
+              size="sm"
+              type="button"
+              variant="outline"
+              onClick={() => {
+                if (window.confirm("Push this branch?")) {
+                  actionMutation.mutate({ action: "push" })
+                }
+              }}
+            >
+              <Upload />
+              Push
+            </Button>
+            <Button
+              size="icon-sm"
+              title="Refresh git"
+              type="button"
+              variant="ghost"
+              onClick={() => {
+                void queryClient.invalidateQueries({ queryKey: ["git-status", chatId] })
+                void queryClient.invalidateQueries({ queryKey: ["git-branches", chatId] })
+                void queryClient.invalidateQueries({ queryKey: ["git-diff", chatId] })
+                void queryClient.invalidateQueries({ queryKey: ["git-history", chatId] })
+              }}
+            >
+              <RefreshCw
+                className={cn(
+                  (actionMutation.isPending ||
+                    diffQuery.isFetching ||
+                    historyQuery.isFetching) &&
+                    "animate-spin",
+                )}
+              />
             </Button>
           </div>
         </div>
-        <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)]">
-          <div className="grid gap-3 p-3">
-            <div className="flex min-w-0 flex-wrap items-center gap-2">
-              <Button
-                disabled={locked}
-                size="sm"
-                type="button"
-                variant="outline"
-                onClick={() => {
-                  if (window.confirm("Pull with rebase and autostash?")) {
-                    actionMutation.mutate({ action: "pull" })
-                  }
-                }}
-              >
-                <Download />
-                Pull
-              </Button>
-              <Button
-                disabled={locked}
-                size="sm"
-                type="button"
-                variant="outline"
-                onClick={() => {
-                  if (window.confirm("Push this branch?")) {
-                    actionMutation.mutate({ action: "push" })
-                  }
-                }}
-              >
-                <Upload />
-                Push
-              </Button>
-              <span className="ml-auto text-xs text-muted-foreground">
-                {actionMutation.isPending ? "Running git..." : formatGitSummary(currentStatus)}
-              </span>
+        <DialogDescription className="sr-only">
+          Manage repository changes, branches, commits, pull, push, and history.
+        </DialogDescription>
+      </DialogHeader>
+      <div className="grid min-h-0 flex-1 overflow-y-auto border-t lg:grid-cols-[18rem_minmax(0,1fr)_19rem] lg:overflow-hidden">
+        <section className="grid min-h-[20rem] grid-rows-[auto_minmax(0,1fr)_auto] border-b lg:min-h-0 lg:border-b-0 lg:border-r">
+          <div className="flex items-center justify-between gap-2 border-b px-3 py-2">
+            <div className="flex min-w-0 items-center gap-2">
+              <ListChecks className="size-4 text-muted-foreground" />
+              <div className="truncate text-sm font-medium">Local Changes</div>
             </div>
-            <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
-              <Textarea
-                className="min-h-16 resize-y"
-                placeholder="Commit message"
-                value={commitMessage}
-                onChange={(event) => setCommitMessage(event.target.value)}
-              />
-              <Button
-                className="self-end"
-                disabled={locked || !commitMessage.trim() || currentStatus?.clean}
-                type="button"
-                onClick={() => {
-                  if (window.confirm("Commit all changed files?")) {
-                    actionMutation.mutate({
-                      action: "commit",
-                      message: commitMessage.trim(),
-                    })
-                  }
-                }}
-              >
-                <GitCommitHorizontal />
-                Commit
-              </Button>
-            </div>
+            <span className="text-xs text-muted-foreground">
+              {changedFiles.length}
+            </span>
           </div>
-          <ScrollArea className="min-h-0 border-t">
-            <div className="grid gap-3 p-3">
-              <ChangedFilesList status={currentStatus} />
-              <pre className="max-h-[46vh] min-w-0 overflow-auto rounded-md bg-muted p-3 font-mono text-xs leading-5">
-                {diffQuery.data?.diff?.trim() ||
-                  diffQuery.data?.stat?.trim() ||
-                  "No tracked diff."}
-              </pre>
-            </div>
+          <ScrollArea className="min-h-0">
+            <ChangedFilesList
+              files={changedFiles}
+              loading={!currentStatus}
+              selectedPath={selectedFilePath}
+              onSelect={setSelectedFilePath}
+            />
           </ScrollArea>
-        </div>
+          <div className="grid gap-2 border-t p-3">
+            <Textarea
+              className="min-h-20 resize-none text-sm"
+              placeholder="Commit message"
+              value={commitMessage}
+              onChange={(event) => setCommitMessage(event.target.value)}
+            />
+            <Button
+              className="justify-center"
+              disabled={locked || !commitMessage.trim() || currentStatus?.clean}
+              type="button"
+              onClick={() => {
+                if (window.confirm("Commit all changed files?")) {
+                  actionMutation.mutate({
+                    action: "commit",
+                    message: commitMessage.trim(),
+                  })
+                }
+              }}
+            >
+              <GitCommitHorizontal />
+              Commit All
+            </Button>
+          </div>
+        </section>
+
+        <section className="grid min-h-[24rem] min-w-0 grid-rows-[auto_minmax(0,1fr)] border-b lg:min-h-0 lg:border-b-0 lg:border-r">
+          <div className="flex min-w-0 items-center gap-2 border-b px-3 py-2">
+            <FileDiff className="size-4 shrink-0 text-muted-foreground" />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm font-medium">Diff Preview</div>
+              <div className="truncate font-mono text-xs text-muted-foreground">
+                {diffTitle}
+              </div>
+            </div>
+            {selectedFilePath ? (
+              <Button
+                size="xs"
+                type="button"
+                variant="ghost"
+                onClick={() => setSelectedFilePath(null)}
+              >
+                All
+              </Button>
+            ) : null}
+          </div>
+          <div className="min-h-0 min-w-0 overflow-auto bg-muted/20">
+            <GitDiffViewer
+              diff={diffQuery.data?.diff ?? ""}
+              error={diffQuery.error}
+              fallback={diffQuery.data?.stat ?? ""}
+              loading={diffQuery.isFetching && !diffText}
+            />
+          </div>
+        </section>
+
+        <section className="grid min-h-[22rem] grid-rows-[auto_minmax(0,1fr)_auto] lg:min-h-0">
+          <div className="flex min-w-0 items-center justify-between gap-2 border-b px-3 py-2">
+            <div className="flex min-w-0 items-center gap-2">
+              <Clock className="size-4 text-muted-foreground" />
+              <div className="truncate text-sm font-medium">History</div>
+            </div>
+            <span className="text-xs text-muted-foreground">{commits.length}</span>
+          </div>
+          <GitHistoryPanel
+            commits={commits}
+            error={historyQuery.error}
+            fetching={historyQuery.isFetching}
+            selectedHash={selectedCommitHash}
+            onSelect={setSelectedCommitHash}
+          />
+          <div className="min-h-20 border-t p-3 text-xs">
+            {selectedCommit ? (
+              <div className="grid gap-1">
+                <div className="line-clamp-2 font-medium">
+                  {selectedCommit.subject}
+                </div>
+                <div className="truncate font-mono text-muted-foreground">
+                  {selectedCommit.hash}
+                </div>
+                <div className="truncate text-muted-foreground">
+                  {selectedCommit.authorName || "Unknown author"} ·{" "}
+                  {formatGitCommitDate(selectedCommit.authoredAt)}
+                </div>
+              </div>
+            ) : (
+              <div className="text-muted-foreground">No commit selected.</div>
+            )}
+          </div>
+        </section>
       </div>
     </DialogContent>
   )
 }
 
-function ChangedFilesList({ status }: { status?: GitStatusResponse }) {
-  const files = status?.changedFiles ?? []
+function GitBranchPopover({
+  branches,
+  branchFilter,
+  currentBranch,
+  loading,
+  locked,
+  newBranchName,
+  onBranchFilterChange,
+  onCheckout,
+  onCreateBranch,
+  onNewBranchNameChange,
+}: {
+  branches: GitBranchesResponse["branches"]
+  branchFilter: string
+  currentBranch?: string | null
+  loading: boolean
+  locked: boolean
+  newBranchName: string
+  onBranchFilterChange: (value: string) => void
+  onCheckout: (branch: string) => void
+  onCreateBranch: () => void
+  onNewBranchNameChange: (value: string) => void
+}) {
+  return (
+    <Popover>
+      <PopoverTrigger
+        render={
+          <Button
+            className="max-w-64 justify-start"
+            size="sm"
+            type="button"
+            variant="outline"
+          />
+        }
+      >
+        <GitBranch />
+        <span className="min-w-0 truncate">{currentBranch ?? "No branch"}</span>
+        <ChevronDown className="ml-1 size-3.5 text-muted-foreground" />
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-80 gap-0 p-0" side="bottom">
+        <PopoverHeader className="border-b p-3">
+          <PopoverTitle>Branches</PopoverTitle>
+          <PopoverDescription>
+            Current branch: {currentBranch ?? "detached"}
+          </PopoverDescription>
+        </PopoverHeader>
+        <div className="grid gap-2 p-3">
+          <Input
+            className="h-8"
+            placeholder="Find branch"
+            value={branchFilter}
+            onChange={(event) => onBranchFilterChange(event.target.value)}
+          />
+        </div>
+        <ScrollArea className="max-h-72 border-y">
+          <div className="grid gap-1 p-2">
+            {branches.map((branch) => (
+              <Button
+                className="justify-start"
+                disabled={locked || branch.current}
+                key={branch.name}
+                size="sm"
+                type="button"
+                variant={branch.current ? "secondary" : "ghost"}
+                onClick={() => onCheckout(branch.name)}
+              >
+                {branch.current ? <Check /> : <GitBranch />}
+                <span className="min-w-0 truncate">{branch.name}</span>
+              </Button>
+            ))}
+            {!branches.length ? (
+              <div className="px-2 py-6 text-center text-xs text-muted-foreground">
+                {loading ? "Loading branches..." : "No branches found."}
+              </div>
+            ) : null}
+          </div>
+        </ScrollArea>
+        <div className="grid gap-2 p-3">
+          <Input
+            className="h-8"
+            placeholder="New branch"
+            value={newBranchName}
+            onChange={(event) => onNewBranchNameChange(event.target.value)}
+          />
+          <Button
+            disabled={locked || !newBranchName.trim()}
+            size="sm"
+            type="button"
+            variant="outline"
+            onClick={onCreateBranch}
+          >
+            <Plus />
+            Create branch
+          </Button>
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+function ChangedFilesList({
+  files,
+  loading,
+  selectedPath,
+  onSelect,
+}: {
+  files: GitFileStatus[]
+  loading: boolean
+  selectedPath: string | null
+  onSelect: (path: string) => void
+}) {
+  if (loading) {
+    return (
+      <div className="m-3 rounded-md border bg-muted/25 px-3 py-2 text-xs text-muted-foreground">
+        Loading status...
+      </div>
+    )
+  }
   if (!files.length) {
     return (
-      <div className="rounded-md border bg-muted/25 px-3 py-2 text-xs text-muted-foreground">
+      <div className="m-3 rounded-md border bg-muted/25 px-3 py-2 text-xs text-muted-foreground">
         Working tree clean.
       </div>
     )
   }
   return (
-    <div className="grid max-h-40 gap-1 overflow-auto rounded-md border p-2">
+    <div className="grid gap-1 p-2">
       {files.map((file) => (
-        <div
-          className="grid min-w-0 grid-cols-[3rem_minmax(0,1fr)] gap-2 text-xs"
+        <button
+          className={cn(
+            "grid min-w-0 grid-cols-[2.25rem_minmax(0,1fr)] items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs outline-none hover:bg-muted focus-visible:bg-muted",
+            selectedPath === file.path && "bg-muted",
+          )}
           key={`${file.status}:${file.path}`}
+          type="button"
+          onClick={() => onSelect(file.path)}
         >
-          <span className="font-mono text-muted-foreground">{file.status}</span>
+          <span
+            className={cn(
+              "rounded-sm px-1 py-0.5 text-center font-mono text-[0.68rem]",
+              gitStatusClassName(file.status),
+            )}
+          >
+            {file.status.trim()}
+          </span>
           <span className="min-w-0 truncate font-mono">{file.path}</span>
-        </div>
+        </button>
       ))}
     </div>
   )
+}
+
+type DiffFile = {
+  hunks: DiffHunk[]
+  language: string | null
+  meta: string[]
+  path: string
+}
+
+type DiffHunk = {
+  header: string
+  lines: DiffLine[]
+}
+
+type DiffLine = {
+  content: string
+  newNumber: number | null
+  oldNumber: number | null
+  type: "add" | "context" | "delete" | "meta"
+}
+
+function GitDiffViewer({
+  diff,
+  error,
+  fallback,
+  loading,
+}: {
+  diff: string
+  error: unknown
+  fallback: string
+  loading: boolean
+}) {
+  const files = useMemo(() => parseUnifiedDiff(diff), [diff])
+
+  if (error) {
+    return (
+      <div className="p-3 font-mono text-xs text-destructive">
+        {readError(error)}
+      </div>
+    )
+  }
+  if (loading) {
+    return (
+      <div className="p-3 font-mono text-xs text-muted-foreground">
+        Loading diff...
+      </div>
+    )
+  }
+  if (!files.length) {
+    return (
+      <pre className="min-h-full min-w-0 overflow-auto p-3 font-mono text-xs leading-5 text-muted-foreground">
+        {fallback.trim() || "No tracked diff."}
+      </pre>
+    )
+  }
+
+  return (
+    <div className="min-w-max divide-y">
+      {files.map((file) => (
+        <section key={file.path} className="bg-background">
+          <div className="sticky top-0 z-10 border-b bg-background/95 px-3 py-2 backdrop-blur">
+            <div className="flex min-w-0 items-center gap-2">
+              <FileIcon className="size-4 shrink-0 text-muted-foreground" />
+              <span className="truncate font-mono text-xs font-medium">
+                {file.path}
+              </span>
+            </div>
+            {file.meta.length ? (
+              <div className="mt-1 flex min-w-0 flex-wrap gap-x-3 gap-y-1 font-mono text-[0.68rem] text-muted-foreground">
+                {file.meta.slice(0, 3).map((line) => (
+                  <span className="truncate" key={line}>
+                    {line}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+          </div>
+          <div className="py-1 font-mono text-xs leading-5">
+            {file.hunks.map((hunk, index) => (
+              <div key={`${file.path}:${index}`}>
+                <div className="grid grid-cols-[4.5rem_1.25rem_minmax(24rem,1fr)] border-y bg-muted/70 text-[0.68rem] text-muted-foreground">
+                  <div className="border-r px-2 py-1 text-right">line</div>
+                  <div />
+                  <div className="whitespace-pre px-2 py-1">{hunk.header}</div>
+                </div>
+                {hunk.lines.map((line, lineIndex) => (
+                  <DiffViewerLine
+                    fileLanguage={file.language}
+                    key={`${file.path}:${index}:${lineIndex}`}
+                    line={line}
+                  />
+                ))}
+              </div>
+            ))}
+          </div>
+        </section>
+      ))}
+    </div>
+  )
+}
+
+function DiffViewerLine({
+  fileLanguage,
+  line,
+}: {
+  fileLanguage: string | null
+  line: DiffLine
+}) {
+  const prefix =
+    line.type === "add"
+      ? "+"
+      : line.type === "delete"
+        ? "-"
+        : line.type === "meta"
+          ? "\\"
+          : " "
+  const lineNumber =
+    line.type === "delete" ? line.oldNumber : line.newNumber ?? line.oldNumber
+  const highlighted =
+    line.type === "meta"
+      ? escapeHtml(line.content)
+      : highlightCode(line.content || " ", fileLanguage)
+
+  return (
+    <div
+      className={cn(
+        "grid grid-cols-[4.5rem_1.25rem_minmax(24rem,1fr)] border-l-2",
+        line.type === "add" &&
+          "border-l-emerald-500 bg-emerald-500/10 text-emerald-950 dark:text-emerald-50",
+        line.type === "delete" &&
+          "border-l-red-500 bg-red-500/10 text-red-950 dark:text-red-50",
+        line.type === "context" && "border-l-transparent bg-background",
+        line.type === "meta" && "border-l-transparent bg-muted/40 text-muted-foreground",
+      )}
+    >
+      <div className="select-none border-r px-2 text-right text-[0.68rem] text-muted-foreground">
+        {lineNumber ?? ""}
+      </div>
+      <div className="select-none px-2 text-center text-muted-foreground">
+        {prefix}
+      </div>
+      <div
+        className="whitespace-pre px-2"
+        dangerouslySetInnerHTML={{ __html: highlighted }}
+      />
+    </div>
+  )
+}
+
+function parseUnifiedDiff(diff: string): DiffFile[] {
+  const trimmed = diff.trim()
+  if (!trimmed) {
+    return []
+  }
+  return splitUnifiedDiffFiles(trimmed)
+    .map(parseUnifiedDiffFile)
+    .filter((file): file is DiffFile => !!file)
+}
+
+function splitUnifiedDiffFiles(diff: string): string[][] {
+  const chunks: string[][] = []
+  let current: string[] = []
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("diff --git ") && current.length) {
+      chunks.push(current)
+      current = []
+    }
+    current.push(line)
+  }
+  if (current.length) {
+    chunks.push(current)
+  }
+  return chunks
+}
+
+function parseUnifiedDiffFile(lines: string[]): DiffFile | null {
+  const path = diffPathFromLines(lines)
+  if (!path) {
+    return null
+  }
+  const file: DiffFile = {
+    hunks: [],
+    language: languageFromPath(path),
+    meta: [],
+    path,
+  }
+  let currentHunk: DiffHunk | null = null
+  let oldLine = 0
+  let newLine = 0
+
+  for (const line of lines) {
+    if (line.startsWith("@@")) {
+      const range = parseHunkRange(line)
+      oldLine = range.oldStart
+      newLine = range.newStart
+      currentHunk = { header: line, lines: [] }
+      file.hunks.push(currentHunk)
+      continue
+    }
+
+    if (!currentHunk) {
+      if (
+        !line.startsWith("diff --git ") &&
+        !line.startsWith("--- ") &&
+        !line.startsWith("+++ ")
+      ) {
+        file.meta.push(line)
+      }
+      continue
+    }
+
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      currentHunk.lines.push({
+        content: line.slice(1),
+        newNumber: newLine,
+        oldNumber: null,
+        type: "add",
+      })
+      newLine += 1
+    } else if (line.startsWith("-") && !line.startsWith("---")) {
+      currentHunk.lines.push({
+        content: line.slice(1),
+        newNumber: null,
+        oldNumber: oldLine,
+        type: "delete",
+      })
+      oldLine += 1
+    } else if (line.startsWith("\\")) {
+      currentHunk.lines.push({
+        content: line,
+        newNumber: null,
+        oldNumber: null,
+        type: "meta",
+      })
+    } else {
+      currentHunk.lines.push({
+        content: line.startsWith(" ") ? line.slice(1) : line,
+        newNumber: newLine,
+        oldNumber: oldLine,
+        type: "context",
+      })
+      oldLine += 1
+      newLine += 1
+    }
+  }
+
+  return file.hunks.length ? file : null
+}
+
+function diffPathFromLines(lines: string[]): string | null {
+  for (const prefix of ["+++ ", "--- "]) {
+    for (const line of lines) {
+      if (!line.startsWith(prefix)) {
+        continue
+      }
+      const path = normalizeDiffPath(line.slice(prefix.length))
+      if (path && path !== "/dev/null") {
+        return path
+      }
+    }
+  }
+  const header = lines.find((line) => line.startsWith("diff --git "))
+  const parts = header?.split(/\s+/) ?? []
+  return normalizeDiffPath(parts[3] ?? parts[2] ?? "")
+}
+
+function normalizeDiffPath(path: string): string | null {
+  const trimmed = path.trim().replace(/^"|"$/g, "")
+  if (!trimmed) {
+    return null
+  }
+  return trimmed.replace(/^[ab]\//, "")
+}
+
+function parseHunkRange(header: string): { oldStart: number; newStart: number } {
+  const match = header.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+  return {
+    newStart: Number(match?.[2] ?? 0),
+    oldStart: Number(match?.[1] ?? 0),
+  }
+}
+
+function languageFromPath(path: string): string | null {
+  const extension = path.split(".").pop()?.toLocaleLowerCase()
+  switch (extension) {
+    case "bash":
+    case "sh":
+      return "bash"
+    case "css":
+      return "css"
+    case "go":
+      return "go"
+    case "htm":
+    case "html":
+    case "svg":
+    case "xml":
+      return "xml"
+    case "js":
+    case "jsx":
+    case "mjs":
+    case "cjs":
+      return "javascript"
+    case "json":
+      return "json"
+    case "md":
+    case "mdx":
+      return "markdown"
+    case "py":
+      return "python"
+    case "rs":
+      return "rust"
+    case "sql":
+      return "sql"
+    case "ts":
+    case "tsx":
+      return "typescript"
+    case "yaml":
+    case "yml":
+      return "yaml"
+    default:
+      return null
+  }
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;")
+}
+
+function GitHistoryPanel({
+  commits,
+  error,
+  fetching,
+  selectedHash,
+  onSelect,
+}: {
+  commits: GitCommit[]
+  error: unknown
+  fetching: boolean
+  selectedHash: string | null
+  onSelect: (hash: string) => void
+}) {
+  if (error) {
+    return (
+      <div className="p-3 text-xs text-destructive">{readError(error)}</div>
+    )
+  }
+  if (fetching && !commits.length) {
+    return (
+      <div className="p-3 text-xs text-muted-foreground">Loading history...</div>
+    )
+  }
+  if (!commits.length) {
+    return (
+      <div className="p-3 text-xs text-muted-foreground">No commits found.</div>
+    )
+  }
+  return (
+    <ScrollArea className="min-h-0">
+      <div className="grid gap-1 p-2">
+        {commits.map((commit) => (
+          <button
+            className={cn(
+              "grid gap-1 rounded-md px-2 py-2 text-left outline-none hover:bg-muted focus-visible:bg-muted",
+              selectedHash === commit.hash && "bg-muted",
+            )}
+            key={commit.hash}
+            type="button"
+            onClick={() => onSelect(commit.hash)}
+          >
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="min-w-0 flex-1 truncate text-xs font-medium">
+                {commit.subject}
+              </span>
+              <span className="shrink-0 font-mono text-[0.68rem] text-muted-foreground">
+                {commit.shortHash}
+              </span>
+            </div>
+            <div className="flex min-w-0 items-center gap-1.5 text-[0.68rem] text-muted-foreground">
+              <span className="min-w-0 truncate">
+                {commit.authorName || "Unknown author"}
+              </span>
+              <span aria-hidden="true">·</span>
+              <span className="shrink-0">{formatGitCommitDate(commit.authoredAt)}</span>
+            </div>
+            {commit.refs.length ? (
+              <div className="flex min-w-0 flex-wrap gap-1">
+                {commit.refs.slice(0, 3).map((ref) => (
+                  <span
+                    className="max-w-full truncate rounded bg-secondary px-1.5 py-0.5 text-[0.65rem] text-secondary-foreground"
+                    key={ref}
+                  >
+                    {ref}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+          </button>
+        ))}
+      </div>
+    </ScrollArea>
+  )
+}
+
+function gitStatusClassName(status: string): string {
+  if (status.includes("D")) {
+    return "bg-red-500/10 text-red-700 dark:text-red-300"
+  }
+  if (status.includes("A") || status.includes("?")) {
+    return "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+  }
+  if (status.includes("R") || status.includes("C")) {
+    return "bg-blue-500/10 text-blue-700 dark:text-blue-300"
+  }
+  return "bg-amber-500/10 text-amber-700 dark:text-amber-300"
+}
+
+function formatGitCommitDate(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return "Unknown date"
+  }
+  return date.toLocaleString(undefined, {
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    month: "short",
+    year: "numeric",
+  })
 }
 
 function filterGitBranches(
@@ -2745,6 +3557,21 @@ function UsageCapacityPill({
         <UsageCapacityDetails pending={pending} snapshot={snapshot} />
       </PopoverContent>
     </Popover>
+  )
+}
+
+function ChatInputPlanModeBadge({ visible }: { visible: boolean }) {
+  if (!visible) {
+    return null
+  }
+  return (
+    <Badge
+      className="pointer-events-none absolute right-1.5 top-1.5 z-10 border-primary/25 bg-background/95 text-foreground shadow-sm backdrop-blur dark:border-primary/40"
+      variant="outline"
+    >
+      <ListChecks />
+      <span>Plan mode</span>
+    </Badge>
   )
 }
 
@@ -3244,50 +4071,6 @@ function selectedModelOption(
   return models.find((model) => model.isDefault) ?? models[0]
 }
 
-function selectRateLimitSnapshot(
-  response?: CodexRateLimitsResponse,
-): CodexRateLimitSnapshot | undefined {
-  return (
-    response?.rateLimitsByLimitId?.codex ??
-    Object.values(response?.rateLimitsByLimitId ?? {}).find(Boolean) ??
-    response?.rateLimits
-  )
-}
-
-function usageCapacityLabel(snapshot?: CodexRateLimitSnapshot): string {
-  if (!snapshot) {
-    return "Usage unavailable"
-  }
-  if (snapshot.credits?.unlimited) {
-    return "Unlimited"
-  }
-  if (snapshot.rateLimitReachedType) {
-    return "Limit reached"
-  }
-  const parts = [
-    rateLimitSummary(snapshot.primary, "5h"),
-    rateLimitSummary(snapshot.secondary, "W"),
-  ]
-    .filter(Boolean)
-    .join(" · ")
-  return parts || "Usage n/a"
-}
-
-function usageCapacitySeverity(
-  snapshot?: CodexRateLimitSnapshot,
-): "fiveHour" | "weekly" | null {
-  if (!snapshot) {
-    return null
-  }
-  if (rateLimitWindowReached(snapshot.secondary)) {
-    return "weekly"
-  }
-  if (rateLimitWindowReached(snapshot.primary)) {
-    return "fiveHour"
-  }
-  return null
-}
-
 function selectBestAvailableAccount(
   accounts: AccountResponse[],
   snapshots: Record<string, CodexRateLimitSnapshot>,
@@ -3324,43 +4107,6 @@ function accountAvailabilityScore(snapshot?: CodexRateLimitSnapshot): number {
     return 0
   }
   return Math.min(...remainingPercents)
-}
-
-function rateLimitWindowReached(
-  window: CodexRateLimitWindow | null | undefined,
-): boolean {
-  return clampPercent(window?.usedPercent ?? 0) >= 100
-}
-
-function rateLimitSummary(
-  window: CodexRateLimitWindow | null | undefined,
-  fallbackLabel: string,
-): string | null {
-  if (!window) {
-    return null
-  }
-  const remainingPercent = Math.max(0, Math.round(100 - clampPercent(window.usedPercent)))
-  return `${compactRateLimitWindowLabel(window, fallbackLabel)} ${remainingPercent}%`
-}
-
-function compactRateLimitWindowLabel(
-  window: CodexRateLimitWindow | null | undefined,
-  fallbackLabel: string,
-): string {
-  const minutes = window?.windowDurationMins
-  if (!minutes) {
-    return fallbackLabel
-  }
-  if (minutes >= 10_080) {
-    return "W"
-  }
-  if (minutes === 300) {
-    return "5h"
-  }
-  if (minutes % 60 === 0) {
-    return `${minutes / 60}h`
-  }
-  return `${minutes}m`
 }
 
 function fullRateLimitWindowLabel(
@@ -3450,6 +4196,22 @@ function chatFolderName(workingDirectory?: string | null): string {
   return parts.at(-1) ?? trimmed
 }
 
+function chatFolderPath(workingDirectory?: string | null): string {
+  const path = workingDirectory?.trim()
+  if (!path) {
+    return "No folder"
+  }
+  return path.replace(/[\\/]+$/, "") || path
+}
+
+function chatFolderKey(workingDirectory?: string | null): string {
+  return chatFolderPath(workingDirectory)
+}
+
+function isConcreteFolderPath(path: string): boolean {
+  return !!path.trim() && path !== "No folder"
+}
+
 function displayNameForPath(path: string): string {
   const trimmed = path.replace(/[\\/]+$/, "")
   return trimmed.split(/[\\/]/).filter(Boolean).at(-1) || path
@@ -3479,10 +4241,6 @@ function formatPlanType(value: string): string {
 
 function formatRateLimitReached(value: string): string {
   return formatPlanType(value)
-}
-
-function clampPercent(value: number): number {
-  return Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0))
 }
 
 function runtimeSummary({
@@ -3564,6 +4322,27 @@ function canSend(
   attachments: ComposerAttachment[] = [],
 ) {
   return (!!content.trim() || attachments.length > 0) && !!workingDirectory.trim() && !!account
+}
+
+function routeWorkingDirectoryFromState(state: unknown): string {
+  if (!state || typeof state !== "object" || Array.isArray(state)) {
+    return ""
+  }
+  const value = (state as { workingDirectory?: unknown }).workingDirectory
+  return typeof value === "string" ? value.trim() : ""
+}
+
+function isAccountTokenInvalidatedError(error: unknown): boolean {
+  if (!error) {
+    return false
+  }
+  const message = error instanceof Error ? error.message : String(error)
+  return (
+    (error instanceof ApiError && error.status === 401) ||
+    /token_invalidated|authentication token .*invalidated|re-authenticate this account/i.test(
+      message,
+    )
+  )
 }
 
 function readError(caught: unknown): string {

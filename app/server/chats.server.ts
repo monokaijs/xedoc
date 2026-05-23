@@ -1,25 +1,26 @@
-import type { Chat, ChatMessage, CodexAccount, Prisma } from "@prisma/client"
+import type { CodexAccount, ThreadPreference } from "@prisma/client"
 import { randomUUID } from "node:crypto"
-import { basename, join } from "node:path"
+import { basename } from "node:path"
 import type {
   ChatAttachmentInput,
-  ChatMessageAttachment,
-  CodexCollaborationMode,
-  CodexRateLimitSnapshot,
-  CodexRateLimitWindow,
-  ChatResponse,
-  ChatMessageResponse,
   ChatEventPayloads,
   ChatEventType,
-  ContextWindowUsagePayload,
-  CodexReasoningEffort,
-  CodexPermissionMode,
-  CodexServiceTier,
+  ChatMessageAttachment,
+  ChatMessageResponse,
+  ChatResponse,
+  CodexCollaborationMode,
   CodexJsonRpcResponse,
+  CodexPermissionMode,
+  CodexRateLimitSnapshot,
+  CodexRateLimitWindow,
+  CodexReasoningEffort,
+  CodexServiceTier,
+  ContextWindowUsagePayload,
   CreateChatRequest,
   ExecuteChatRequest,
   JsonObject,
   JsonSerializable,
+  RunStatus,
   ServerRequestResponseRequest,
   UpdateChatRequest,
 } from "@/types"
@@ -27,28 +28,31 @@ import {
   codexRuntimeService,
   jsonRpcIdKey,
   readCodexRateLimitsForAccount,
-  resolveAccountCodexHome,
 } from "./codex-runtime.server"
 import { normalizeEnvironment } from "./env.server"
 import { HttpError } from "./http.server"
 import { asJsonObject, readString } from "./json.server"
+import { selectRateLimitSnapshot } from "@/lib/rate-limits"
 import {
-  isInternalEnvironmentContext,
-  importLocalCodexChats,
+  listLocalCodexSessionSummaries,
+  mirrorCodexSessionForAccount,
+  readLatestLocalCodexContextUsage,
+  readLocalCodexSessionMetadata,
+  readLocalCodexSessionTranscript,
   type ImportedLocalMessage,
-  type LocalCodexSessionIndexMetadata,
-  mirrorImportedCodexSessionForAccount,
-  readCodexSessionIndexFile,
-  readLatestLocalCodexContextUsageForChat,
-  readLocalCodexSessionTranscriptForChat,
+  type LocalCodexSessionSummary,
 } from "./local-codex-import.server"
 import { prisma } from "./prisma.server"
 import { publishChatEvent } from "./realtime.server"
-import { resolveDirectory } from "./workspaces.server"
+import {
+  archiveThreadPreference,
+  getThreadPreference,
+  listThreadPreferences,
+  preferenceToChatFields,
+  upsertThreadPreference,
+} from "./thread-preferences.server"
 import { readWorkspaceFileMetadata } from "./workspace-files.server"
-
-type PersistedChatMessage = ChatMessage
-type PersistedChat = Chat
+import { resolveDirectory } from "./workspaces.server"
 
 type SourceTranscriptMessage = {
   completedAt?: Date | null
@@ -81,22 +85,12 @@ type CodexRuntimeSession = {
 }
 
 type PendingServerRequest = {
-  chatId: string
+  messageId: string
   requestId: string
   requestKind: "approval" | "permissions" | "userInput"
   rpcId: string | number
   runtime: Pick<CodexRuntimeSession, "rejectServerRequest" | "respondToServerRequest">
-  messageId: string
-}
-
-type ActiveRunState = {
-  chatId: string
-  externalThreadId?: string | null
-  interruptRequested: boolean
-  permissionMode: CodexPermissionMode
-  runId: string
-  runtime?: CodexRuntimeSession
-  turnId?: string
+  threadId: string
 }
 
 type PreparedAttachment = {
@@ -119,793 +113,578 @@ type QueuedTurn = {
   workingDirectory: string
 }
 
+type RuntimeThreadState = {
+  accountId?: string | null
+  interruptRequested: boolean
+  messageKeys: Map<string, string>
+  messages: ChatMessageResponse[]
+  nextSequence: number
+  permissionMode: CodexPermissionMode
+  primed: boolean
+  queuedTurns: QueuedTurn[]
+  runId?: string | null
+  runtime?: CodexRuntimeSession
+  status: RunStatus | "IDLE"
+  threadId: string
+  turnId?: string | null
+  updatedAt: Date
+}
+
+type ThreadSnapshot = {
+  createdAt: Date
+  firstUserMessage?: string | null
+  preview?: string | null
+  threadId: string
+  title?: string | null
+  updatedAt: Date
+  workingDirectory?: string | null
+}
+
 const pendingServerRequests = new Map<string, PendingServerRequest>()
-const activeRuns = new Map<string, ActiveRunState>()
-const queuedTurnsByChatId = new Map<string, QueuedTurn[]>()
+const runtimeStates = new Map<string, RuntimeThreadState>()
 const accountRunLocks = new Map<string, Promise<void>>()
 const queueFlushLocks = new Map<string, Promise<void>>()
-const chatSequenceLocks = new Map<string, Promise<void>>()
 const runProjectionQueues = new Map<string, Promise<void>>()
 const timelineMessageLocks = new Map<string, Promise<void>>()
+const DEFAULT_CHAT_TITLE = "New Thread"
 
-async function withChatSequenceLock<T>(
-  chatId: string,
-  operation: () => Promise<T>,
-): Promise<T> {
-  const previous = chatSequenceLocks.get(chatId) ?? Promise.resolve()
-  let release!: () => void
-  const current = new Promise<void>((resolve) => {
-    release = resolve
-  })
-  const next = previous.catch(() => undefined).then(() => current)
-  chatSequenceLocks.set(chatId, next)
-
-  await previous.catch(() => undefined)
-  try {
-    return await operation()
-  } finally {
-    release()
-    if (chatSequenceLocks.get(chatId) === next) {
-      chatSequenceLocks.delete(chatId)
-    }
-  }
-}
-
-async function withAccountRunLock<T>(
-  accountId: string,
-  operation: () => Promise<T>,
-): Promise<T> {
-  const previous = accountRunLocks.get(accountId) ?? Promise.resolve()
-  let release!: () => void
-  const current = new Promise<void>((resolve) => {
-    release = resolve
-  })
-  const next = previous.catch(() => undefined).then(() => current)
-  accountRunLocks.set(accountId, next)
-
-  await previous.catch(() => undefined)
-  try {
-    return await operation()
-  } finally {
-    release()
-    if (accountRunLocks.get(accountId) === next) {
-      accountRunLocks.delete(accountId)
-    }
-  }
-}
-
-function createSequencedChatMessage(
-  chatId: string,
-  data: Omit<Prisma.ChatMessageUncheckedCreateInput, "chatId" | "sequence">,
-): Promise<ChatMessage> {
-  return withChatSequenceLock(chatId, async () =>
-    prisma.chatMessage.create({
-      data: {
-        ...data,
-        chatId,
-        sequence: await nextSequence(chatId),
-      },
-    }),
+export async function createChat(dto: CreateChatRequest): Promise<ChatResponse> {
+  const account = await readConnectedAccount(dto.accountId)
+  const workingDirectory = resolveDirectory(dto.workingDirectory)
+  const collaborationMode =
+    dto.collaborationMode === undefined
+      ? "default"
+      : normalizeCollaborationMode(dto.collaborationMode)
+  const permissionMode =
+    dto.permissionMode === undefined
+      ? "default"
+      : normalizePermissionMode(dto.permissionMode)
+  const runtime = runtimeForAccount(account)
+  const threadId = await ensureCodexThread(
+    runtime,
+    null,
+    workingDirectory,
+    collaborationMode,
   )
-}
-
-function enqueueRunProjection(
-  runId: string,
-  operation: () => Promise<void>,
-): Promise<void> {
-  const previous = runProjectionQueues.get(runId) ?? Promise.resolve()
-  const current = previous.catch(() => undefined).then(operation)
-  const stored = current.catch(() => undefined)
-  runProjectionQueues.set(runId, stored)
-  void stored.finally(() => {
-    if (runProjectionQueues.get(runId) === stored) {
-      runProjectionQueues.delete(runId)
-    }
+  const preference = await upsertThreadPreference(threadId, {
+    accountId: account.id,
+    autoRotateAccount: dto.autoRotateAccount ?? false,
+    collaborationMode,
+    model:
+      dto.model === undefined ? undefined : normalizeNullableRuntimeOption(dto.model),
+    permissionMode,
+    reasoningEffort:
+      dto.reasoningEffort === undefined
+        ? undefined
+        : normalizeReasoningEffort(dto.reasoningEffort),
+    serviceTier:
+      dto.serviceTier === undefined
+        ? undefined
+        : normalizeServiceTier(dto.serviceTier),
+    title: normalizeChatTitle(dto.title ?? "") ?? null,
+    workingDirectory,
   })
-  return current
+  const state = await ensureRuntimeState(threadId)
+  state.accountId = account.id
+  state.primed = true
+  state.runtime = runtime
+  state.updatedAt = new Date()
+  const chat = await buildChatResponse(threadId, preference)
+  emit(threadId, "chat.updated", chat)
+  return chat
 }
 
-async function drainRunProjectionQueue(runId: string): Promise<void> {
-  await runProjectionQueues.get(runId)?.catch(() => undefined)
+export async function listChats(): Promise<ChatResponse[]> {
+  const [preferences, snapshots] = await Promise.all([
+    listThreadPreferences(),
+    readThreadSnapshots(),
+  ])
+  const preferencesByThreadId = new Map(
+    preferences.map((preference) => [preference.threadId, preference]),
+  )
+  const threadIds = new Set([
+    ...snapshots.keys(),
+    ...runtimeStates.keys(),
+  ])
+  const chats = await Promise.all(
+    [...threadIds].map((threadId) =>
+      buildChatResponse(
+        threadId,
+        preferencesByThreadId.get(threadId) ?? null,
+        snapshots.get(threadId) ?? null,
+      ),
+    ),
+  )
+  return chats
+    .filter((chat) => chat.status !== "ARCHIVED")
+    .sort(
+      (left, right) =>
+        new Date(right.lastActivityAt).getTime() -
+          new Date(left.lastActivityAt).getTime() ||
+        new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
+    )
 }
 
-async function withTimelineMessageLock<T>(
-  key: string | null,
-  operation: () => Promise<T>,
-): Promise<T> {
-  if (!key) {
-    return operation()
-  }
-
-  const previous = timelineMessageLocks.get(key) ?? Promise.resolve()
-  let release!: () => void
-  const current = new Promise<void>((resolve) => {
-    release = resolve
-  })
-  const next = previous.catch(() => undefined).then(() => current)
-  timelineMessageLocks.set(key, next)
-
-  await previous.catch(() => undefined)
-  try {
-    return await operation()
-  } finally {
-    release()
-    if (timelineMessageLocks.get(key) === next) {
-      timelineMessageLocks.delete(key)
-    }
-  }
-}
-
-export async function createChat(dto: CreateChatRequest) {
-  const account = await prisma.codexAccount.findUnique({
-    where: { id: dto.accountId },
-  })
-  if (!account) {
-    throw new HttpError(400, "Account not found.")
-  }
-  if (account.status !== "CONNECTED") {
-    throw new HttpError(400, "Authenticate the account before starting a chat.")
-  }
-
-  return prisma.chat.create({
-    data: {
-      accountId: dto.accountId,
-      autoRotateAccount: dto.autoRotateAccount,
-      workingDirectory: resolveDirectory(dto.workingDirectory),
-      model: dto.model === undefined ? undefined : normalizeNullableRuntimeOption(dto.model),
-      reasoningEffort:
-        dto.reasoningEffort === undefined
-          ? undefined
-          : normalizeReasoningEffort(dto.reasoningEffort),
-      serviceTier:
-        dto.serviceTier === undefined
-          ? undefined
-          : normalizeServiceTier(dto.serviceTier),
-      collaborationMode:
-        dto.collaborationMode === undefined
-          ? undefined
-          : normalizeCollaborationMode(dto.collaborationMode),
-      permissionMode:
-        dto.permissionMode === undefined
-          ? undefined
-          : normalizePermissionMode(dto.permissionMode),
-      title: dto.title ?? "Untitled chat",
-    },
-  })
-}
-
-export async function listChats() {
-  const existingChats = await readVisibleChats()
-
-  if (existingChats.length) {
-    void refreshLocalChatIndex().catch((error) => {
-      console.warn(
-        "Failed to refresh local chat index.",
-        error instanceof Error ? error.message : error,
-      )
-    })
-    return existingChats
-  }
-
-  await refreshLocalChatIndex()
-  return readVisibleChats()
-}
-
-async function refreshLocalChatIndex(): Promise<void> {
-  await importLocalCodexChats()
-  await syncThreadIndexMetadata()
-}
-
-function readVisibleChats() {
-  return prisma.chat.findMany({
-    where: { status: { not: "ARCHIVED" } },
-    orderBy: [{ lastActivityAt: "desc" }, { updatedAt: "desc" }],
-  })
-}
-
-export async function getChat(chatId: string) {
-  const chat = await prisma.chat.findUnique({ where: { id: chatId } })
-  if (!chat) {
+export async function getChat(threadId: string): Promise<ChatResponse> {
+  const preference = await getThreadPreference(threadId)
+  const snapshot = await readThreadSnapshot(threadId)
+  if (!snapshot && !runtimeStates.has(threadId)) {
     throw new HttpError(404, "Chat not found.")
   }
-  return hydrateChatFromThreadIndex(chat)
+  return buildChatResponse(threadId, preference, snapshot)
 }
 
-export async function updateChat(chatId: string, dto: UpdateChatRequest) {
-  const chat = await getChat(chatId)
-  const accountId = await resolveUpdatedChatAccountId(chat, dto.accountId)
-  const accountChanged = accountId !== undefined && accountId !== chat.accountId
+export async function updateChat(
+  threadId: string,
+  dto: UpdateChatRequest,
+): Promise<ChatResponse> {
+  const chat = await getChat(threadId)
+  if (chat.status === "RUNNING") {
+    if (dto.accountId !== undefined && dto.accountId !== chat.accountId) {
+      throw new HttpError(400, "Wait for the current run to finish before switching accounts.")
+    }
+    if (
+      dto.collaborationMode !== undefined &&
+      normalizeCollaborationMode(dto.collaborationMode) !== chat.collaborationMode
+    ) {
+      throw new HttpError(400, "Wait for the current run to finish before changing modes.")
+    }
+    if (dto.workingDirectory !== undefined) {
+      throw new HttpError(400, "Wait for the current run to finish before changing workspace.")
+    }
+  }
+
+  const accountId = await resolveUpdatedChatAccountId(chat.accountId, dto.accountId)
+  if (
+    runtimeStates.get(threadId)?.primed &&
+    accountId !== undefined &&
+    accountId !== chat.accountId
+  ) {
+    throw new HttpError(
+      400,
+      "Send the first message before switching accounts on this chat.",
+    )
+  }
   const collaborationMode =
     dto.collaborationMode === undefined
       ? undefined
       : normalizeCollaborationMode(dto.collaborationMode)
-  const collaborationModeChanged =
-    collaborationMode !== undefined &&
-    collaborationMode !== normalizeStoredCollaborationMode(chat.collaborationMode)
   const permissionMode =
     dto.permissionMode === undefined
       ? undefined
       : normalizePermissionMode(dto.permissionMode)
-  const permissionModeChanged =
-    permissionMode !== undefined &&
-    permissionMode !== normalizeStoredPermissionMode(chat.permissionMode)
-  if (dto.workingDirectory !== undefined) {
-    throw new HttpError(400, "Chat working directory cannot be changed.")
-  }
-  if (accountChanged && chat.status === "RUNNING") {
-    throw new HttpError(400, "Wait for the current run to finish before switching accounts.")
-  }
-  if (collaborationModeChanged && chat.status === "RUNNING") {
-    throw new HttpError(400, "Wait for the current run to finish before changing modes.")
-  }
-  const updated = await prisma.chat.update({
-    where: { id: chatId },
-    data: {
-      accountId,
-      autoRotateAccount: dto.autoRotateAccount,
-      model: dto.model === undefined ? undefined : normalizeNullableRuntimeOption(dto.model),
-      reasoningEffort:
-        dto.reasoningEffort === undefined
-          ? undefined
-          : normalizeReasoningEffort(dto.reasoningEffort),
-      serviceTier:
-        dto.serviceTier === undefined
-          ? undefined
-          : normalizeServiceTier(dto.serviceTier),
-      collaborationMode,
-      permissionMode,
-      title: dto.title,
-      externalThreadId:
-        (accountChanged && !!chat.accountId) || collaborationModeChanged
-          ? null
-          : undefined,
-    },
+  const title =
+    dto.title === undefined
+      ? undefined
+      : normalizeChatTitle(dto.title) ?? "Untitled chat"
+  const workingDirectory =
+    dto.workingDirectory === undefined
+      ? undefined
+      : resolveDirectory(dto.workingDirectory)
+
+  const preference = await upsertThreadPreference(threadId, {
+    accountId,
+    autoRotateAccount: dto.autoRotateAccount,
+    collaborationMode,
+    model: dto.model === undefined ? undefined : normalizeNullableRuntimeOption(dto.model),
+    permissionMode,
+    reasoningEffort:
+      dto.reasoningEffort === undefined
+        ? undefined
+        : normalizeReasoningEffort(dto.reasoningEffort),
+    serviceTier:
+      dto.serviceTier === undefined ? undefined : normalizeServiceTier(dto.serviceTier),
+    title,
+    workingDirectory,
   })
-  if (accountChanged && !chat.accountId && accountId) {
-    void mirrorImportedCodexSessionForAccount(chatId, accountId).catch((error) => {
+
+  if (accountId) {
+    void mirrorCodexSessionForAccount(threadId, accountId).catch((error) => {
       console.warn(
-        "Failed to mirror imported Codex session.",
+        "Failed to mirror Codex session.",
         error instanceof Error ? error.message : error,
       )
     })
   }
-  if (dto.title !== undefined) {
-    void persistChatTitleToCodex(updated).catch((error) => {
+  if (title) {
+    void persistThreadTitleToCodex(threadId, preference, title).catch((error) => {
       console.warn(
         "Failed to persist Codex chat title.",
         error instanceof Error ? error.message : error,
       )
     })
   }
-  if (permissionModeChanged && permissionMode !== undefined) {
-    setActiveChatPermissionMode(chatId, permissionMode)
+  if (permissionMode) {
+    const state = runtimeStates.get(threadId)
+    if (state) {
+      state.permissionMode = permissionMode
+    }
     if (permissionMode === "fullAccess") {
-      await resolvePendingServerRequestsForFullAccess(chatId)
+      await resolvePendingServerRequestsForFullAccess(threadId)
     }
   }
+
+  const updated = await buildChatResponse(threadId, preference)
+  emit(threadId, "chat.updated", updated)
   return updated
 }
 
+export async function archiveChat(threadId: string): Promise<ChatResponse> {
+  await getChat(threadId)
+  const preference = await archiveThreadPreference(threadId)
+  const archived = await buildChatResponse(threadId, preference)
+  emit(threadId, "chat.updated", archived)
+  return archived
+}
+
+export async function listMessages(
+  threadId: string,
+  afterSequence = 0,
+  limit = 50,
+) {
+  const chat = await getChat(threadId)
+  const safeLimit = Math.min(Math.max(limit, 1), 200)
+  const sourceMessages = await readCodexTranscriptMessages(threadId)
+  const sourceResponses = sourceMessages.map((source, index) =>
+    sourceTranscriptResponse(threadId, chat, source, index, index + 1),
+  )
+  const overlay = overlayMessagesForList(threadId, sourceResponses)
+  const messages = [...sourceResponses, ...overlay]
+    .sort((left, right) => left.sequence - right.sequence)
+    .filter((message) => message.sequence > afterSequence)
+    .slice(0, safeLimit)
+  return {
+    data: messages,
+    nextCursor: messages.length ? messages[messages.length - 1].sequence : null,
+  }
+}
+
+export async function readChatContext(threadId: string) {
+  await getChat(threadId)
+  return { usage: await readLatestLocalCodexContextUsage(threadId) }
+}
+
+export async function respondToCodexServerRequest(
+  threadId: string,
+  requestId: string,
+  dto: ServerRequestResponseRequest,
+): Promise<ChatMessageResponse> {
+  await getChat(threadId)
+  const key = serverRequestKey(threadId, requestId)
+  const pending = pendingServerRequests.get(key)
+  if (!pending) {
+    throw new HttpError(410, "Server request is no longer active.")
+  }
+
+  const result = serverRequestResult(dto)
+  pending.runtime.respondToServerRequest(pending.rpcId, result)
+  pendingServerRequests.delete(key)
+  const updated = updateRuntimeMessage(threadId, pending.messageId, {
+    completedAt: new Date(),
+    metadataPatch: {
+      decision: dto.decision,
+      resolvedAt: new Date().toISOString(),
+      result: dto.result ?? result,
+      status: "resolved",
+    },
+    status: "COMPLETED",
+  })
+  if (!updated) {
+    throw new HttpError(410, "Server request is no longer active.")
+  }
+  emit(threadId, "message.updated", updated)
+  return updated
+}
+
+export async function executeMessage(
+  threadId: string,
+  dto: ExecuteChatRequest,
+) {
+  let chat = await getChat(threadId)
+  if (dto.accountId && chat.accountId && dto.accountId !== chat.accountId) {
+    throw new HttpError(
+      400,
+      "Switch the chat account before sending with a different account.",
+    )
+  }
+  if (!dto.accountId && chat.status !== "RUNNING") {
+    chat = await autoRotateChatAccountIfNeeded(chat)
+  }
+  const accountId = dto.accountId ?? chat.accountId
+  if (!accountId) {
+    throw new HttpError(400, "Choose a Codex account before sending messages.")
+  }
+  const account = await readConnectedAccount(accountId)
+  if (!chat.workingDirectory) {
+    throw new HttpError(400, "Select a working directory before sending messages.")
+  }
+  const workingDirectory = resolveDirectory(chat.workingDirectory)
+  const attachments = await prepareChatAttachments(
+    workingDirectory,
+    dto.attachments ?? [],
+  )
+  const messageContent = userMessageContent(dto.content, attachments)
+  if (!messageContent.trim() && !attachments.length) {
+    throw new HttpError(400, "Message content or an attachment is required.")
+  }
+
+  const requestedCollaborationMode =
+    dto.collaborationMode === undefined
+      ? undefined
+      : normalizeCollaborationMode(dto.collaborationMode)
+  const collaborationMode = requestedCollaborationMode ?? chat.collaborationMode
+  const permissionMode = chat.permissionMode
+  const startedAt = new Date()
+  const state = await ensureRuntimeState(threadId)
+
+  if (state.status === "RUNNING" || state.status === "QUEUED") {
+    if (dto.delivery === "steer") {
+      return steerActiveRunMessage({
+        account,
+        attachments,
+        collaborationMode,
+        content: dto.content,
+        messageContent,
+        metadata: dto.metadata ?? {},
+        permissionMode,
+        startedAt,
+        threadId,
+        workingDirectory,
+      })
+    }
+    return queueActiveRunMessage({
+      accountId,
+      attachments,
+      automaticTitleSeed: await automaticChatTitleSeed(
+        chat,
+        automaticTitleContent(dto.content, attachments),
+      ),
+      collaborationMode,
+      content: dto.content,
+      messageContent,
+      metadata: dto.metadata ?? {},
+      permissionMode,
+      queuedAt: startedAt,
+      threadId,
+      workingDirectory,
+    })
+  }
+
+  const message = appendRuntimeMessage(threadId, {
+    completedAt: startedAt,
+    content: messageContent,
+    metadata: messageMetadataWithAttachments(dto.metadata, attachments),
+    role: "USER",
+    status: "COMPLETED",
+  })
+  emit(threadId, "message.created", message)
+  const started = await startAssistantRunForMessage({
+    account,
+    attachments,
+    automaticTitleSeed: await automaticChatTitleSeed(
+      chat,
+      automaticTitleContent(dto.content, attachments),
+    ),
+    collaborationMode,
+    content: dto.content,
+    metadata: dto.metadata ?? {},
+    permissionMode,
+    requestedCollaborationMode,
+    startedAt,
+    threadId,
+    workingDirectory,
+  })
+  return {
+    message,
+    assistantMessage: started.assistantMessage,
+    runId: started.runId,
+    status: "QUEUED" as const,
+  }
+}
+
+export async function interruptChatRun(threadId: string) {
+  const chat = await getChat(threadId)
+  if (chat.status !== "RUNNING") {
+    throw new HttpError(409, "There is no running task to stop.")
+  }
+  const state = runtimeStates.get(threadId)
+  if (!state?.runId) {
+    throw new HttpError(409, "There is no active run to stop.")
+  }
+  state.interruptRequested = true
+  if (state.runtime && state.turnId) {
+    await sendTurnInterrupt(state.runtime, state.turnId, threadId)
+  }
+  return {
+    chatId: threadId,
+    runId: state.runId,
+    status: state.status === "RUNNING" ? "RUNNING" : "QUEUED",
+    message: state.turnId
+      ? "Stop signal sent to Codex."
+      : "Stop requested. Codex will be interrupted as soon as the turn starts.",
+  }
+}
+
+export function readInMemoryThreadStatus(threadId: string): ChatResponse["status"] {
+  const status = runtimeStates.get(threadId)?.status
+  return status === "RUNNING" || status === "QUEUED" ? "RUNNING" : "IDLE"
+}
+
+async function readConnectedAccount(accountId: string): Promise<CodexAccount> {
+  const account = await prisma.codexAccount.findUnique({ where: { id: accountId } })
+  if (!account) {
+    throw new HttpError(400, "Account not found.")
+  }
+  if (account.status !== "CONNECTED") {
+    throw new HttpError(400, "Authenticate the account before using this chat.")
+  }
+  return account
+}
+
 async function resolveUpdatedChatAccountId(
-  chat: Awaited<ReturnType<typeof getChat>>,
+  currentAccountId: string | null | undefined,
   accountId: string | null | undefined,
 ): Promise<string | null | undefined> {
-  if (accountId === undefined || accountId === chat.accountId) {
+  if (accountId === undefined || accountId === currentAccountId) {
     return undefined
   }
   if (accountId === null) {
     return null
   }
-
-  const account = await prisma.codexAccount.findUnique({
-    where: { id: accountId },
-  })
-  if (!account) {
-    throw new HttpError(400, "Account not found.")
-  }
-  if (account.status !== "CONNECTED") {
-    throw new HttpError(400, "Authenticate the account before attaching it to a chat.")
-  }
-  return account.id
+  return (await readConnectedAccount(accountId)).id
 }
 
-function normalizeNullableRuntimeOption(value: string | null): string | null {
-  if (value === null) {
-    return null
+async function readThreadSnapshots(): Promise<Map<string, ThreadSnapshot>> {
+  const sessions = await listLocalCodexSessionSummaries()
+  const snapshots = new Map<string, ThreadSnapshot>()
+  for (const session of sessions) {
+    snapshots.set(session.externalThreadId, snapshotFromSession(session))
   }
-  const trimmed = value.trim()
-  if (!trimmed) {
-    throw new HttpError(400, "Runtime option cannot be empty.")
-  }
-  return trimmed
+  return snapshots
 }
 
-function normalizeReasoningEffort(
-  value: CodexReasoningEffort | null,
-): CodexReasoningEffort | null {
-  if (value === null) {
-    return null
-  }
-  const allowed: CodexReasoningEffort[] = [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-  ]
-  if (!allowed.includes(value)) {
-    throw new HttpError(400, "reasoningEffort is invalid.")
-  }
-  return value
-}
-
-function normalizeServiceTier(value: CodexServiceTier | null): CodexServiceTier | null {
-  if (value === null || value === "fast" || value === "flex") {
-    return value
-  }
-  throw new HttpError(400, "serviceTier is invalid.")
-}
-
-function normalizeCollaborationMode(
-  value: CodexCollaborationMode | null,
-): CodexCollaborationMode {
-  if (value === null || value === "default") {
-    return "default"
-  }
-  if (value === "plan") {
-    return value
-  }
-  throw new HttpError(400, "collaborationMode is invalid.")
-}
-
-function normalizeStoredCollaborationMode(
-  value: string | null | undefined,
-): CodexCollaborationMode {
-  return value === "plan" ? "plan" : "default"
-}
-
-function normalizePermissionMode(
-  value: CodexPermissionMode | null,
-): CodexPermissionMode {
-  if (value === null || value === "default") {
-    return "default"
-  }
-  if (value === "fullAccess") {
-    return value
-  }
-  throw new HttpError(400, "permissionMode is invalid.")
-}
-
-function normalizeStoredPermissionMode(
-  value: string | null | undefined,
-): CodexPermissionMode {
-  return value === "fullAccess" ? "fullAccess" : "default"
-}
-
-async function automaticChatTitleSeed(
-  chatId: string,
-  currentTitle: string | null | undefined,
-  currentContent: string,
-): Promise<string | null> {
-  if (!isGenericChatTitle(currentTitle)) {
-    return null
-  }
-
-  const existingUserMessage = await prisma.chatMessage.findFirst({
-    where: {
-      chatId,
-      kind: "CHAT",
-      role: "USER",
-      content: { not: "" },
-    },
-    orderBy: { sequence: "asc" },
-  })
-  const seed = existingUserMessage?.content ?? currentContent
-  const trimmed = seed.trim()
-  return trimmed ? trimmed : null
-}
-
-async function applyFallbackChatTitleIfAllowed(
-  chatId: string,
-  seed: string | null,
-): Promise<string | null> {
-  const fallbackTitle = seed ? fallbackChatTitle(seed) : null
-  if (!fallbackTitle) {
-    return null
-  }
-
-  const chat = await prisma.chat.findUnique({
-    where: { id: chatId },
-    select: { title: true },
-  })
-  if (!chat || !isGenericChatTitle(chat.title)) {
-    return null
-  }
-
-  await updateChatTitleFromCodex(chatId, fallbackTitle)
-  return fallbackTitle
-}
-
-async function hydrateChatFromThreadIndex(chat: Chat): Promise<Chat> {
-  if (!chat.accountId || !chat.externalThreadId) {
-    return chat
-  }
-  return refreshChatFromThreadIndex(chat, chat.accountId, chat.externalThreadId)
-}
-
-function isGenericChatTitle(value: string | null | undefined): boolean {
-  const normalized = normalizeTitleComparisonValue(value)
-  return (
-    !normalized ||
-    normalized === "untitled chat" ||
-    normalized === "conversation" ||
-    normalized === "new chat" ||
-    normalized === "chat"
-  )
-}
-
-function fallbackChatTitle(seed: string): string | null {
-  const words = seed
-    .split(/\s+/)
-    .map((word) => word.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
-    .filter(Boolean)
-    .slice(0, 5)
-  if (!words.length) {
-    return null
-  }
-  const title = words.join(" ")
-  return `${title.charAt(0).toUpperCase()}${title.slice(1)}`.slice(0, 80)
-}
-
-async function syncThreadIndexMetadata(): Promise<void> {
-  const chats = await prisma.chat.findMany({
-    where: {
-      accountId: { not: null },
-      externalThreadId: { not: null },
-      status: { not: "ARCHIVED" },
-    },
-    select: {
-      accountId: true,
-      externalThreadId: true,
-      id: true,
-      lastActivityAt: true,
-      title: true,
-    },
-  })
-  const accountIds = [
-    ...new Set(
-      chats
-        .map((chat) => chat.accountId)
-        .filter((accountId): accountId is string => !!accountId),
-    ),
-  ]
-  if (!accountIds.length) {
-    return
-  }
-
-  const indexes = new Map<
-    string,
-    Awaited<ReturnType<typeof readCodexSessionIndexFile>>
-  >()
-  await Promise.all(
-    accountIds.map(async (accountId) => {
-      indexes.set(
-        accountId,
-        await readCodexSessionIndexFile(
-          join(resolveAccountCodexHome(accountId), "session_index.jsonl"),
-        ),
-      )
-    }),
-  )
-
-  for (const chat of chats) {
-    if (!chat.accountId || !chat.externalThreadId) {
-      continue
-    }
-    const metadata = indexes.get(chat.accountId)?.get(chat.externalThreadId)
-    const data = threadIndexChatUpdate(chat, metadata)
-    if (data) {
-      const updated = await prisma.chat.update({ where: { id: chat.id }, data })
-      emit(chat.id, "chat.updated", toChatResponse(updated))
-    }
-  }
-}
-
-async function refreshChatFromThreadIndex(
-  chat: Chat,
-  accountId: string,
+async function readThreadSnapshot(
   threadId: string,
-): Promise<Chat> {
-  const index = await readCodexSessionIndexFile(
-    join(resolveAccountCodexHome(accountId), "session_index.jsonl"),
-  )
-  const data = threadIndexChatUpdate(chat, index.get(threadId))
-  if (!data) {
-    return chat
-  }
-  const updated = await prisma.chat.update({ where: { id: chat.id }, data })
-  emit(chat.id, "chat.updated", toChatResponse(updated))
-  return updated
-}
-
-function threadIndexChatUpdate(
-  chat: Pick<Chat, "lastActivityAt" | "title">,
-  metadata: LocalCodexSessionIndexMetadata | null | undefined,
-): Prisma.ChatUpdateInput | null {
-  if (!metadata) {
+): Promise<ThreadSnapshot | null> {
+  const session = await readLocalCodexSessionMetadata(threadId)
+  if (!session) {
     return null
   }
-  const data: Prisma.ChatUpdateInput = {}
-  if (
-    metadata.title &&
-    normalizeTitleComparisonValue(chat.title) !==
-      normalizeTitleComparisonValue(metadata.title) &&
-    (!isGenericChatTitle(metadata.title) || isGenericChatTitle(chat.title))
-  ) {
-    data.title = metadata.title
-  }
-  if (
-    metadata.updatedAt &&
-    chat.lastActivityAt.getTime() !== metadata.updatedAt.getTime()
-  ) {
-    data.lastActivityAt = metadata.updatedAt
-  }
-  return Object.keys(data).length ? data : null
-}
-
-export async function archiveChat(chatId: string) {
-  await getChat(chatId)
-  return prisma.chat.update({
-    where: { id: chatId },
-    data: { status: "ARCHIVED" },
-  })
-}
-
-export async function listMessages(chatId: string, afterSequence = 0, limit = 50) {
-  const chat = await getChat(chatId)
-  await reconcileSettledRunMessages(chatId)
-  const safeLimit = Math.min(Math.max(limit, 1), 200)
-  const data = await listSourceBackedMessages(chat, afterSequence, safeLimit)
   return {
-    data,
-    nextCursor: data.length ? data[data.length - 1].sequence : null,
+    createdAt: session.createdAt,
+    firstUserMessage: session.firstUserMessage ?? null,
+    preview: session.preview ?? null,
+    threadId,
+    title: session.title,
+    updatedAt: session.updatedAt,
+    workingDirectory: session.workingDirectory ?? null,
   }
 }
 
-export async function readChatContext(chatId: string) {
-  const chat = await getChat(chatId)
-  if (!chat.externalThreadId) {
-    return { usage: null }
-  }
+function snapshotFromSession(session: LocalCodexSessionSummary): ThreadSnapshot {
   return {
-    usage: await readLatestLocalCodexContextUsageForChat(
-      chat.id,
-      chat.externalThreadId,
-    ),
+    createdAt: session.createdAt,
+    firstUserMessage: session.firstUserMessage ?? null,
+    preview: session.preview ?? null,
+    threadId: session.externalThreadId,
+    title: session.title,
+    updatedAt: session.updatedAt,
+    workingDirectory: session.workingDirectory ?? null,
   }
 }
 
-async function listSourceBackedMessages(
-  chat: Chat,
-  afterSequence: number,
-  limit: number,
-): Promise<ChatMessageResponse[]> {
-  const localMessages = await prisma.chatMessage.findMany({
-    where: { chatId: chat.id },
-    orderBy: { sequence: "asc" },
+async function buildChatResponse(
+  threadId: string,
+  preference: ThreadPreference | null,
+  snapshot?: ThreadSnapshot | null,
+): Promise<ChatResponse> {
+  const resolvedSnapshot = snapshot === undefined ? await readThreadSnapshot(threadId) : snapshot
+  const state = runtimeStates.get(threadId)
+  const preferenceFields = preferenceToChatFields(preference)
+  const createdAt =
+    preference?.createdAt ??
+    resolvedSnapshot?.createdAt ??
+    state?.updatedAt ??
+    new Date()
+  const updatedAt =
+    state?.updatedAt ??
+    resolvedSnapshot?.updatedAt ??
+    preference?.updatedAt ??
+    createdAt
+  const title = resolveChatDisplayTitle({
+    preferenceTitle: preference?.title,
+    preview: resolvedSnapshot?.preview,
+    seed:
+      lastUserMessageContent(state?.messages ?? []) ??
+      resolvedSnapshot?.firstUserMessage ??
+      null,
+    snapshotTitle: resolvedSnapshot?.title,
   })
-  const sourceMessages =
-    chat.status === "RUNNING" ? [] : await readCodexTranscriptMessages(chat)
-  const messages = sourceMessages.length
-    ? mergeSourceTranscriptMessages(chat, sourceMessages, localMessages)
-    : localMessages.map(toChatMessageResponse)
-
-  return messages
-    .filter((message) => message.sequence > afterSequence)
-    .sort((left, right) => left.sequence - right.sequence)
-    .slice(0, limit)
+  return {
+    ...preferenceFields,
+    id: threadId,
+    externalThreadId: threadId,
+    lastActivityAt: updatedAt,
+    status: preference?.archivedAt
+      ? "ARCHIVED"
+      : state?.status === "RUNNING" || state?.status === "QUEUED"
+        ? "RUNNING"
+        : "IDLE",
+    title,
+    workingDirectory:
+      resolvedSnapshot?.workingDirectory ?? preferenceFields.workingDirectory,
+    createdAt,
+    updatedAt,
+  }
 }
 
 async function readCodexTranscriptMessages(
-  chat: Chat,
+  threadId: string,
 ): Promise<SourceTranscriptMessage[]> {
-  if (!chat.externalThreadId) {
-    return []
-  }
-
-  const runtimeMessages = await readRuntimeTranscriptMessages(chat)
-  if (runtimeMessages.length) {
-    return runtimeMessages
-  }
-
-  const session = await readLocalCodexSessionTranscriptForChat(
-    chat.id,
-    chat.externalThreadId,
-  )
+  const session = await readLocalCodexSessionTranscript(threadId)
   return session
     ? session.messages.map((message) => sourceMessageFromLocalSession(message))
     : []
 }
 
-async function readRuntimeTranscriptMessages(
-  chat: Chat,
-): Promise<SourceTranscriptMessage[]> {
-  if (!chat.accountId || !chat.externalThreadId) {
-    return []
-  }
-  const account = await prisma.codexAccount.findUnique({
-    where: { id: chat.accountId },
-  })
-  if (!account || account.status !== "CONNECTED") {
-    return []
-  }
-  const runtime = codexRuntimeService.getRuntime({
-    accountId: account.id,
-    command: account.command,
-    args: normalizeAccountArgs(account.args),
-    workingDirectory: null,
-    environment: normalizeEnvironment(account.environment),
-  })
-
-  try {
-    const response = await runtime.request(
-      "thread/turns/list",
-      { threadId: chat.externalThreadId, limit: 1_000 },
-      30_000,
-    )
-    const messages = sourceMessagesFromTurns(response.result)
-    if (messages.length) {
-      return messages
-    }
-  } catch {
-    // Fall back to thread/read and then the on-disk session transcript.
-  }
-
-  try {
-    const response = await runtime.request(
-      "thread/read",
-      { includeTurns: true, threadId: chat.externalThreadId },
-      30_000,
-    )
-    return sourceMessagesFromTurns(response.result)
-  } catch {
-    return []
-  }
-}
-
-function mergeSourceTranscriptMessages(
-  chat: Chat,
-  sourceMessages: SourceTranscriptMessage[],
-  localMessages: PersistedChatMessage[],
-): ChatMessageResponse[] {
-  const localTranscriptMessages = localMessages.filter(isLocalTranscriptMessage)
-  const matchedLocalIds = new Set<string>()
-  const sourceRoles = new Set(sourceMessages.map((message) => message.role))
-  let nextSyntheticSequence = Math.max(
-    0,
-    ...localMessages.map((message) => message.sequence),
-  )
-
-  const sourceResponses = sourceMessages.map((source, index) => {
-    const local = findNextLocalTranscriptMessage(
-      source,
-      localTranscriptMessages,
-      matchedLocalIds,
-    )
-    if (local) {
-      matchedLocalIds.add(local.id)
-    }
-    const sequence = local?.sequence ?? ++nextSyntheticSequence
-    return sourceTranscriptResponse(chat, source, index, local, sequence)
-  })
-
-  const localProjection = localMessages
-    .filter((message) => !matchedLocalIds.has(message.id))
-    .filter((message) => shouldKeepLocalProjectionMessage(message, sourceRoles))
-    .map(toChatMessageResponse)
-
-  return [...sourceResponses, ...localProjection].sort(
-    (left, right) => left.sequence - right.sequence,
-  )
-}
-
-function isLocalTranscriptMessage(message: PersistedChatMessage): boolean {
-  return (
-    message.kind === "CHAT" &&
-    (message.role === "USER" || message.role === "ASSISTANT")
-  )
-}
-
-function shouldKeepLocalProjectionMessage(
-  message: PersistedChatMessage,
-  sourceRoles: Set<SourceTranscriptMessage["role"]>,
-): boolean {
-  if (message.kind !== "CHAT") {
-    return true
-  }
-  if (message.status !== "COMPLETED") {
-    return true
-  }
-  if (!isLocalTranscriptMessage(message)) {
-    return true
-  }
-  return !sourceRoles.has(message.role as SourceTranscriptMessage["role"])
-}
-
-function findNextLocalTranscriptMessage(
-  source: SourceTranscriptMessage,
-  localMessages: PersistedChatMessage[],
-  matchedLocalIds: Set<string>,
-): PersistedChatMessage | null {
-  return (
-    localMessages.find(
-      (message) =>
-        !matchedLocalIds.has(message.id) &&
-        message.role === source.role &&
-        source.itemId &&
-        message.itemId === source.itemId,
-    ) ??
-    localMessages.find(
-      (message) =>
-        !matchedLocalIds.has(message.id) &&
-        message.role === source.role &&
-        source.turnId &&
-        message.turnId === source.turnId,
-    ) ??
-    localMessages.find(
-      (message) =>
-        !matchedLocalIds.has(message.id) && message.role === source.role,
-    ) ??
-    null
-  )
-}
-
 function sourceTranscriptResponse(
-  chat: Chat,
+  threadId: string,
+  chat: ChatResponse,
   source: SourceTranscriptMessage,
   index: number,
-  local: PersistedChatMessage | null,
   sequence: number,
 ): ChatMessageResponse {
-  const createdAt = source.createdAt ?? local?.createdAt ?? chat.createdAt
-  const completedAt = source.completedAt ?? source.createdAt ?? local?.completedAt
+  const createdAt = source.createdAt ?? chat.createdAt
+  const completedAt = source.completedAt ?? source.createdAt ?? createdAt
   return {
-    chatId: chat.id,
+    chatId: threadId,
     completedAt,
     content: source.content,
     createdAt,
-    id:
-      local?.id ??
-      sourceTranscriptId(chat.id, chat.externalThreadId, source, index),
-    itemId: source.itemId ?? local?.itemId ?? null,
+    id: sourceTranscriptId(threadId, source, index),
+    itemId: source.itemId ?? null,
     kind: source.kind ?? "CHAT",
-    metadata:
-      (source.metadata
-        ? (toSerializable(source.metadata) as ChatMessageResponse["metadata"])
-        : null) ??
-      (local?.metadata as ChatMessageResponse["metadata"] | null) ??
-      sourceTranscriptMetadata(source),
-    rawPayload: toSerializable(source.rawPayload ?? local?.rawPayload ?? null),
-    requestId: local?.requestId ?? null,
+    metadata: source.metadata
+      ? (toSerializable(source.metadata) as ChatMessageResponse["metadata"])
+      : sourceTranscriptMetadata(source),
+    rawPayload: toSerializable(source.rawPayload ?? null),
+    requestId: null,
     role: source.role,
-    runId: local?.runId ?? null,
+    runId: null,
     sequence,
-    status: local?.status === "FAILED" ? "FAILED" : "COMPLETED",
-    turnId: source.turnId ?? local?.turnId ?? null,
+    status: "COMPLETED",
+    turnId: source.turnId ?? null,
   }
 }
 
 function sourceTranscriptId(
-  chatId: string,
-  threadId: string | null,
+  threadId: string,
   source: SourceTranscriptMessage,
   index: number,
 ): string {
   return [
     "codex",
-    chatId,
-    threadId ?? "thread",
+    threadId,
     source.turnId ?? "turn",
     source.itemId ?? index,
     source.role.toLowerCase(),
@@ -928,129 +707,12 @@ function sourceMessageFromLocalSession(
     completedAt: message.createdAt,
     content: message.content,
     createdAt: message.createdAt,
-    metadata: message.metadata,
     kind: message.kind,
+    metadata: message.metadata,
     rawPayload: message.rawPayload,
     role: message.role,
     source: "session",
   }
-}
-
-function sourceMessagesFromTurns(value: unknown): SourceTranscriptMessage[] {
-  return readTurnObjects(value).flatMap((turn) => sourceMessagesFromTurn(turn))
-}
-
-function readTurnObjects(value: unknown): JsonObject[] {
-  const root = asJsonObject(value)
-  const thread = asJsonObject(root?.thread)
-  const candidates = [
-    Array.isArray(value) ? value : null,
-    root?.data,
-    root?.items,
-    root?.turns,
-    thread?.turns,
-  ]
-  for (const candidate of candidates) {
-    const rows = readJsonObjectArray(candidate)
-    if (rows) {
-      return rows
-    }
-  }
-  return []
-}
-
-function sourceMessagesFromTurn(turn: JsonObject): SourceTranscriptMessage[] {
-  const turnId =
-    readString(turn.id) ??
-    readString(turn.turnId) ??
-    readString(turn.turn_id) ??
-    null
-  const createdAt = readDateValue(
-    turn.createdAt ?? turn.created_at ?? turn.timestamp ?? turn.startedAt,
-  )
-  const completedAt = readDateValue(
-    turn.completedAt ?? turn.completed_at ?? turn.finishedAt ?? turn.updatedAt,
-  )
-  const items = readJsonObjectArray(turn.items) ?? []
-  return items
-    .map((item) =>
-      sourceMessageFromTurnItem(item, {
-        completedAt,
-        createdAt,
-        turnId,
-      }),
-    )
-    .filter((message): message is SourceTranscriptMessage => !!message)
-}
-
-function sourceMessageFromTurnItem(
-  item: JsonObject,
-  turn: {
-    completedAt?: Date | null
-    createdAt?: Date | null
-    turnId?: string | null
-  },
-): SourceTranscriptMessage | null {
-  const role = sourceItemRole(item)
-  if (!role) {
-    return null
-  }
-  const content = sourceItemText(item)
-  if (!content.trim() || isInternalEnvironmentContext(content)) {
-    return null
-  }
-  return {
-    completedAt:
-      readDateValue(item.completedAt ?? item.completed_at) ?? turn.completedAt,
-    content,
-    createdAt:
-      readDateValue(item.createdAt ?? item.created_at ?? item.timestamp) ??
-      turn.createdAt,
-    itemId:
-      readString(item.id) ??
-      readString(item.itemId) ??
-      readString(item.item_id) ??
-      null,
-    rawPayload: compactSourceTurnItem(item),
-    role,
-    source: "runtime",
-    turnId:
-      readString(item.turnId) ??
-      readString(item.turn_id) ??
-      turn.turnId ??
-      null,
-  }
-}
-
-function sourceItemRole(
-  item: JsonObject,
-): SourceTranscriptMessage["role"] | null {
-  const role = readString(item.role)?.toLowerCase()
-  if (role === "user") {
-    return "USER"
-  }
-  if (role === "assistant" || role === "agent") {
-    return "ASSISTANT"
-  }
-
-  const type = readString(item.type)?.replace(/[_\s-]+/g, "").toLowerCase()
-  if (type === "usermessage" || type === "inputmessage") {
-    return "USER"
-  }
-  if (type === "agentmessage" || type === "assistantmessage") {
-    return "ASSISTANT"
-  }
-  return null
-}
-
-function sourceItemText(item: JsonObject): string {
-  const text =
-    readText(item.text) ??
-    readText(item.message) ??
-    readText(item.output) ??
-    readContentText(item.content) ??
-    ""
-  return appendSourceImageTags(text, item)
 }
 
 function readContentText(value: unknown): string | undefined {
@@ -1078,28 +740,6 @@ function readContentText(value: unknown): string | undefined {
   return text.length ? text : undefined
 }
 
-function appendSourceImageTags(content: string, item: JsonObject): string {
-  const tags = [
-    ...sourceImageTagsFromArray(item.images),
-    ...sourceImageTagsFromArray(item.local_images),
-    ...sourceImageTagsFromArray(item.localImages),
-  ]
-  return [content, ...tags].filter(Boolean).join("\n\n")
-}
-
-function sourceImageTagsFromArray(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return []
-  }
-  return value
-    .map((entry) =>
-      typeof entry === "string"
-        ? sourceImageTagFromString(entry)
-        : sourceImageTagFromObject(asJsonObject(entry)),
-    )
-    .filter((entry): entry is string => !!entry)
-}
-
 function sourceImageTagFromObject(object: JsonObject | undefined): string | null {
   if (!object) {
     return null
@@ -1117,257 +757,285 @@ function sourceImageTagFromString(value: string | undefined): string | null {
   return src ? `<image>${src}</image>` : null
 }
 
-function readJsonObjectArray(value: unknown): JsonObject[] | null {
-  if (!Array.isArray(value)) {
+async function ensureRuntimeState(threadId: string): Promise<RuntimeThreadState> {
+  const existing = runtimeStates.get(threadId)
+  if (existing) {
+    return existing
+  }
+  const sourceCount = (await readLocalCodexSessionTranscript(threadId))?.messages.length ?? 0
+  const state: RuntimeThreadState = {
+    interruptRequested: false,
+    messageKeys: new Map(),
+    messages: [],
+    nextSequence: sourceCount + 1,
+    permissionMode: "default",
+    primed: false,
+    queuedTurns: [],
+    status: "IDLE",
+    threadId,
+    updatedAt: new Date(),
+  }
+  runtimeStates.set(threadId, state)
+  return state
+}
+
+function getRuntimeState(threadId: string): RuntimeThreadState {
+  const state = runtimeStates.get(threadId)
+  if (!state) {
+    throw new Error(`Missing runtime state for ${threadId}.`)
+  }
+  return state
+}
+
+function appendRuntimeMessage(
+  threadId: string,
+  input: {
+    completedAt?: Date | null
+    content: string
+    id?: string
+    itemId?: string | null
+    kind?: ChatMessageResponse["kind"]
+    metadata?: unknown
+    rawPayload?: unknown
+    requestId?: string | null
+    role: ChatMessageResponse["role"]
+    runId?: string | null
+    status?: ChatMessageResponse["status"]
+    turnId?: string | null
+  },
+): ChatMessageResponse {
+  const state = getRuntimeState(threadId)
+  const createdAt = new Date()
+  const message: ChatMessageResponse = {
+    chatId: threadId,
+    completedAt: input.completedAt ?? null,
+    content: input.content,
+    createdAt,
+    id: input.id ?? `runtime:${threadId}:${randomUUID()}`,
+    itemId: input.itemId ?? null,
+    kind: input.kind ?? "CHAT",
+    metadata: input.metadata
+      ? (toSerializable(input.metadata) as ChatMessageResponse["metadata"])
+      : null,
+    rawPayload: input.rawPayload ? toSerializable(input.rawPayload) : null,
+    requestId: input.requestId ?? null,
+    role: input.role,
+    runId: input.runId ?? state.runId ?? null,
+    sequence: state.nextSequence,
+    status: input.status ?? "PENDING",
+    turnId: input.turnId ?? null,
+  }
+  state.nextSequence += 1
+  state.updatedAt = createdAt
+  state.messages.push(message)
+  return message
+}
+
+function updateRuntimeMessage(
+  threadId: string,
+  messageId: string,
+  patch: {
+    completedAt?: Date | null
+    content?: string
+    metadata?: unknown
+    metadataPatch?: JsonObject
+    rawPayload?: unknown
+    status?: ChatMessageResponse["status"]
+    turnId?: string | null
+  },
+): ChatMessageResponse | null {
+  const state = runtimeStates.get(threadId)
+  const index = state?.messages.findIndex((message) => message.id === messageId) ?? -1
+  if (!state || index < 0) {
     return null
   }
-  return value
-    .map((entry) => asJsonObject(entry))
-    .filter((entry): entry is JsonObject => !!entry)
+  const existing = state.messages[index]
+  const updated: ChatMessageResponse = {
+    ...existing,
+    completedAt: patch.completedAt ?? existing.completedAt,
+    content: patch.content ?? existing.content,
+    metadata:
+      patch.metadata !== undefined
+        ? (toSerializable(patch.metadata) as ChatMessageResponse["metadata"])
+        : patch.metadataPatch
+          ? ({
+              ...(asJsonObject(existing.metadata) ?? {}),
+              ...patch.metadataPatch,
+            } as ChatMessageResponse["metadata"])
+          : existing.metadata,
+    rawPayload:
+      patch.rawPayload !== undefined
+        ? toSerializable(patch.rawPayload)
+        : existing.rawPayload,
+    status: patch.status ?? existing.status,
+    turnId: patch.turnId === undefined ? existing.turnId : patch.turnId,
+  }
+  state.messages[index] = updated
+  state.updatedAt = new Date()
+  return updated
 }
 
-function readDateValue(value: unknown): Date | null {
-  if (typeof value !== "string") {
-    return null
+function overlayMessagesForList(
+  threadId: string,
+  sourceMessages: ChatMessageResponse[],
+): ChatMessageResponse[] {
+  const state = runtimeStates.get(threadId)
+  if (!state) {
+    return []
   }
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? null : date
+  if (!sourceMessages.length) {
+    return state.messages
+  }
+  return state.messages.filter((message) => keepOverlayMessage(message, sourceMessages))
 }
 
-function compactSourceTurnItem(item: JsonObject): JsonObject {
-  return {
-    id: readString(item.id),
-    itemId: readString(item.itemId) ?? readString(item.item_id),
-    role: readString(item.role),
-    type: readString(item.type),
+function keepOverlayMessage(
+  message: ChatMessageResponse,
+  sourceMessages: ChatMessageResponse[],
+): boolean {
+  if (
+    message.status === "PENDING" ||
+    message.status === "STREAMING" ||
+    message.kind === "APPROVAL" ||
+    message.kind === "USER_INPUT_PROMPT"
+  ) {
+    return true
   }
-}
-
-async function reconcileSettledRunMessages(chatId: string): Promise<void> {
-  const runs = await prisma.chatRun.findMany({
-    where: {
-      chatId,
-      status: { in: ["CANCELLED", "COMPLETED", "FAILED"] },
-    },
-    select: { id: true, status: true },
-  })
-
-  for (const run of runs) {
-    const status = run.status === "FAILED" ? "FAILED" : "COMPLETED"
-    await prisma.chatMessage.updateMany({
-      where: {
-        chatId,
-        kind: {
-          in: [
-            "CHAT",
-            "COMMAND_EXECUTION",
-            "FILE_CHANGE",
-            "PLAN",
-            "THINKING",
-            "TOOL_ACTIVITY",
-          ],
-        },
-        runId: run.id,
-        status: { in: ["PENDING", "STREAMING"] },
-      },
-      data: {
-        completedAt: new Date(),
-        status,
-      },
-    })
-  }
-}
-
-export async function respondToCodexServerRequest(
-  chatId: string,
-  requestId: string,
-  dto: ServerRequestResponseRequest,
-) {
-  await getChat(chatId)
-  const key = serverRequestKey(chatId, requestId)
-  const pending = pendingServerRequests.get(key)
-  if (!pending) {
-    throw new HttpError(410, "Server request is no longer active.")
-  }
-
-  const result = serverRequestResult(dto)
-  pending.runtime.respondToServerRequest(pending.rpcId, result)
-  pendingServerRequests.delete(key)
-
-  const updated = await prisma.chatMessage.update({
-    where: { id: pending.messageId },
-    data: {
-      status: "COMPLETED",
-      completedAt: new Date(),
-      metadata: mergeMetadata(
-        await messageMetadata(pending.messageId),
-        {
-          status: "resolved",
-          decision: dto.decision,
-          result: dto.result ?? result,
-          resolvedAt: new Date().toISOString(),
-        },
-      ),
-    },
-  })
-  const response = toChatMessageResponse(updated)
-  emit(chatId, "message.updated", response)
-  return response
-}
-
-export async function executeMessage(chatId: string, dto: ExecuteChatRequest) {
-  let chat = await getChat(chatId)
-  if (dto.accountId && chat.accountId && dto.accountId !== chat.accountId) {
-    throw new HttpError(400, "Switch the chat account before sending with a different account.")
-  }
-  if (!dto.accountId && chat.status !== "RUNNING") {
-    chat = await autoRotateChatAccountIfNeeded(chat)
-  }
-  const accountId = dto.accountId ?? chat.accountId
-  if (!accountId) {
-    throw new HttpError(400, "Choose a Codex account before sending messages.")
-  }
-  const account = await prisma.codexAccount.findUnique({
-    where: { id: accountId },
-  })
-  if (!account) {
-    throw new HttpError(400, "Account not found.")
-  }
-  if (account.status !== "CONNECTED") {
-    throw new HttpError(400, "Authenticate the account before sending messages.")
-  }
-  if (!chat.workingDirectory) {
-    throw new HttpError(400, "Select a working directory before sending messages.")
-  }
-  const workingDirectory = resolveDirectory(chat.workingDirectory)
-  const attachments = await prepareChatAttachments(
-    workingDirectory,
-    dto.attachments ?? [],
+  return !sourceMessages.some((source) =>
+    messagesRepresentSameTranscriptEntry(source, message),
   )
-  const messageContent = userMessageContent(dto.content, attachments)
-  if (!messageContent.trim() && !attachments.length) {
-    throw new HttpError(400, "Message content or an attachment is required.")
+}
+
+function messagesRepresentSameTranscriptEntry(
+  source: ChatMessageResponse,
+  overlay: ChatMessageResponse,
+): boolean {
+  if (source.kind !== overlay.kind || source.role !== overlay.role) {
+    return false
   }
-  const automaticTitleSeed = await automaticChatTitleSeed(
-    chatId,
-    chat.title,
-    automaticTitleContent(dto.content, attachments),
+  if (source.turnId && overlay.turnId && source.turnId === overlay.turnId) {
+    return true
+  }
+  if (source.itemId && overlay.itemId && source.itemId === overlay.itemId) {
+    return true
+  }
+  return (
+    source.kind === "CHAT" &&
+    normalizedComparableContent(source.content) ===
+      normalizedComparableContent(overlay.content)
   )
-  await applyFallbackChatTitleIfAllowed(chatId, automaticTitleSeed)
-  const requestedCollaborationMode =
-    dto.collaborationMode === undefined
-      ? undefined
-      : normalizeCollaborationMode(dto.collaborationMode)
-  const collaborationMode =
-    requestedCollaborationMode ?? normalizeStoredCollaborationMode(chat.collaborationMode)
-  const permissionMode = normalizeStoredPermissionMode(chat.permissionMode)
-  const startedAt = new Date()
+}
 
-  if (chat.status === "RUNNING") {
-    if (dto.delivery === "steer") {
-      return steerActiveRunMessage({
-        accountId,
-        attachments,
-        chat,
-        collaborationMode,
-        content: dto.content,
-        messageContent,
-        metadata: dto.metadata ?? {},
-        permissionMode,
-        startedAt,
-        workingDirectory,
-      })
-    }
-    return queueActiveRunMessage({
-      accountId,
-      attachments,
-      automaticTitleSeed,
-      chat,
-      collaborationMode,
-      content: dto.content,
-      messageContent,
-      metadata: dto.metadata ?? {},
-      permissionMode,
-      queuedAt: startedAt,
-      workingDirectory,
-    })
+function normalizedComparableContent(value: string): string {
+  return value.replace(/\s+/g, " ").trim()
+}
+
+async function startAssistantRunForMessage({
+  account,
+  attachments,
+  automaticTitleSeed,
+  collaborationMode,
+  content,
+  metadata,
+  permissionMode,
+  requestedCollaborationMode,
+  startedAt,
+  threadId,
+  workingDirectory,
+}: {
+  account: CodexAccount
+  attachments: PreparedAttachment[]
+  automaticTitleSeed: string | null
+  collaborationMode: CodexCollaborationMode
+  content: string
+  metadata: Record<string, unknown>
+  permissionMode: CodexPermissionMode
+  requestedCollaborationMode?: CodexCollaborationMode | null
+  startedAt: Date
+  threadId: string
+  workingDirectory: string
+}) {
+  const state = await ensureRuntimeState(threadId)
+  const runId = `run:${threadId}:${randomUUID()}`
+  state.accountId = account.id
+  state.interruptRequested = false
+  state.permissionMode = permissionMode
+  state.runId = runId
+  state.status = "QUEUED"
+  state.turnId = null
+  state.updatedAt = startedAt
+  if (requestedCollaborationMode) {
+    await upsertThreadPreference(threadId, { collaborationMode: requestedCollaborationMode })
   }
-
-  const message = await createSequencedChatMessage(chatId, {
-    role: "USER",
-    status: "COMPLETED",
-    content: messageContent,
-    completedAt: startedAt,
-    metadata: toJsonInput(messageMetadataWithAttachments(dto.metadata, attachments)),
+  const assistantMessage = appendRuntimeMessage(threadId, {
+    content: "",
+    kind: "CHAT",
+    role: "ASSISTANT",
+    runId,
+    status: "PENDING",
   })
-  emit(chatId, "message.created", toChatMessageResponse(message))
-  const started = await startAssistantRunForMessage({
-    accountId,
+  emit(threadId, "chat.updated", await getChat(threadId))
+  emit(threadId, "message.created", assistantMessage)
+  emit(threadId, "run.status", { runId, status: "QUEUED" })
+  void runCodex(
+    threadId,
+    runId,
+    assistantMessage.id,
+    account,
+    content,
+    metadata,
     attachments,
-    automaticTitleSeed,
-    chatId,
-    collaborationMode,
-    content: dto.content,
-    metadata: dto.metadata ?? {},
-    permissionMode,
-    requestedCollaborationMode,
-    startedAt,
     workingDirectory,
-  })
-
-  return {
-    message: toChatMessageResponse(message),
-    assistantMessage: toChatMessageResponse(started.assistantMessage),
-    runId: started.run.id,
-    status: "QUEUED" as const,
-  }
+    collaborationMode,
+    automaticTitleSeed,
+  )
+  return { assistantMessage, runId }
 }
 
 async function queueActiveRunMessage({
   accountId,
   attachments,
   automaticTitleSeed,
-  chat,
   collaborationMode,
   content,
   messageContent,
   metadata,
   permissionMode,
   queuedAt,
+  threadId,
   workingDirectory,
 }: {
   accountId: string
   attachments: PreparedAttachment[]
   automaticTitleSeed: string | null
-  chat: Chat
   collaborationMode: CodexCollaborationMode
   content: string
   messageContent: string
   metadata: Record<string, unknown>
   permissionMode: CodexPermissionMode
   queuedAt: Date
+  threadId: string
   workingDirectory: string
 }) {
   const queueId = randomUUID()
-  const message = await createSequencedChatMessage(chat.id, {
+  const message = appendRuntimeMessage(threadId, {
+    completedAt: queuedAt,
+    content: messageContent,
+    metadata: messageMetadataWithAttachments(
+      {
+        ...metadata,
+        delivery: "queue",
+        queuedAt: queuedAt.toISOString(),
+        queueId,
+        queueStatus: "queued",
+      },
+      attachments,
+    ),
     role: "USER",
     status: "COMPLETED",
-    content: messageContent,
-    completedAt: queuedAt,
-    metadata: toJsonInput(
-      messageMetadataWithAttachments(
-        {
-          ...metadata,
-          delivery: "queue",
-          queueId,
-          queueStatus: "queued",
-          queuedAt: queuedAt.toISOString(),
-        },
-        attachments,
-      ),
-    ),
   })
-  appendQueuedTurn(chat.id, {
+  const state = getRuntimeState(threadId)
+  state.queuedTurns.push({
     accountId,
     attachments,
     automaticTitleSeed,
@@ -1380,14 +1048,10 @@ async function queueActiveRunMessage({
     permissionMode,
     workingDirectory,
   })
-  const updated = await prisma.chat.update({
-    where: { id: chat.id },
-    data: { lastActivityAt: queuedAt, updatedAt: queuedAt },
-  })
-  emit(chat.id, "chat.updated", toChatResponse(updated))
-  emit(chat.id, "message.created", toChatMessageResponse(message))
+  emit(threadId, "chat.updated", await getChat(threadId))
+  emit(threadId, "message.created", message)
   return {
-    message: toChatMessageResponse(message),
+    message,
     assistantMessage: null,
     runId: null,
     status: "QUEUED" as const,
@@ -1397,52 +1061,44 @@ async function queueActiveRunMessage({
 }
 
 async function steerActiveRunMessage({
-  accountId,
+  account,
   attachments,
-  chat,
   collaborationMode,
   content,
   messageContent,
   metadata,
-  permissionMode,
   startedAt,
-  workingDirectory,
+  threadId,
 }: {
-  accountId: string
+  account: CodexAccount
   attachments: PreparedAttachment[]
-  chat: Chat
   collaborationMode: CodexCollaborationMode
   content: string
   messageContent: string
   metadata: Record<string, unknown>
   permissionMode: CodexPermissionMode
   startedAt: Date
+  threadId: string
   workingDirectory: string
 }) {
-  void accountId
-  void permissionMode
-  void workingDirectory
-  const activeRun = activeRunForChat(chat.id)
-  if (!activeRun?.runtime) {
+  void account
+  const state = runtimeStates.get(threadId)
+  if (!state?.runtime) {
     throw new HttpError(409, "The active turn is not ready for steering yet.")
   }
-  const threadId = activeRun.externalThreadId ?? chat.externalThreadId
-  if (!threadId) {
-    throw new HttpError(409, "The active turn has not published a thread yet.")
-  }
   const expectedTurnId =
-    activeRun.turnId ?? (await resolveInFlightTurnId(activeRun.runtime, threadId))
+    state.turnId ?? (await resolveInFlightTurnId(state.runtime, threadId))
   if (!expectedTurnId) {
     throw new HttpError(409, "The active turn has not published a turn id yet.")
   }
-  const currentChat = await prisma.chat.findUnique({ where: { id: chat.id } })
+  const preference = await getThreadPreference(threadId)
   const collaborationSettings = await resolveCollaborationModeSettings(
-    activeRun.runtime,
-    currentChat?.model ?? chat.model,
-    (currentChat?.reasoningEffort ?? chat.reasoningEffort) as CodexReasoningEffort | null,
+    state.runtime,
+    preference?.model ?? null,
+    (preference?.reasoningEffort as CodexReasoningEffort | null) ?? null,
   )
   const response = await steerCodexTurn(
-    activeRun.runtime,
+    state.runtime,
     {
       expectedTurnId,
       threadId,
@@ -1451,295 +1107,406 @@ async function steerActiveRunMessage({
     content,
     attachments,
   )
-  activeRun.turnId = getTurnId(response) ?? expectedTurnId
-  activeRun.externalThreadId = threadId
-
-  const message = await createSequencedChatMessage(chat.id, {
+  state.turnId = getTurnId(response) ?? expectedTurnId
+  const message = appendRuntimeMessage(threadId, {
+    completedAt: startedAt,
+    content: messageContent,
+    metadata: messageMetadataWithAttachments(
+      {
+        ...metadata,
+        delivery: "steer",
+        steeredAt: startedAt.toISOString(),
+      },
+      attachments,
+    ),
     role: "USER",
     status: "COMPLETED",
-    content: messageContent,
-    completedAt: startedAt,
-    metadata: toJsonInput(
-      messageMetadataWithAttachments(
-        {
-          ...metadata,
-          delivery: "steer",
-          steeredAt: startedAt.toISOString(),
-        },
-        attachments,
-      ),
-    ),
   })
-  const updated = await prisma.chat.update({
-    where: { id: chat.id },
-    data: { lastActivityAt: startedAt, updatedAt: startedAt },
-  })
-  emit(chat.id, "chat.updated", toChatResponse(updated))
-  emit(chat.id, "message.created", toChatMessageResponse(message))
+  emit(threadId, "chat.updated", await getChat(threadId))
+  emit(threadId, "message.created", message)
   return {
-    message: toChatMessageResponse(message),
+    message,
     assistantMessage: null,
-    runId: activeRun.runId,
+    runId: state.runId,
     status: "RUNNING" as const,
     delivery: "steer" as const,
     steered: true,
   }
 }
 
-async function startAssistantRunForMessage({
-  accountId,
-  attachments,
-  automaticTitleSeed,
-  chatId,
-  collaborationMode,
-  content,
-  metadata,
-  permissionMode,
-  requestedCollaborationMode,
-  startedAt,
-  workingDirectory,
-}: {
-  accountId: string
-  attachments: PreparedAttachment[]
-  automaticTitleSeed: string | null
-  chatId: string
-  collaborationMode: CodexCollaborationMode
-  content: string
-  metadata: Record<string, unknown>
-  permissionMode: CodexPermissionMode
-  requestedCollaborationMode?: CodexCollaborationMode | null
-  startedAt: Date
-  workingDirectory: string
-}) {
-  const run = await prisma.chatRun.create({
-    data: {
-      chatId,
-      accountId,
-      status: "QUEUED",
-      request: toJsonInput({
-        attachments: attachments.map((attachment) => attachment.message),
-        collaborationMode,
-        content,
-        metadata,
-        permissionMode,
-        workingDirectory,
-      }),
-    },
-  })
-  const assistantMessage = await createSequencedChatMessage(chatId, {
-    runId: run.id,
-    role: "ASSISTANT",
-    kind: "CHAT",
-    status: "PENDING",
-    content: "",
-  })
-  const runningChat = await prisma.chat.update({
-    where: { id: chatId },
-    data: {
-      collaborationMode: requestedCollaborationMode ?? undefined,
-      lastActivityAt: startedAt,
-      status: "RUNNING",
-      updatedAt: startedAt,
-    },
-  })
-
-  emit(chatId, "chat.updated", toChatResponse(runningChat))
-  emit(chatId, "message.created", toChatMessageResponse(assistantMessage))
-  emit(chatId, "run.status", { runId: run.id, status: "QUEUED" })
-  void runCodex(
-    chatId,
-    run.id,
-    assistantMessage.id,
-    accountId,
-    content,
-    metadata,
-    attachments,
-    workingDirectory,
-    collaborationMode,
-    automaticTitleSeed,
-  )
-  return { assistantMessage, run }
-}
-
-function activeRunForChat(chatId: string): ActiveRunState | null {
-  for (const activeRun of activeRuns.values()) {
-    if (activeRun.chatId === chatId) {
-      return activeRun
-    }
-  }
-  return null
-}
-
-function setActiveChatPermissionMode(
-  chatId: string,
-  permissionMode: CodexPermissionMode,
-): void {
-  for (const activeRun of activeRuns.values()) {
-    if (activeRun.chatId === chatId) {
-      activeRun.permissionMode = permissionMode
-    }
-  }
-}
-
-async function resolvePendingServerRequestsForFullAccess(
-  chatId: string,
+async function runCodex(
+  threadId: string,
+  runId: string,
+  assistantMessageId: string,
+  account: CodexAccount,
+  content: string,
+  metadata: Record<string, unknown>,
+  attachments: PreparedAttachment[],
+  workingDirectory: string,
+  collaborationMode: CodexCollaborationMode,
+  automaticTitleSeed: string | null,
 ): Promise<void> {
-  const pendingRequests = [...pendingServerRequests.values()].filter(
-    (pending) =>
-      pending.chatId === chatId && pending.requestKind !== "userInput",
+  return withAccountRunLock(account.id, () =>
+    runCodexWithAccountLock(
+      threadId,
+      runId,
+      assistantMessageId,
+      account,
+      content,
+      metadata,
+      attachments,
+      workingDirectory,
+      collaborationMode,
+      automaticTitleSeed,
+    ),
   )
-  for (const pending of pendingRequests) {
-    if (pending.requestKind === "userInput") {
-      continue
-    }
-    const requestKind = pending.requestKind
-    const result = fullAccessServerRequestResult(requestKind)
-    pending.runtime.respondToServerRequest(pending.rpcId, result)
-    pendingServerRequests.delete(serverRequestKey(chatId, pending.requestId))
-    const message = await prisma.chatMessage.findUnique({
-      where: { id: pending.messageId },
-    })
-    if (!message) {
-      continue
-    }
-    const updated = await prisma.chatMessage.update({
-      where: { id: message.id },
-      data: {
-        completedAt: new Date(),
-        metadata: mergeMetadata(message.metadata, {
-          autoApproved: true,
-          decision: requestKind === "approval" ? "acceptForSession" : undefined,
-          result,
-          resolvedAt: new Date().toISOString(),
-          status: "resolved",
-        }),
-        status: "COMPLETED",
-      },
-    })
-    emit(chatId, "message.updated", toChatMessageResponse(updated))
-  }
 }
 
-function appendQueuedTurn(chatId: string, queuedTurn: QueuedTurn): void {
-  const queue = queuedTurnsByChatId.get(chatId) ?? []
-  queuedTurnsByChatId.set(chatId, [...queue, queuedTurn])
-}
-
-function dequeueQueuedTurn(chatId: string): QueuedTurn | null {
-  const queue = queuedTurnsByChatId.get(chatId) ?? []
-  const [nextTurn, ...remaining] = queue
-  if (!nextTurn) {
-    queuedTurnsByChatId.delete(chatId)
-    return null
-  }
-  if (remaining.length) {
-    queuedTurnsByChatId.set(chatId, remaining)
-  } else {
-    queuedTurnsByChatId.delete(chatId)
-  }
-  return nextTurn
-}
-
-function scheduleQueuedTurnFlush(chatId: string): void {
-  const previous = queueFlushLocks.get(chatId) ?? Promise.resolve()
-  const current = previous
-    .catch(() => undefined)
-    .then(() => flushNextQueuedTurn(chatId))
-  const stored = current.catch(() => undefined)
-  queueFlushLocks.set(chatId, stored)
-  void stored.finally(() => {
-    if (queueFlushLocks.get(chatId) === stored) {
-      queueFlushLocks.delete(chatId)
-    }
+async function runCodexWithAccountLock(
+  threadId: string,
+  runId: string,
+  assistantMessageId: string,
+  account: CodexAccount,
+  content: string,
+  metadata: Record<string, unknown>,
+  attachments: PreparedAttachment[],
+  workingDirectory: string,
+  collaborationMode: CodexCollaborationMode,
+  automaticTitleSeed: string | null,
+): Promise<void> {
+  const state = getRuntimeState(threadId)
+  const preference = await getThreadPreference(threadId)
+  const permissionMode = normalizeStoredPermissionMode(preference?.permissionMode)
+  const runtime = runtimeForAccount(account)
+  const usePrimedThread =
+    state.primed && state.accountId === account.id && state.runtime === runtime
+  state.permissionMode = permissionMode
+  state.runtime = runtime
+  state.status = "RUNNING"
+  state.updatedAt = new Date()
+  const streaming = updateRuntimeMessage(threadId, assistantMessageId, {
+    status: "STREAMING",
   })
-}
+  if (streaming) {
+    emit(threadId, "message.updated", streaming)
+  }
+  emit(threadId, "chat.updated", await getChat(threadId))
+  emit(threadId, "run.status", { runId, status: "RUNNING" })
+  await mirrorCodexSessionForAccount(threadId, account.id)
 
-function scheduleIdleAutoRotate(chatId: string): void {
-  void autoRotateIdleChatAccount(chatId).catch((error) => {
-    console.warn(
-      "Failed to auto rotate idle chat account.",
-      error instanceof Error ? error.message : error,
+  let streamedContent = ""
+  const streamBuffers = new Map<string, string>()
+  let turnId: string | undefined
+  let turnStarted = false
+  let terminalWaitAbort: AbortController | null = null
+  let terminalEventPromise: Promise<CodexJsonRpcResponse> | null = null
+  const unsubscribeEvents = state.runtime.onEvent((event) => {
+    if (!eventBelongsToTurn(event, threadId, turnId)) {
+      return
+    }
+    void enqueueRunProjection(runId, () =>
+      projectCodexEvent(
+        {
+          assistantMessageId,
+          onAssistantContent: (value) => {
+            streamedContent = value
+          },
+          runId,
+          streamBuffers,
+          threadId,
+        },
+        event,
+      ),
+    ).catch((error) => logProjectionError("Codex event projection failed.", error))
+  })
+  const unsubscribeRequests = state.runtime.onServerRequest((request) => {
+    if (!serverRequestBelongsToTurn(request, threadId, turnId)) {
+      return
+    }
+    void enqueueRunProjection(runId, () =>
+      projectCodexServerRequest(
+        {
+          permissionMode: () => state.permissionMode,
+          runId,
+          runtime: state.runtime!,
+          threadId,
+        },
+        request,
+      ),
+    ).catch((error) =>
+      logProjectionError("Codex server request projection failed.", error),
     )
   })
+
+  try {
+    if (!usePrimedThread) {
+      const resumedThreadId = await ensureCodexThread(
+        state.runtime,
+        threadId,
+        workingDirectory,
+        collaborationMode,
+      )
+      if (resumedThreadId !== threadId) {
+        throw new Error("Codex returned a different thread id while resuming.")
+      }
+    }
+    scheduleAutomaticChatTitleIfNeeded({
+      cwd: workingDirectory,
+      runtime: state.runtime,
+      seed: automaticTitleSeed,
+      threadId,
+    })
+    const collaborationSettings = await resolveCollaborationModeSettings(
+      state.runtime,
+      preference?.model ?? null,
+      (preference?.reasoningEffort as CodexReasoningEffort | null) ?? null,
+    )
+    terminalWaitAbort = new AbortController()
+    terminalEventPromise = state.runtime.waitForEvent(
+      (event) =>
+        turnEventIsTerminal(event) &&
+        readEventThreadId(event) === threadId &&
+        (!turnId || eventTurnId(event) === turnId),
+      600_000,
+      terminalWaitAbort.signal,
+    )
+    const turnResponse = await startCodexTurn(
+      state.runtime,
+      {
+        threadId,
+        cwd: workingDirectory,
+        ...(preference?.model ? { model: preference.model } : {}),
+        ...(preference?.reasoningEffort ? { effort: preference.reasoningEffort } : {}),
+        ...(preference?.serviceTier ? { serviceTier: preference.serviceTier } : {}),
+        ...turnModeOverrides(
+          collaborationMode,
+          collaborationSettings,
+          permissionMode,
+        ),
+        metadata,
+      },
+      content,
+      attachments,
+    )
+    turnStarted = true
+    turnId = getTurnId(turnResponse)
+    state.primed = false
+    state.turnId = turnId ?? null
+    if (turnId && state.interruptRequested) {
+      await sendTurnInterrupt(state.runtime, turnId, threadId)
+    }
+    const completedEvent = await terminalEventPromise
+    await drainRunProjectionQueue(runId)
+    if (turnEventIsInterrupted(completedEvent)) {
+      throw new CodexRunInterruptedError(terminalTurnMessage(completedEvent))
+    }
+    if (turnEventIsFailure(completedEvent)) {
+      throw new Error(terminalTurnMessage(completedEvent))
+    }
+    const historyContent = await readLatestAssistantText(
+      state.runtime,
+      threadId,
+      turnId,
+    )
+    const finalContent =
+      historyContent ||
+      extractAssistantText(completedEvent) ||
+      extractAssistantText(turnResponse) ||
+      streamedContent
+    const finishedAt = new Date()
+    const completed = updateRuntimeMessage(threadId, assistantMessageId, {
+      completedAt: finishedAt,
+      content: finalContent,
+      rawPayload: completedEvent,
+      status: "COMPLETED",
+      turnId: turnId ?? null,
+    })
+    settleOpenRunTimelineMessages(threadId, runId, "COMPLETED")
+    expirePendingServerRequests(threadId, runId, "Codex completed the turn.")
+    state.status = "IDLE"
+    state.runtime = undefined
+    state.updatedAt = finishedAt
+    const resetCollaborationMode =
+      collaborationMode === "plan" && runHasPlanResult(threadId, runId)
+    if (resetCollaborationMode) {
+      await upsertThreadPreference(threadId, { collaborationMode: "default" })
+    }
+    emit(threadId, "chat.updated", await getChat(threadId))
+    if (completed) {
+      emit(threadId, "message.completed", completed)
+    }
+    emit(threadId, "run.status", { runId, status: "COMPLETED" })
+    await refreshThreadTitleFromCodex(runtimeForAccount(account), threadId)
+    await mirrorCodexSessionForAccount(threadId, account.id)
+  } catch (error) {
+    terminalWaitAbort?.abort()
+    await terminalEventPromise?.catch(() => undefined)
+    const message = error instanceof Error ? error.message : "Codex run failed."
+    const keepPrimedRuntime = usePrimedThread && !turnStarted
+    expirePendingServerRequests(threadId, runId, message)
+    const failedAt = new Date()
+    if (error instanceof CodexRunInterruptedError) {
+      settleOpenRunTimelineMessages(threadId, runId, "COMPLETED")
+      const stopped = updateRuntimeMessage(threadId, assistantMessageId, {
+        completedAt: failedAt,
+        content: streamedContent,
+        metadataPatch: { interrupted: true, kind: "assistant" },
+        status: "COMPLETED",
+      })
+      state.status = "IDLE"
+      state.runtime = keepPrimedRuntime ? runtime : undefined
+      state.updatedAt = failedAt
+      emit(threadId, "chat.updated", await getChat(threadId))
+      if (stopped) {
+        emit(threadId, "message.completed", stopped)
+      }
+      emit(threadId, "run.status", {
+        error: message,
+        runId,
+        status: "CANCELLED",
+      })
+      return
+    }
+    settleOpenRunTimelineMessages(threadId, runId, "FAILED")
+    const failed = updateRuntimeMessage(threadId, assistantMessageId, {
+      completedAt: failedAt,
+      content: streamedContent,
+      status: "FAILED",
+    })
+    state.status = "IDLE"
+    state.runtime = keepPrimedRuntime ? runtime : undefined
+    state.updatedAt = failedAt
+    emit(threadId, "chat.updated", await getChat(threadId))
+    if (failed) {
+      emit(threadId, "message.failed", { ...failed, error: message })
+    }
+    emit(threadId, "run.status", {
+      error: message,
+      runId,
+      status: "FAILED",
+    })
+  } finally {
+    terminalWaitAbort?.abort()
+    unsubscribeEvents()
+    unsubscribeRequests()
+    runProjectionQueues.delete(runId)
+    state.runId = null
+    state.turnId = null
+    if (state.queuedTurns.length) {
+      scheduleQueuedTurnFlush(threadId)
+    } else {
+      scheduleIdleAutoRotate(threadId)
+    }
+  }
 }
 
-async function autoRotateIdleChatAccount(chatId: string): Promise<void> {
-  const chat = await prisma.chat.findUnique({ where: { id: chatId } })
-  if (!chat || chat.status === "RUNNING") {
-    return
-  }
-  await autoRotateChatAccountIfNeeded(chat)
-}
+class CodexRunInterruptedError extends Error {}
 
-async function flushNextQueuedTurn(chatId: string): Promise<void> {
-  if (activeRunForChat(chatId)) {
+async function flushNextQueuedTurn(threadId: string): Promise<void> {
+  const state = runtimeStates.get(threadId)
+  if (!state || state.status === "RUNNING" || state.status === "QUEUED") {
     return
   }
-  const chat = await prisma.chat.findUnique({ where: { id: chatId } })
-  if (!chat || chat.status === "RUNNING") {
-    return
-  }
-  const queuedTurn = dequeueQueuedTurn(chatId)
+  const queuedTurn = state.queuedTurns.shift()
   if (!queuedTurn) {
     return
   }
-
   try {
-    const activeChat = chat.autoRotateAccount
-      ? await autoRotateChatAccountIfNeeded(chat)
-      : chat
-    const accountId = activeChat.accountId ?? queuedTurn.accountId
-    const account = await prisma.codexAccount.findUnique({
-      where: { id: accountId },
-    })
-    if (!account || account.status !== "CONNECTED") {
-      throw new Error("Queued message account is no longer connected.")
-    }
+    const chat = await autoRotateChatAccountIfNeeded(await getChat(threadId))
+    const account = await readConnectedAccount(chat.accountId ?? queuedTurn.accountId)
     const startedAt = new Date()
     const started = await startAssistantRunForMessage({
-      accountId,
+      account,
       attachments: queuedTurn.attachments,
       automaticTitleSeed: queuedTurn.automaticTitleSeed,
-      chatId,
       collaborationMode: queuedTurn.collaborationMode,
       content: queuedTurn.content,
       metadata: queuedTurn.metadata,
-      permissionMode: normalizeStoredPermissionMode(activeChat.permissionMode),
-      requestedCollaborationMode: queuedTurn.collaborationMode,
+      permissionMode: queuedTurn.permissionMode,
       startedAt,
+      threadId,
       workingDirectory: queuedTurn.workingDirectory,
     })
-    await updateQueuedMessageStatus(chatId, queuedTurn.messageId, {
-      dequeuedAt: startedAt.toISOString(),
-      queueStatus: "running",
-      runId: started.run.id,
+    const updated = updateRuntimeMessage(threadId, queuedTurn.messageId, {
+      metadataPatch: {
+        dequeuedAt: startedAt.toISOString(),
+        queueStatus: "running",
+        runId: started.runId,
+      },
     })
+    if (updated) {
+      emit(threadId, "message.updated", updated)
+    }
   } catch (error) {
-    await updateQueuedMessageStatus(chatId, queuedTurn.messageId, {
-      error: error instanceof Error ? error.message : "Queued message failed.",
-      failedAt: new Date().toISOString(),
-      queueStatus: "failed",
+    const updated = updateRuntimeMessage(threadId, queuedTurn.messageId, {
+      metadataPatch: {
+        error: error instanceof Error ? error.message : "Queued message failed.",
+        failedAt: new Date().toISOString(),
+        queueStatus: "failed",
+      },
     })
+    if (updated) {
+      emit(threadId, "message.updated", updated)
+    }
   }
 }
 
-async function autoRotateChatAccountIfNeeded(chat: Chat): Promise<Chat> {
+function scheduleQueuedTurnFlush(threadId: string): void {
+  const previous = queueFlushLocks.get(threadId) ?? Promise.resolve()
+  const current = previous
+    .catch(() => undefined)
+    .then(() => flushNextQueuedTurn(threadId))
+  const stored = current.catch(() => undefined)
+  queueFlushLocks.set(threadId, stored)
+  void stored.finally(() => {
+    if (queueFlushLocks.get(threadId) === stored) {
+      queueFlushLocks.delete(threadId)
+    }
+  })
+}
+
+function scheduleIdleAutoRotate(threadId: string): void {
+  void autoRotateChatAccountIfNeeded(getChatSnapshotOrNull(threadId)).catch(
+    (error) => {
+      console.warn(
+        "Failed to auto rotate idle chat account.",
+        error instanceof Error ? error.message : error,
+      )
+    },
+  )
+}
+
+async function getChatSnapshotOrNull(
+  threadId: string,
+): Promise<ChatResponse | null> {
+  try {
+    return await getChat(threadId)
+  } catch {
+    return null
+  }
+}
+
+async function autoRotateChatAccountIfNeeded(
+  chatOrPromise: ChatResponse | Promise<ChatResponse | null> | null,
+): Promise<ChatResponse> {
+  const chat = await chatOrPromise
+  if (!chat) {
+    throw new HttpError(404, "Chat not found.")
+  }
   if (
     !chat.autoRotateAccount ||
     chat.status === "RUNNING" ||
-    activeRunForChat(chat.id)
+    runtimeStates.get(chat.id)?.primed
   ) {
     return chat
   }
-
   const connectedAccounts = await prisma.codexAccount.findMany({
-    where: { status: "CONNECTED" },
     orderBy: { createdAt: "asc" },
+    where: { status: "CONNECTED" },
   })
   if (!connectedAccounts.length) {
     return chat
   }
-
   const snapshots = await readAccountRateLimitSnapshots(connectedAccounts)
   const currentAccount = connectedAccounts.find(
     (account) => account.id === chat.accountId,
@@ -1750,7 +1517,6 @@ async function autoRotateChatAccountIfNeeded(chat: Chat): Promise<Chat> {
   if (currentAccount && currentScore >= 0) {
     return chat
   }
-
   const bestAccount = selectBestAvailableAccount(connectedAccounts, snapshots)
   if (!bestAccount || bestAccount.id === chat.accountId) {
     return chat
@@ -1758,25 +1524,12 @@ async function autoRotateChatAccountIfNeeded(chat: Chat): Promise<Chat> {
   if (accountAvailabilityScore(snapshots.get(bestAccount.id)) < 0) {
     return chat
   }
-
-  const updated = await prisma.chat.update({
-    where: { id: chat.id },
-    data: {
-      accountId: bestAccount.id,
-      externalThreadId: chat.accountId ? null : undefined,
-    },
+  const preference = await upsertThreadPreference(chat.id, {
+    accountId: bestAccount.id,
   })
-  emit(chat.id, "chat.updated", toChatResponse(updated))
-
-  if (!chat.accountId) {
-    void mirrorImportedCodexSessionForAccount(chat.id, bestAccount.id).catch((error) => {
-      console.warn(
-        "Failed to mirror imported Codex session.",
-        error instanceof Error ? error.message : error,
-      )
-    })
-  }
-
+  void mirrorCodexSessionForAccount(chat.id, bestAccount.id).catch(() => undefined)
+  const updated = await buildChatResponse(chat.id, preference)
+  emit(chat.id, "chat.updated", updated)
   return updated
 }
 
@@ -1798,23 +1551,12 @@ async function readAccountRateLimitSnapshots(
       ),
     })),
   )
-
   for (const result of results) {
     if (result.status === "fulfilled") {
       snapshots.set(result.value.accountId, result.value.snapshot)
     }
   }
   return snapshots
-}
-
-function selectRateLimitSnapshot(
-  response: Awaited<ReturnType<typeof readCodexRateLimitsForAccount>>,
-): CodexRateLimitSnapshot | undefined {
-  return (
-    response?.rateLimitsByLimitId?.codex ??
-    Object.values(response?.rateLimitsByLimitId ?? {}).find(Boolean) ??
-    response?.rateLimits
-  )
 }
 
 function selectBestAvailableAccount(
@@ -1844,15 +1586,10 @@ function accountAvailabilityScore(snapshot?: CodexRateLimitSnapshot): number {
   if (snapshot.credits?.unlimited) {
     return 101
   }
-
   const remainingPercents = [snapshot.primary, snapshot.secondary]
     .filter((window): window is CodexRateLimitWindow => !!window)
     .map((window) => 100 - clampPercent(window.usedPercent))
-
-  if (!remainingPercents.length) {
-    return 0
-  }
-  return Math.min(...remainingPercents)
+  return remainingPercents.length ? Math.min(...remainingPercents) : 0
 }
 
 function usageCapacitySeverity(
@@ -1880,22 +1617,6 @@ function clampPercent(value: number): number {
   return Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0))
 }
 
-async function updateQueuedMessageStatus(
-  chatId: string,
-  messageId: string,
-  patch: JsonObject,
-): Promise<void> {
-  const message = await prisma.chatMessage.findUnique({ where: { id: messageId } })
-  if (!message) {
-    return
-  }
-  const updated = await prisma.chatMessage.update({
-    where: { id: messageId },
-    data: { metadata: mergeMetadata(message.metadata, patch) },
-  })
-  emit(chatId, "message.updated", toChatMessageResponse(updated))
-}
-
 async function prepareChatAttachments(
   workingDirectory: string,
   inputs: ChatAttachmentInput[],
@@ -1918,7 +1639,9 @@ async function prepareChatAttachments(
   return attachments
 }
 
-function prepareImageAttachment(input: Extract<ChatAttachmentInput, { kind: "image" }>): PreparedAttachment {
+function prepareImageAttachment(
+  input: Extract<ChatAttachmentInput, { kind: "image" }>,
+): PreparedAttachment {
   const dataUrl = input.dataUrl?.trim()
   const match = /^data:(image\/(?:png|jpeg|jpg|webp|gif));base64,([A-Za-z0-9+/=\s]+)$/i.exec(dataUrl)
   if (!match) {
@@ -1930,7 +1653,10 @@ function prepareImageAttachment(input: Extract<ChatAttachmentInput, { kind: "ima
   if (size > 6 * 1024 * 1024) {
     throw new HttpError(400, "Image attachments must be 6 MB or smaller.")
   }
-  const name = normalizeAttachmentName(input.name, mimeType.split("/").at(-1) ?? "image")
+  const name = normalizeAttachmentName(
+    input.name,
+    mimeType.split("/").at(-1) ?? "image",
+  )
   const normalizedDataUrl = `data:${mimeType};base64,${base64}`
   return {
     message: {
@@ -1982,7 +1708,12 @@ function userMessageContent(
 ): string {
   const imageTags = attachments
     .map((attachment) => attachment.message)
-    .filter((attachment): attachment is Extract<ChatMessageAttachment, { kind: "image" }> => attachment.kind === "image")
+    .filter(
+      (
+        attachment,
+      ): attachment is Extract<ChatMessageAttachment, { kind: "image" }> =>
+        attachment.kind === "image",
+    )
     .map((attachment) => `<image>${attachment.url}</image>`)
   return [content.trim(), ...imageTags].filter(Boolean).join("\n\n")
 }
@@ -2011,364 +1742,82 @@ function messageMetadataWithAttachments(
   }
 }
 
-async function runCodex(
-  chatId: string,
-  runId: string,
-  assistantMessageId: string,
-  accountId: string,
-  content: string,
-  metadata: Record<string, unknown>,
-  attachments: PreparedAttachment[],
-  workingDirectory: string,
-  collaborationMode: CodexCollaborationMode,
-  automaticTitleSeed: string | null,
-): Promise<void> {
-  return withAccountRunLock(accountId, () =>
-    runCodexWithAccountLock(
-      chatId,
-      runId,
-      assistantMessageId,
-      accountId,
-      content,
-      metadata,
-      attachments,
-      workingDirectory,
-      collaborationMode,
-      automaticTitleSeed,
-    ),
-  )
+function automaticChatTitleSeed(
+  chat: ChatResponse,
+  currentContent: string,
+): string | null {
+  if (!isGenericChatTitle(chat.title)) {
+    return null
+  }
+  const trimmed = currentContent.trim()
+  return trimmed ? trimmed : null
 }
 
-async function runCodexWithAccountLock(
-  chatId: string,
-  runId: string,
-  assistantMessageId: string,
+function withAccountRunLock<T>(
   accountId: string,
-  content: string,
-  metadata: Record<string, unknown>,
-  attachments: PreparedAttachment[],
-  workingDirectory: string,
-  collaborationMode: CodexCollaborationMode,
-  automaticTitleSeed: string | null,
-): Promise<void> {
-  const account = await prisma.codexAccount.findUnique({
-    where: { id: accountId },
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = accountRunLocks.get(accountId) ?? Promise.resolve()
+  let release!: () => void
+  const current = new Promise<void>((resolve) => {
+    release = resolve
   })
-  const chat = await prisma.chat.findUnique({ where: { id: chatId } })
-  if (!account || !chat) {
-    return
-  }
-  const permissionMode = normalizeStoredPermissionMode(chat.permissionMode)
-
-  const assistant = await prisma.chatMessage.update({
-    where: { id: assistantMessageId },
-    data: { status: "STREAMING" },
-  })
-  emit(chatId, "message.updated", toChatMessageResponse(assistant))
-
-  await prisma.chatRun.update({
-    where: { id: runId },
-    data: { status: "RUNNING", startedAt: new Date() },
-  })
-  emit(chatId, "run.status", { runId, status: "RUNNING" })
-
-  const activeRun: ActiveRunState = {
-    chatId,
-    externalThreadId: chat.externalThreadId,
-    interruptRequested: false,
-    permissionMode,
-    runId,
-  }
-  activeRuns.set(runId, activeRun)
-
-  const runtime = codexRuntimeService.getRuntime({
-    accountId: account.id,
-    command: account.command,
-    args: normalizeAccountArgs(account.args),
-    workingDirectory: null,
-    environment: normalizeEnvironment(account.environment),
-  })
-  activeRun.runtime = runtime
-  let streamedContent = ""
-  const streamBuffers = new Map<string, string>()
-  let externalThreadId: string | null = chat.externalThreadId
-  let turnId: string | undefined
-  let terminalWaitAbort: AbortController | null = null
-  let terminalEventPromise: Promise<CodexJsonRpcResponse> | null = null
-  const unsubscribeEvents = runtime.onEvent((event) => {
-    if (!eventBelongsToTurn(event, externalThreadId, turnId)) {
-      return
-    }
-    void enqueueRunProjection(runId, () =>
-      projectCodexEvent({
-        assistantMessageId: assistant.id,
-        chatId,
-        streamBuffers,
-        runId,
-        onAssistantContent: (content) => {
-          streamedContent = content
-        },
-      }, event),
-    ).catch((error) =>
-      logProjectionError("Codex event projection failed.", error),
-    )
-  })
-  const unsubscribeRequests = runtime.onServerRequest((request) => {
-    if (!serverRequestBelongsToTurn(request, externalThreadId, turnId)) {
-      return
-    }
-    void enqueueRunProjection(runId, () =>
-      projectCodexServerRequest({
-        chatId,
-        permissionMode: () => activeRun.permissionMode,
-        runId,
-        runtime,
-      }, request),
-    ).catch((error) =>
-      logProjectionError("Codex server request projection failed.", error),
-    )
-  })
-
-  try {
-    externalThreadId = await ensureCodexThread(
-      runtime,
-      chat.externalThreadId,
-      workingDirectory,
-      collaborationMode,
-    )
-    activeRun.externalThreadId = externalThreadId
-    scheduleAutomaticChatTitleIfNeeded({
-      chatId,
-      cwd: workingDirectory,
-      runtime,
-      seed: automaticTitleSeed,
-      threadId: externalThreadId,
-    })
-    if (await runInterruptRequested(runId)) {
-      activeRun.interruptRequested = true
-    }
-    const collaborationSettings = await resolveCollaborationModeSettings(
-      runtime,
-      chat.model,
-      chat.reasoningEffort as CodexReasoningEffort | null,
-    )
-    terminalWaitAbort = new AbortController()
-    terminalEventPromise = runtime.waitForEvent(
-      (event) =>
-        turnEventIsTerminal(event) &&
-        readEventThreadId(event) === externalThreadId &&
-        (!turnId || eventTurnId(event) === turnId),
-      600_000,
-      terminalWaitAbort.signal,
-    )
-    const turnResponse = await startCodexTurn(runtime, {
-        threadId: externalThreadId,
-        cwd: workingDirectory,
-        ...(chat.model ? { model: chat.model } : {}),
-        ...(chat.reasoningEffort ? { effort: chat.reasoningEffort } : {}),
-        ...(chat.serviceTier ? { serviceTier: chat.serviceTier } : {}),
-        ...turnModeOverrides(collaborationMode, collaborationSettings, permissionMode),
-        metadata,
-      },
-      content,
-      attachments,
-    )
-    turnId = getTurnId(turnResponse)
-    activeRun.turnId = turnId
-    if (turnId) {
-      await prisma.chatRun.update({
-        where: { id: runId },
-        data: { externalTurnId: turnId },
-      })
-      if (activeRun.interruptRequested || (await runInterruptRequested(runId))) {
-        activeRun.interruptRequested = true
-        await sendTurnInterrupt(runtime, turnId, externalThreadId)
+  const next = previous.catch(() => undefined).then(() => current)
+  accountRunLocks.set(accountId, next)
+  return previous
+    .catch(() => undefined)
+    .then(operation)
+    .finally(() => {
+      release()
+      if (accountRunLocks.get(accountId) === next) {
+        accountRunLocks.delete(accountId)
       }
+    })
+}
+
+function enqueueRunProjection(
+  runId: string,
+  operation: () => Promise<void>,
+): Promise<void> {
+  const previous = runProjectionQueues.get(runId) ?? Promise.resolve()
+  const current = previous.catch(() => undefined).then(operation)
+  const stored = current.catch(() => undefined)
+  runProjectionQueues.set(runId, stored)
+  void stored.finally(() => {
+    if (runProjectionQueues.get(runId) === stored) {
+      runProjectionQueues.delete(runId)
     }
-    const completedEvent = await terminalEventPromise
-    await drainRunProjectionQueue(runId)
-    if (turnEventIsInterrupted(completedEvent)) {
-      throw new CodexRunInterruptedError(terminalTurnMessage(completedEvent))
-    }
-    if (turnEventIsFailure(completedEvent)) {
-      throw new Error(terminalTurnMessage(completedEvent))
-    }
-    const historyContent = await readLatestAssistantText(
-      runtime,
-      externalThreadId,
-      turnId,
-    )
-    const finalContent =
-      historyContent ||
-      extractAssistantText(completedEvent) ||
-      extractAssistantText(turnResponse) ||
-      streamedContent
-    const finishedAt = new Date()
-    const completed = await prisma.chatMessage.update({
-      where: { id: assistant.id },
-      data: {
-        content: finalContent,
-        status: "COMPLETED",
-        rawPayload: toJsonInput(completedEvent),
-        completedAt: finishedAt,
-      },
-    })
-    await settleOpenRunTimelineMessages(chatId, runId, "COMPLETED")
-    await expirePendingServerRequests(chatId, runId, "Codex completed the turn.")
-    await prisma.chatRun.update({
-      where: { id: runId },
-      data: { status: "COMPLETED", endedAt: new Date() },
-    })
-    const resetCollaborationMode =
-      collaborationMode === "plan" && (await runHasPlanResult(chatId, runId))
-    const completedChat = await prisma.chat.update({
-      where: { id: chatId },
-      data: {
-        collaborationMode: resetCollaborationMode ? "default" : undefined,
-        status: "IDLE",
-        externalThreadId,
-        lastActivityAt: finishedAt,
-        updatedAt: finishedAt,
-      },
-    })
-    emit(chatId, "chat.updated", toChatResponse(completedChat))
-    emit(chatId, "message.completed", toChatMessageResponse(completed))
-    emit(chatId, "run.status", { runId, status: "COMPLETED" })
-    await refreshChatTitleFromCodex(runtime, chatId, externalThreadId)
-    await refreshChatFromThreadIndex(
-      (await prisma.chat.findUnique({ where: { id: chatId } })) ?? completedChat,
-      account.id,
-      externalThreadId,
-    )
-  } catch (error) {
-    terminalWaitAbort?.abort()
-    await terminalEventPromise?.catch(() => undefined)
-    const message = error instanceof Error ? error.message : "Codex run failed."
-    await expirePendingServerRequests(chatId, runId, message)
-    if (error instanceof CodexRunInterruptedError) {
-      await settleOpenRunTimelineMessages(chatId, runId, "COMPLETED")
-      const stoppedAt = new Date()
-      const stopped = await prisma.chatMessage.update({
-        where: { id: assistant.id },
-        data: {
-          status: "COMPLETED",
-          content: streamedContent,
-          completedAt: stoppedAt,
-          metadata: mergeMetadata(assistant.metadata, {
-            interrupted: true,
-            kind: "assistant",
-          }),
-        },
-      })
-      await prisma.chatRun.update({
-        where: { id: runId },
-        data: { status: "CANCELLED", error: message, endedAt: new Date() },
-      })
-      const stoppedChat = await prisma.chat.update({
-        where: { id: chatId },
-        data: { lastActivityAt: stoppedAt, status: "IDLE", updatedAt: stoppedAt },
-      })
-      emit(chatId, "chat.updated", toChatResponse(stoppedChat))
-      emit(chatId, "message.completed", toChatMessageResponse(stopped))
-      emit(chatId, "run.status", {
-        runId,
-        status: "CANCELLED",
-        error: message,
-      })
-      return
-    }
-    const failedAt = new Date()
-    const failed = await prisma.chatMessage.update({
-      where: { id: assistant.id },
-      data: {
-        status: "FAILED",
-        content: streamedContent,
-        completedAt: failedAt,
-      },
-    })
-    await settleOpenRunTimelineMessages(chatId, runId, "FAILED")
-    await prisma.chatRun.update({
-      where: { id: runId },
-      data: { status: "FAILED", error: message, endedAt: new Date() },
-    })
-    const failedChat = await prisma.chat.update({
-      where: { id: chatId },
-      data: { lastActivityAt: failedAt, status: "IDLE", updatedAt: failedAt },
-    })
-    emit(chatId, "chat.updated", toChatResponse(failedChat))
-    emit(chatId, "message.failed", {
-      ...toChatMessageResponse(failed),
-      error: message,
-    })
-    emit(chatId, "run.status", {
-      runId,
-      status: "FAILED",
-      error: message,
-    })
+  })
+  return current
+}
+
+async function drainRunProjectionQueue(runId: string): Promise<void> {
+  await runProjectionQueues.get(runId)?.catch(() => undefined)
+}
+
+async function withTimelineMessageLock<T>(
+  key: string | null,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (!key) {
+    return operation()
+  }
+  const previous = timelineMessageLocks.get(key) ?? Promise.resolve()
+  let release!: () => void
+  const current = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const next = previous.catch(() => undefined).then(() => current)
+  timelineMessageLocks.set(key, next)
+  await previous.catch(() => undefined)
+  try {
+    return await operation()
   } finally {
-    terminalWaitAbort?.abort()
-    unsubscribeEvents()
-    unsubscribeRequests()
-    activeRuns.delete(runId)
-    runProjectionQueues.delete(runId)
-    if (queuedTurnsByChatId.has(chatId)) {
-      scheduleQueuedTurnFlush(chatId)
-    } else {
-      scheduleIdleAutoRotate(chatId)
+    release()
+    if (timelineMessageLocks.get(key) === next) {
+      timelineMessageLocks.delete(key)
     }
   }
-}
-
-class CodexRunInterruptedError extends Error {}
-
-export async function interruptChatRun(chatId: string) {
-  const chat = await getChat(chatId)
-  if (chat.status !== "RUNNING") {
-    throw new HttpError(409, "There is no running task to stop.")
-  }
-
-  const run = await prisma.chatRun.findFirst({
-    where: { chatId, status: { in: ["QUEUED", "RUNNING"] } },
-    orderBy: { createdAt: "desc" },
-  })
-  if (!run) {
-    throw new HttpError(409, "There is no active run to stop.")
-  }
-
-  const now = new Date()
-  await prisma.chatRun.update({
-    where: { id: run.id },
-    data: { interruptRequestedAt: now },
-  })
-
-  const activeRun = activeRuns.get(run.id)
-  if (activeRun) {
-    activeRun.interruptRequested = true
-    if (activeRun.runtime && activeRun.turnId) {
-      await sendTurnInterrupt(
-        activeRun.runtime,
-        activeRun.turnId,
-        activeRun.externalThreadId ?? chat.externalThreadId,
-      )
-    }
-  }
-
-  return {
-    chatId,
-    runId: run.id,
-    status: run.status,
-    message: activeRun?.turnId
-      ? "Stop signal sent to Codex."
-      : "Stop requested. Codex will be interrupted as soon as the turn starts.",
-  }
-}
-
-async function runInterruptRequested(runId: string): Promise<boolean> {
-  const run = await prisma.chatRun.findUnique({
-    where: { id: runId },
-    select: { interruptRequestedAt: true },
-  })
-  return !!run?.interruptRequestedAt
 }
 
 async function sendTurnInterrupt(
@@ -2532,16 +1981,15 @@ async function readThreadTurnStateSnapshot(
     )
     const result = asJsonObject(response.result)
     return turnStateSnapshot(
-      readObjectArray(result?.data) ??
-        readObjectArray(result?.items) ??
-        readObjectArray(result?.turns) ??
+      readJsonObjectArray(result?.data) ??
+        readJsonObjectArray(result?.items) ??
+        readJsonObjectArray(result?.turns) ??
         [],
       true,
     )
   } catch {
-    // Older app-server builds only expose turns through thread/read.
+    // Older runtimes only expose turns through thread/read.
   }
-
   let response: CodexJsonRpcResponse
   try {
     response = await runtime.request(
@@ -2561,7 +2009,7 @@ async function readThreadTurnStateSnapshot(
   }
   const result = asJsonObject(response.result)
   const thread = asJsonObject(result?.thread)
-  return turnStateSnapshot(readObjectArray(thread?.turns) ?? [], false)
+  return turnStateSnapshot(readJsonObjectArray(thread?.turns) ?? [], false)
 }
 
 function turnStateSnapshot(
@@ -2599,13 +2047,6 @@ function turnStateSnapshot(
   }
 }
 
-function readObjectArray(value: unknown): JsonObject[] | null {
-  if (!Array.isArray(value)) {
-    return null
-  }
-  return value.map(asJsonObject).filter((entry): entry is JsonObject => !!entry)
-}
-
 function readTurnId(turn: JsonObject): string | null {
   return (
     readString(turn.id) ??
@@ -2625,10 +2066,7 @@ function normalizeTurnStatus(turn: JsonObject): string | null {
     readString(turn.status) ??
     readString(turn.turnStatus) ??
     readString(turn.turn_status)
-  return status
-    ?.replace(/[_-]/g, "")
-    .trim()
-    .toLowerCase() ?? null
+  return status?.replace(/[_-]/g, "").trim().toLowerCase() ?? null
 }
 
 function isInterruptibleTurnStatus(status: string | null): boolean {
@@ -2647,23 +2085,34 @@ function turnInputVariants(
   content: string,
   attachments: PreparedAttachment[],
 ): Array<Array<Record<string, unknown>>> {
-  const fallbackText = [content.trim(), ...attachments.flatMap((attachment) => attachment.fallbackText ?? [])]
+  const fallbackText = [
+    content.trim(),
+    ...attachments.flatMap((attachment) => attachment.fallbackText ?? []),
+  ]
     .filter(Boolean)
     .join("\n\n")
-  const images = attachments.filter((attachment) => attachment.message.kind === "image")
-  const mentions = attachments.filter((attachment) => attachment.message.kind === "file")
+  const images = attachments.filter(
+    (attachment) => attachment.message.kind === "image",
+  )
+  const mentions = attachments.filter(
+    (attachment) => attachment.message.kind === "file",
+  )
   const textItem = {
-    type: "text",
     text: fallbackText,
     text_elements: [],
+    type: "text",
   }
   const build = (imageKey: "image_url" | "url", includeMentions: boolean) => [
     textItem,
     ...images.map((attachment) => ({
+      [imageKey]: (
+        attachment.message as Extract<ChatMessageAttachment, { kind: "image" }>
+      ).url,
       type: "image",
-      [imageKey]: (attachment.message as Extract<ChatMessageAttachment, { kind: "image" }>).url,
     })),
-    ...(includeMentions ? mentions.map((attachment) => attachment.runtime) : []),
+    ...(includeMentions
+      ? mentions.map((attachment) => attachment.runtime)
+      : []),
   ]
   const variants = [build("url", true)]
   if (images.length) {
@@ -2742,13 +2191,7 @@ function shouldRetryWithoutCollaborationMode(error: unknown): boolean {
 }
 
 async function ensureCodexThread(
-  runtime: {
-    request(
-      method: string,
-      params: Record<string, unknown>,
-      timeoutMs?: number,
-    ): Promise<CodexJsonRpcResponse>
-  },
+  runtime: Pick<CodexRuntimeSession, "request">,
   threadId: string | null,
   workingDirectory: string | null,
   collaborationMode: CodexCollaborationMode,
@@ -2838,7 +2281,6 @@ async function resolveCollaborationModeSettings(
   if (selectedModel) {
     return { model: selectedModel, reasoningEffort }
   }
-
   let resolvedReasoningEffort = reasoningEffort
   try {
     const configResponse = await runtime.request("config/read", {}, 30_000)
@@ -2852,9 +2294,8 @@ async function resolveCollaborationModeSettings(
       return { model: configuredModel, reasoningEffort: resolvedReasoningEffort }
     }
   } catch {
-    // Fall back to model/list below. Older runtimes may not expose config/read.
+    // Fall back to model/list below.
   }
-
   try {
     const modelResponse = await runtime.request(
       "model/list",
@@ -2873,64 +2314,24 @@ async function resolveCollaborationModeSettings(
       }
     }
   } catch {
-    // If settings cannot be resolved, still send the native mode without settings.
-  }
-
-  return null
-}
-
-function normalizeNonEmptyString(value: string | null | undefined): string | null {
-  const trimmed = value?.trim()
-  return trimmed ? trimmed : null
-}
-
-function readReasoningEffort(value: unknown): CodexReasoningEffort | null {
-  if (
-    value === "none" ||
-    value === "minimal" ||
-    value === "low" ||
-    value === "medium" ||
-    value === "high" ||
-    value === "xhigh"
-  ) {
-    return value
+    // Native mode still works without resolved settings.
   }
   return null
-}
-
-async function nextSequence(chatId: string): Promise<number> {
-  const aggregate = await prisma.chatMessage.aggregate({
-    where: { chatId },
-    _max: { sequence: true },
-  })
-  return (aggregate._max.sequence ?? 0) + 1
-}
-
-function emit<TType extends ChatEventType>(
-  chatId: string,
-  type: TType,
-  payload: ChatEventPayloads[TType],
-): void {
-  publishChatEvent(chatId, type, payload)
-}
-
-function logProjectionError(message: string, error: unknown): void {
-  console.error(message, error instanceof Error ? error.stack ?? error.message : error)
 }
 
 type ProjectCodexEventContext = {
   assistantMessageId: string
-  chatId: string
+  onAssistantContent: (content: string) => void
   runId: string
   streamBuffers: Map<string, string>
-  onAssistantContent: (content: string) => void
+  threadId: string
 }
 
 type ProjectCodexRequestContext = {
-  chatId: string
   permissionMode: () => CodexPermissionMode
   runId: string
   runtime: CodexRuntimeSession
+  threadId: string
 }
 
 async function projectCodexEvent(
@@ -2939,14 +2340,13 @@ async function projectCodexEvent(
 ): Promise<void> {
   const contextUsage = extractContextWindowUsage(event)
   if (contextUsage) {
-    emit(context.chatId, "context.updated", contextUsage)
+    emit(context.threadId, "context.updated", contextUsage)
   }
   if (isContextWindowUsageEvent(event)) {
     return
   }
   if (isCompactionEvent(event)) {
     await upsertTimelineMessage({
-      chatId: context.chatId,
       completedAt: new Date(),
       content: compactionEventMessage(event),
       itemId: `context-compaction:${eventTurnId(event) ?? event.method ?? Date.now()}`,
@@ -2959,6 +2359,7 @@ async function projectCodexEvent(
       role: "SYSTEM",
       runId: context.runId,
       status: compactionEventIsStarted(event) ? "STREAMING" : "COMPLETED",
+      threadId: context.threadId,
       turnId: eventTurnId(event),
     })
     return
@@ -2968,15 +2369,13 @@ async function projectCodexEvent(
   const params = asJsonObject(event.params)
   const item = extractItemObject(event)
   const itemType = normalizedType(readString(item?.type) ?? "")
-
   if (method === "thread/name/updated") {
     const title = extractThreadName(event)
     if (title) {
-      await updateChatTitleFromCodex(context.chatId, title)
+      await updateThreadTitleFromCodex(context.threadId, title)
     }
     return
   }
-
   if (method === "item/agentMessage/delta" || method.includes("agent_message_delta")) {
     const delta = readText(params?.delta) ?? readText(asJsonObject(params?.event)?.delta)
     if (!delta) {
@@ -2987,7 +2386,6 @@ async function projectCodexEvent(
     context.streamBuffers.set(itemId, nextContent)
     context.onAssistantContent(nextContent)
     const response = await upsertTimelineMessage({
-      chatId: context.chatId,
       content: nextContent,
       fallbackMessageId: context.assistantMessageId,
       itemId,
@@ -2997,9 +2395,10 @@ async function projectCodexEvent(
       role: "ASSISTANT",
       runId: context.runId,
       status: "STREAMING",
+      threadId: context.threadId,
       turnId: eventTurnId(event),
     })
-    emit(context.chatId, "message.delta", {
+    emit(context.threadId, "message.delta", {
       content: nextContent,
       delta,
       messageId: response.id,
@@ -3007,10 +2406,8 @@ async function projectCodexEvent(
     })
     return
   }
-
   if (method === "item/started" && isAssistantItem(itemType)) {
     await upsertTimelineMessage({
-      chatId: context.chatId,
       content: "",
       fallbackMessageId: context.assistantMessageId,
       itemId: eventItemId(event),
@@ -3020,11 +2417,11 @@ async function projectCodexEvent(
       role: "ASSISTANT",
       runId: context.runId,
       status: "STREAMING",
+      threadId: context.threadId,
       turnId: eventTurnId(event),
     })
     return
   }
-
   if (method === "item/completed" && isAssistantItem(itemType)) {
     const text = extractIncomingMessageText(item) || extractAssistantText(event)
     if (!text) {
@@ -3034,7 +2431,6 @@ async function projectCodexEvent(
     context.streamBuffers.set(itemId, text)
     context.onAssistantContent(text)
     await upsertTimelineMessage({
-      chatId: context.chatId,
       completedAt: new Date(),
       content: text,
       fallbackMessageId: context.assistantMessageId,
@@ -3045,11 +2441,11 @@ async function projectCodexEvent(
       role: "ASSISTANT",
       runId: context.runId,
       status: "COMPLETED",
+      threadId: context.threadId,
       turnId: eventTurnId(event),
     })
     return
   }
-
   if (
     method.startsWith("item/reasoning/") ||
     normalizedType(itemType).includes("reasoning")
@@ -3061,17 +2457,14 @@ async function projectCodexEvent(
     })
     return
   }
-
   if (method === "turn/plan/updated" || method === "item/plan/delta") {
     await projectPlanEvent(context, event)
     return
   }
-
   if (itemType === "commandexecution" || method.includes("commandExecution")) {
     await projectCommandEvent(context, event, item)
     return
   }
-
   if (
     itemType === "filechange" ||
     method.includes("fileChange") ||
@@ -3081,12 +2474,10 @@ async function projectCodexEvent(
     await projectFileChangeEvent(context, event, item)
     return
   }
-
   if (method === "serverRequest/resolved") {
-    await markServerRequestResolved(context.chatId, event)
+    markServerRequestResolved(context.threadId, event)
     return
   }
-
   if (method === "error" || method === "turn/failed" || method.endsWith("/error")) {
     await projectErrorEvent(context, event)
   }
@@ -3111,24 +2502,24 @@ async function projectCodexServerRequest(
     )
     return
   }
-
-  const metadata = requestKind === "userInput"
-    ? userInputMetadata(method, requestId, params, request)
-    : approvalMetadata(method, requestId, params, requestKind, request)
+  const metadata =
+    requestKind === "userInput"
+      ? userInputMetadata(method, requestId, params, request)
+      : approvalMetadata(method, requestId, params, requestKind, request)
   if (context.permissionMode() === "fullAccess" && requestKind !== "userInput") {
     const result = fullAccessServerRequestResult(requestKind)
     context.runtime.respondToServerRequest(request.id, result)
     await upsertTimelineMessage({
-      chatId: context.chatId,
       completedAt: new Date(),
       content: serverRequestContent(metadata),
+      itemId: readString(params.itemId),
       kind: "APPROVAL",
       metadata: {
         ...metadata,
         autoApproved: true,
         decision: requestKind === "approval" ? "acceptForSession" : undefined,
-        result,
         resolvedAt: new Date().toISOString(),
+        result,
         status: "resolved",
       },
       rawPayload: request,
@@ -3136,14 +2527,14 @@ async function projectCodexServerRequest(
       role: "SYSTEM",
       runId: context.runId,
       status: "COMPLETED",
+      threadId: context.threadId,
       turnId: readString(params.turnId),
-      itemId: readString(params.itemId),
     })
     return
   }
   const message = await upsertTimelineMessage({
-    chatId: context.chatId,
     content: serverRequestContent(metadata),
+    itemId: readString(params.itemId),
     kind: requestKind === "userInput" ? "USER_INPUT_PROMPT" : "APPROVAL",
     metadata,
     rawPayload: request,
@@ -3151,17 +2542,16 @@ async function projectCodexServerRequest(
     role: "SYSTEM",
     runId: context.runId,
     status: "PENDING",
+    threadId: context.threadId,
     turnId: readString(params.turnId),
-    itemId: readString(params.itemId),
   })
-
-  pendingServerRequests.set(serverRequestKey(context.chatId, requestId), {
-    chatId: context.chatId,
+  pendingServerRequests.set(serverRequestKey(context.threadId, requestId), {
     messageId: message.id,
-    requestKind,
     requestId,
+    requestKind,
     rpcId: request.id,
     runtime: context.runtime,
+    threadId: context.threadId,
   })
 }
 
@@ -3176,7 +2566,8 @@ async function appendSystemDelta(
     metadata: JsonObject
   },
 ): Promise<void> {
-  const itemId = eventItemId(event) ?? `${kind.toLowerCase()}:${eventTurnId(event) ?? "turn"}`
+  const itemId =
+    eventItemId(event) ?? `${kind.toLowerCase()}:${eventTurnId(event) ?? "turn"}`
   const bufferKey = `${kind}:${itemId}`
   const bufferedContent = context.streamBuffers.get(bufferKey)
   const nextContent = options.delta
@@ -3187,7 +2578,6 @@ async function appendSystemDelta(
   }
   context.streamBuffers.set(bufferKey, nextContent)
   await upsertTimelineMessage({
-    chatId: context.chatId,
     content: nextContent,
     itemId,
     kind,
@@ -3196,6 +2586,7 @@ async function appendSystemDelta(
     role: "SYSTEM",
     runId: context.runId,
     status: eventIsCompleted(event) ? "COMPLETED" : "STREAMING",
+    threadId: context.threadId,
     turnId: eventTurnId(event),
   })
 }
@@ -3230,7 +2621,6 @@ async function projectPlanEvent(
   }
   context.streamBuffers.set(bufferKey, content)
   await upsertTimelineMessage({
-    chatId: context.chatId,
     content,
     itemId,
     kind: "PLAN",
@@ -3244,6 +2634,7 @@ async function projectPlanEvent(
     role: "SYSTEM",
     runId: context.runId,
     status: event.method === "item/plan/delta" ? "STREAMING" : "COMPLETED",
+    threadId: context.threadId,
     turnId,
   })
 }
@@ -3269,7 +2660,6 @@ async function projectCommandEvent(
   const command = readString(payload.command) ?? readString(params.command) ?? "command"
   const status = itemStatus(payload, event.method ?? "")
   await upsertTimelineMessage({
-    chatId: context.chatId,
     completedAt: eventIsCompleted(event) ? new Date() : undefined,
     content: command,
     itemId,
@@ -3287,7 +2677,13 @@ async function projectCommandEvent(
     rawPayload: event,
     role: "SYSTEM",
     runId: context.runId,
-    status: status === "failed" ? "FAILED" : eventIsCompleted(event) ? "COMPLETED" : "STREAMING",
+    status:
+      status === "failed"
+        ? "FAILED"
+        : eventIsCompleted(event)
+          ? "COMPLETED"
+          : "STREAMING",
+    threadId: context.threadId,
     turnId: eventTurnId(event),
   })
 }
@@ -3304,7 +2700,6 @@ async function projectFileChangeEvent(
   const changes = readJsonArray(payload.changes) ?? readJsonArray(params.changes) ?? []
   const paths = extractChangedPaths(payload, changes)
   await upsertTimelineMessage({
-    chatId: context.chatId,
     content: paths.length ? paths.join("\n") : "File changes",
     itemId,
     kind: "FILE_CHANGE",
@@ -3321,6 +2716,7 @@ async function projectFileChangeEvent(
     role: "SYSTEM",
     runId: context.runId,
     status: eventIsCompleted(event) ? "COMPLETED" : "STREAMING",
+    threadId: context.threadId,
     turnId: eventTurnId(event),
   })
 }
@@ -3337,7 +2733,6 @@ async function projectErrorEvent(
     event.error?.message ??
     "Codex runtime error."
   await upsertTimelineMessage({
-    chatId: context.chatId,
     completedAt: new Date(),
     content: message,
     itemId: `error:${eventTurnId(event) ?? Date.now()}`,
@@ -3351,12 +2746,12 @@ async function projectErrorEvent(
     role: "SYSTEM",
     runId: context.runId,
     status: "FAILED",
+    threadId: context.threadId,
     turnId: eventTurnId(event),
   })
 }
 
 async function upsertTimelineMessage(input: {
-  chatId: string
   completedAt?: Date
   content: string
   fallbackMessageId?: string
@@ -3368,91 +2763,254 @@ async function upsertTimelineMessage(input: {
   role: ChatMessageResponse["role"]
   runId: string
   status: ChatMessageResponse["status"]
+  threadId: string
   turnId?: string | null
 }): Promise<ChatMessageResponse> {
   return withTimelineMessageLock(timelineMessageLockKey(input), async () => {
-    const existing = await findTimelineMessage(input)
-    const data: Omit<Prisma.ChatMessageUncheckedCreateInput, "chatId" | "sequence"> = {
-      completedAt: input.completedAt,
-      content: input.content,
-      itemId: input.itemId ?? undefined,
-      kind: input.kind,
-      metadata: input.metadata === undefined ? undefined : toJsonInput(input.metadata),
-      rawPayload: input.rawPayload === undefined ? undefined : toJsonInput(input.rawPayload),
-      requestId: input.requestId ?? undefined,
-      role: input.role,
-      runId: input.runId,
-      status: input.status,
-      turnId: input.turnId ?? undefined,
-    }
+    const state = getRuntimeState(input.threadId)
+    const existing = findTimelineMessage(state, input)
     const message = existing
-      ? await prisma.chatMessage.update({
-          where: { id: existing.id },
-          data,
+      ? updateRuntimeMessage(input.threadId, existing.id, {
+          completedAt: input.completedAt,
+          content: input.content,
+          metadata: input.metadata,
+          rawPayload: input.rawPayload,
+          status: input.status,
+          turnId: input.turnId ?? existing.turnId,
+        })!
+      : appendRuntimeMessage(input.threadId, {
+          completedAt: input.completedAt,
+          content: input.content,
+          itemId: input.itemId,
+          kind: input.kind,
+          metadata: input.metadata,
+          rawPayload: input.rawPayload,
+          requestId: input.requestId,
+          role: input.role,
+          runId: input.runId,
+          status: input.status,
+          turnId: input.turnId,
         })
-      : await createSequencedChatMessage(input.chatId, data)
-    const response = toChatMessageResponse(message)
-    emit(input.chatId, existing ? "message.updated" : "message.created", response)
-    return response
+    const key = timelineMessageLockKey(input)
+    if (key) {
+      state.messageKeys.set(key, message.id)
+    }
+    emit(input.threadId, existing ? "message.updated" : "message.created", message)
+    return message
   })
 }
 
 function timelineMessageLockKey(input: {
-  chatId: string
   fallbackMessageId?: string
   itemId?: string | null
   kind: ChatMessageResponse["kind"]
   requestId?: string | null
+  threadId: string
 }): string | null {
   if (input.requestId) {
-    return `${input.chatId}:request:${input.requestId}`
+    return `${input.threadId}:request:${input.requestId}`
   }
   if (input.itemId) {
-    return `${input.chatId}:item:${input.kind}:${input.itemId}`
+    return `${input.threadId}:item:${input.kind}:${input.itemId}`
   }
   if (input.fallbackMessageId) {
-    return `${input.chatId}:fallback:${input.fallbackMessageId}`
+    return `${input.threadId}:fallback:${input.fallbackMessageId}`
   }
   return null
 }
 
-async function findTimelineMessage(input: {
-  chatId: string
-  fallbackMessageId?: string
-  itemId?: string | null
-  kind: ChatMessageResponse["kind"]
-  requestId?: string | null
-}) {
+function findTimelineMessage(
+  state: RuntimeThreadState,
+  input: {
+    fallbackMessageId?: string
+    itemId?: string | null
+    kind: ChatMessageResponse["kind"]
+    requestId?: string | null
+    threadId: string
+  },
+): ChatMessageResponse | null {
+  const key = timelineMessageLockKey(input)
+  const keyed = key ? state.messageKeys.get(key) : null
+  if (keyed) {
+    return state.messages.find((message) => message.id === keyed) ?? null
+  }
   if (input.requestId) {
-    const byRequest = await prisma.chatMessage.findFirst({
-      where: { chatId: input.chatId, requestId: input.requestId },
-      orderBy: { sequence: "desc" },
-    })
-    if (byRequest) {
-      return byRequest
-    }
+    return (
+      state.messages.find((message) => message.requestId === input.requestId) ??
+      null
+    )
   }
   if (input.itemId) {
-    const byItem = await prisma.chatMessage.findFirst({
-      where: { chatId: input.chatId, itemId: input.itemId, kind: input.kind },
-      orderBy: { sequence: "desc" },
-    })
-    if (byItem) {
-      return byItem
-    }
+    return (
+      state.messages.find(
+        (message) =>
+          message.itemId === input.itemId && message.kind === input.kind,
+      ) ?? null
+    )
   }
   if (input.fallbackMessageId) {
-    const fallback = await prisma.chatMessage.findUnique({
-      where: { id: input.fallbackMessageId },
-    })
-    if (!fallback) {
-      return null
-    }
-    if (!input.itemId || !fallback.itemId || fallback.itemId === input.itemId) {
-      return fallback
-    }
+    return (
+      state.messages.find((message) => message.id === input.fallbackMessageId) ??
+      null
+    )
   }
   return null
+}
+
+function markServerRequestResolved(
+  threadId: string,
+  event: CodexJsonRpcResponse,
+): void {
+  const params = asJsonObject(event.params) ?? {}
+  const requestId = readString(params.requestId) ?? readString(params.id)
+  if (!requestId) {
+    return
+  }
+  pendingServerRequests.delete(serverRequestKey(threadId, requestId))
+  const state = runtimeStates.get(threadId)
+  const message = state?.messages.find((entry) => entry.requestId === requestId)
+  if (!message) {
+    return
+  }
+  const updated = updateRuntimeMessage(threadId, message.id, {
+    completedAt: new Date(),
+    metadataPatch: {
+      resolvedAt: new Date().toISOString(),
+      result: params.result === undefined ? null : toSerializable(params.result),
+      status: "resolved",
+    },
+    status: "COMPLETED",
+  })
+  if (updated) {
+    emit(threadId, "message.updated", updated)
+  }
+}
+
+function expirePendingServerRequests(
+  threadId: string,
+  runId: string,
+  reason: string,
+): void {
+  const state = runtimeStates.get(threadId)
+  if (!state) {
+    return
+  }
+  for (const message of state.messages) {
+    if (
+      message.runId !== runId ||
+      message.status !== "PENDING" ||
+      (message.kind !== "APPROVAL" && message.kind !== "USER_INPUT_PROMPT")
+    ) {
+      continue
+    }
+    if (message.requestId) {
+      const key = serverRequestKey(threadId, message.requestId)
+      const pending = pendingServerRequests.get(key)
+      pending?.runtime.rejectServerRequest(
+        pending.rpcId,
+        -32000,
+        `Server request expired: ${reason}`,
+      )
+      pendingServerRequests.delete(key)
+    }
+    const updated = updateRuntimeMessage(threadId, message.id, {
+      completedAt: new Date(),
+      metadataPatch: {
+        expiredAt: new Date().toISOString(),
+        reason,
+        status: "expired",
+      },
+      status: "COMPLETED",
+    })
+    if (updated) {
+      emit(threadId, "message.updated", updated)
+    }
+  }
+}
+
+function settleOpenRunTimelineMessages(
+  threadId: string,
+  runId: string,
+  status: Extract<ChatMessageResponse["status"], "COMPLETED" | "FAILED">,
+): void {
+  const state = runtimeStates.get(threadId)
+  if (!state) {
+    return
+  }
+  for (const message of state.messages) {
+    if (
+      message.runId !== runId ||
+      (message.status !== "PENDING" && message.status !== "STREAMING") ||
+      ![
+        "COMMAND_EXECUTION",
+        "FILE_CHANGE",
+        "PLAN",
+        "THINKING",
+        "TOOL_ACTIVITY",
+      ].includes(message.kind)
+    ) {
+      continue
+    }
+    const updated = updateRuntimeMessage(threadId, message.id, {
+      completedAt: new Date(),
+      status,
+    })
+    if (updated) {
+      emit(threadId, "message.updated", updated)
+    }
+  }
+}
+
+function runHasPlanResult(threadId: string, runId: string): boolean {
+  const state = runtimeStates.get(threadId)
+  return (
+    state?.messages.some((message) => {
+      if (message.runId !== runId) {
+        return false
+      }
+      const content = message.content.trim()
+      if (!content || content === "Planning...") {
+        return false
+      }
+      if (message.kind === "CHAT" && message.role === "ASSISTANT") {
+        return /<proposed_plan\b[^>]*>[\s\S]*?<\/proposed_plan>/i.test(content)
+      }
+      return message.kind === "PLAN" && asJsonObject(message.metadata)?.presentation === "result"
+    }) ?? false
+  )
+}
+
+async function resolvePendingServerRequestsForFullAccess(
+  threadId: string,
+): Promise<void> {
+  const pendingRequests = [...pendingServerRequests.values()].filter(
+    (pending) =>
+      pending.threadId === threadId && pending.requestKind !== "userInput",
+  )
+  for (const pending of pendingRequests) {
+    if (pending.requestKind === "userInput") {
+      continue
+    }
+    const requestKind = pending.requestKind
+    const result = fullAccessServerRequestResult(requestKind)
+    pending.runtime.respondToServerRequest(pending.rpcId, result)
+    pendingServerRequests.delete(serverRequestKey(threadId, pending.requestId))
+    const updated = updateRuntimeMessage(threadId, pending.messageId, {
+      completedAt: new Date(),
+      metadataPatch: {
+        autoApproved: true,
+        decision:
+          requestKind === "approval" ? "acceptForSession" : undefined,
+        resolvedAt: new Date().toISOString(),
+        result,
+        status: "resolved",
+      },
+      status: "COMPLETED",
+    })
+    if (updated) {
+      emit(threadId, "message.updated", updated)
+    }
+  }
 }
 
 function extractAssistantText(message: CodexJsonRpcResponse): string {
@@ -3503,20 +3061,14 @@ function extractTurnAssistantText(
 }
 
 async function readLatestAssistantText(
-  runtime: {
-    request(
-      method: string,
-      params: Record<string, unknown>,
-      timeoutMs?: number,
-    ): Promise<CodexJsonRpcResponse>
-  },
+  runtime: Pick<CodexRuntimeSession, "request">,
   threadId: string,
   turnId?: string,
 ): Promise<string | null> {
   try {
     const response = await runtime.request(
       "thread/turns/list",
-      { threadId, limit: 20 },
+      { limit: 20, threadId },
       30_000,
     )
     const result = asJsonObject(response.result)
@@ -3788,19 +3340,10 @@ function countDiffLines(diff: string | undefined, prefix: "+" | "-"): number {
   }
   return diff
     .split("\n")
-    .filter((line) => line.startsWith(prefix) && !line.startsWith(`${prefix}${prefix}${prefix}`))
+    .filter(
+      (line) => line.startsWith(prefix) && !line.startsWith(`${prefix}${prefix}${prefix}`),
+    )
     .length
-}
-
-function readJsonArray(value: unknown): JsonSerializable[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined
-  }
-  return value.map(toSerializable)
-}
-
-function readNumber(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
 
 function extractContextWindowUsage(
@@ -3819,7 +3362,6 @@ function extractContextWindowUsage(
       firstJsonObject(info, ["total_token_usage", "totalTokenUsage"])
     return contextWindowUsageFromObject(preferredUsage ?? info, info)
   }
-
   const params = asJsonObject(event.params)
   const eventObject = asJsonObject(params?.event)
   const usageObject =
@@ -3920,7 +3462,6 @@ function contextWindowUsageFromObject(
   if (!resolvedTokenLimit) {
     return null
   }
-
   const summedTotal = sumPositiveIntegers([
     firstPositiveInteger(usageRoot, ["input_tokens", "inputTokens"]),
     firstPositiveInteger(usageRoot, ["output_tokens", "outputTokens"]),
@@ -3933,7 +3474,6 @@ function contextWindowUsageFromObject(
   if (rawTokensUsed === null) {
     return null
   }
-
   const tokensUsed = Math.min(rawTokensUsed, resolvedTokenLimit)
   const remainingTokens = Math.max(0, resolvedTokenLimit - tokensUsed)
   const usedPercent = Math.max(
@@ -3941,10 +3481,10 @@ function contextWindowUsageFromObject(
     Math.min(100, Math.round((tokensUsed / resolvedTokenLimit) * 100)),
   )
   return {
+    remainingPercent: Math.max(0, 100 - usedPercent),
     tokenLimit: resolvedTokenLimit,
     tokensRemaining: remainingTokens,
     tokensUsed,
-    remainingPercent: Math.max(0, 100 - usedPercent),
     usedPercent,
   }
 }
@@ -3957,20 +3497,17 @@ function findTokenCountPayload(value: unknown, depth = 0): JsonObject | undefine
   if (!object) {
     return undefined
   }
-
   const type = normalizedType(readString(object.type) ?? "")
   const method = normalizedType(readString(object.method) ?? "")
   if (type === "tokencount" || method === "tokencount") {
     return object
   }
-
   for (const key of ["payload", "event", "params", "message"]) {
     const nested = findTokenCountPayload(object[key], depth + 1)
     if (nested) {
       return nested
     }
   }
-
   return undefined
 }
 
@@ -4097,7 +3634,8 @@ function decodeUserInputQuestions(value: unknown) {
       isSecret: typeof entry.isSecret === "boolean" ? entry.isSecret : undefined,
       options: decodeUserInputOptions(entry.options),
       question: readString(entry.question) ?? readString(entry.header) ?? "Answer",
-      selectionLimit: readNumber(entry.selectionLimit) ?? readNumber(entry.selection_limit),
+      selectionLimit:
+        readNumber(entry.selectionLimit) ?? readNumber(entry.selection_limit),
     }))
 }
 
@@ -4156,164 +3694,31 @@ function fullAccessServerRequestResult(
   if (requestKind === "approval") {
     return { decision: "acceptForSession" }
   }
-  return { scope: "session", permissions: true }
+  return { permissions: true, scope: "session" }
 }
 
-async function markServerRequestResolved(
-  chatId: string,
-  event: CodexJsonRpcResponse,
-): Promise<void> {
-  const params = asJsonObject(event.params) ?? {}
-  const requestId = readString(params.requestId) ?? readString(params.id)
-  if (!requestId) {
-    return
+function serverRequestKey(threadId: string, requestId: string): string {
+  return `${threadId}:${requestId}`
+}
+
+function readJsonObjectArray(value: unknown): JsonObject[] | null {
+  if (!Array.isArray(value)) {
+    return null
   }
-  pendingServerRequests.delete(serverRequestKey(chatId, requestId))
-  const message = await prisma.chatMessage.findFirst({
-    where: { chatId, requestId },
-  })
-  if (!message) {
-    return
+  return value
+    .map((entry) => asJsonObject(entry))
+    .filter((entry): entry is JsonObject => !!entry)
+}
+
+function readJsonArray(value: unknown): JsonSerializable[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined
   }
-  const updated = await prisma.chatMessage.update({
-    where: { id: message.id },
-    data: {
-      completedAt: new Date(),
-      metadata: mergeMetadata(message.metadata, {
-        result: params.result === undefined ? null : toSerializable(params.result),
-        resolvedAt: new Date().toISOString(),
-        status: "resolved",
-      }),
-      status: "COMPLETED",
-    },
-  })
-  emit(chatId, "message.updated", toChatMessageResponse(updated))
+  return value.map(toSerializable)
 }
 
-async function expirePendingServerRequests(
-  chatId: string,
-  runId: string,
-  reason: string,
-): Promise<void> {
-  const messages = await prisma.chatMessage.findMany({
-    where: {
-      chatId,
-      kind: { in: ["APPROVAL", "USER_INPUT_PROMPT"] },
-      runId,
-      status: "PENDING",
-    },
-  })
-
-  for (const message of messages) {
-    const metadata = asJsonObject(message.metadata)
-    if (metadata?.status === "resolved" || metadata?.status === "expired") {
-      continue
-    }
-    if (message.requestId) {
-      const key = serverRequestKey(chatId, message.requestId)
-      const pending = pendingServerRequests.get(key)
-      pending?.runtime.rejectServerRequest(
-        pending.rpcId,
-        -32000,
-        `Server request expired: ${reason}`,
-      )
-      pendingServerRequests.delete(key)
-    }
-    const updated = await prisma.chatMessage.update({
-      where: { id: message.id },
-      data: {
-        completedAt: new Date(),
-        metadata: mergeMetadata(message.metadata, {
-          expiredAt: new Date().toISOString(),
-          reason,
-          status: "expired",
-        }),
-        status: "COMPLETED",
-      },
-    })
-    emit(chatId, "message.updated", toChatMessageResponse(updated))
-  }
-}
-
-async function settleOpenRunTimelineMessages(
-  chatId: string,
-  runId: string,
-  status: Extract<ChatMessageResponse["status"], "COMPLETED" | "FAILED">,
-): Promise<void> {
-  const messages = await prisma.chatMessage.findMany({
-    where: {
-      chatId,
-      kind: {
-        in: [
-          "COMMAND_EXECUTION",
-          "FILE_CHANGE",
-          "PLAN",
-          "THINKING",
-          "TOOL_ACTIVITY",
-        ],
-      },
-      runId,
-      status: { in: ["PENDING", "STREAMING"] },
-    },
-  })
-
-  for (const message of messages) {
-    const updated = await prisma.chatMessage.update({
-      where: { id: message.id },
-      data: {
-        completedAt: new Date(),
-        status,
-      },
-    })
-    emit(chatId, "message.updated", toChatMessageResponse(updated))
-  }
-}
-
-async function runHasPlanResult(
-  chatId: string,
-  runId: string,
-): Promise<boolean> {
-  const messages = await prisma.chatMessage.findMany({
-    where: {
-      chatId,
-      runId,
-      OR: [
-        { kind: "PLAN" },
-        { kind: "CHAT", role: "ASSISTANT" },
-      ],
-    },
-  })
-
-  return messages.some((message) => {
-    const content = message.content.trim()
-    if (!content || content === "Planning...") {
-      return false
-    }
-    if (message.kind === "CHAT") {
-      return /<proposed_plan\b[^>]*>[\s\S]*?<\/proposed_plan>/i.test(content)
-    }
-    const metadata = asJsonObject(message.metadata)
-    return metadata?.presentation === "result"
-  })
-}
-
-async function messageMetadata(messageId: string): Promise<unknown> {
-  const message = await prisma.chatMessage.findUnique({
-    where: { id: messageId },
-    select: { metadata: true },
-  })
-  return message?.metadata ?? null
-}
-
-function mergeMetadata(existing: unknown, patch: JsonObject): Prisma.InputJsonValue {
-  return toJsonInput({
-    ...(asJsonObject(existing) ?? {}),
-    ...patch,
-  })
-}
-
-function serverRequestKey(chatId: string, requestId: string): string {
-  return `${chatId}:${requestId}`
+function readNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
 
 function toSerializable(value: unknown): JsonSerializable {
@@ -4324,26 +3729,189 @@ function readText(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined
 }
 
-function toJsonInput(value: unknown): Prisma.InputJsonValue {
-  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue
+function normalizeNullableRuntimeOption(value: string | null): string | null {
+  if (value === null) {
+    return null
+  }
+  const trimmed = value.trim()
+  if (!trimmed) {
+    throw new HttpError(400, "Runtime option cannot be empty.")
+  }
+  return trimmed
 }
 
-function toChatMessageResponse(message: PersistedChatMessage): ChatMessageResponse {
-  return {
-    ...message,
-    metadata: message.metadata as ChatMessageResponse["metadata"],
-    rawPayload: message.rawPayload as JsonSerializable | null,
+function normalizeReasoningEffort(
+  value: CodexReasoningEffort | null,
+): CodexReasoningEffort | null {
+  if (value === null) {
+    return null
   }
+  const allowed: CodexReasoningEffort[] = [
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+  ]
+  if (!allowed.includes(value)) {
+    throw new HttpError(400, "reasoningEffort is invalid.")
+  }
+  return value
 }
 
-function toChatResponse(chat: PersistedChat): ChatResponse {
-  return {
-    ...chat,
-    collaborationMode: normalizeStoredCollaborationMode(chat.collaborationMode),
-    permissionMode: normalizeStoredPermissionMode(chat.permissionMode),
-    reasoningEffort: chat.reasoningEffort as ChatResponse["reasoningEffort"],
-    serviceTier: chat.serviceTier as ChatResponse["serviceTier"],
+function normalizeServiceTier(value: CodexServiceTier | null): CodexServiceTier | null {
+  if (value === null || value === "fast" || value === "flex") {
+    return value
   }
+  throw new HttpError(400, "serviceTier is invalid.")
+}
+
+function normalizeCollaborationMode(
+  value: CodexCollaborationMode | null,
+): CodexCollaborationMode {
+  if (value === null || value === "default") {
+    return "default"
+  }
+  if (value === "plan") {
+    return value
+  }
+  throw new HttpError(400, "collaborationMode is invalid.")
+}
+
+function normalizePermissionMode(
+  value: CodexPermissionMode | null,
+): CodexPermissionMode {
+  if (value === null || value === "default") {
+    return "default"
+  }
+  if (value === "fullAccess") {
+    return value
+  }
+  throw new HttpError(400, "permissionMode is invalid.")
+}
+
+function normalizeStoredPermissionMode(
+  value: string | null | undefined,
+): CodexPermissionMode {
+  return value === "fullAccess" ? "fullAccess" : "default"
+}
+
+function normalizeNonEmptyString(value: string | null | undefined): string | null {
+  const trimmed = value?.trim()
+  return trimmed ? trimmed : null
+}
+
+function readReasoningEffort(value: unknown): CodexReasoningEffort | null {
+  if (
+    value === "none" ||
+    value === "minimal" ||
+    value === "low" ||
+    value === "medium" ||
+    value === "high" ||
+    value === "xhigh"
+  ) {
+    return value
+  }
+  return null
+}
+
+function normalizeChatTitle(value: string): string | null {
+  const title = value.replace(/\s+/g, " ").trim()
+  return title ? title.slice(0, 160) : null
+}
+
+function normalizeTitleComparisonValue(value: string | null | undefined): string {
+  return value?.replace(/\s+/g, " ").trim().toLowerCase() ?? ""
+}
+
+function resolveChatDisplayTitle({
+  preferenceTitle,
+  preview,
+  seed,
+  snapshotTitle,
+}: {
+  preferenceTitle?: string | null
+  preview?: string | null
+  seed?: string | null
+  snapshotTitle?: string | null
+}): string {
+  for (const candidate of [preferenceTitle, snapshotTitle]) {
+    const title = normalizeChatTitle(candidate ?? "")
+    if (title && !isGenericChatTitle(title)) {
+      return title
+    }
+  }
+
+  return (
+    fallbackChatTitle(seed ?? "") ??
+    fallbackChatTitle(preview ?? "") ??
+    DEFAULT_CHAT_TITLE
+  )
+}
+
+function isGenericChatTitle(value: string | null | undefined): boolean {
+  const normalized = normalizeTitleComparisonValue(value)
+  return (
+    !normalized ||
+    normalized === "untitled chat" ||
+    normalized === "conversation" ||
+    normalized === "new chat" ||
+    normalized === "new thread" ||
+    normalized === "chat" ||
+    normalized === "codex chat"
+  )
+}
+
+function fallbackChatTitle(seed: string): string | null {
+  const words = seed
+    .split(/\s+/)
+    .map((word) => word.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+    .filter(Boolean)
+    .slice(0, 5)
+  if (!words.length) {
+    return null
+  }
+  const title = words.join(" ")
+  return `${title.charAt(0).toUpperCase()}${title.slice(1)}`.slice(0, 80)
+}
+
+function lastUserMessageContent(messages: ChatMessageResponse[]): string | null {
+  return (
+    [...messages]
+      .reverse()
+      .find((message) => message.role === "USER" && message.content.trim())
+      ?.content ?? null
+  )
+}
+
+function emit<TType extends ChatEventType>(
+  threadId: string,
+  type: TType,
+  payload: ChatEventPayloads[TType],
+): void {
+  publishChatEvent(threadId, type, payload)
+}
+
+function logProjectionError(message: string, error: unknown): void {
+  console.error(message, error instanceof Error ? error.stack ?? error.message : error)
+}
+
+function runtimeForAccount(account: CodexAccount): CodexRuntimeSession {
+  return codexRuntimeService.getRuntime({
+    accountId: account.id,
+    args: normalizeAccountArgs(account.args),
+    command: account.command,
+    environment: normalizeEnvironment(account.environment),
+    workingDirectory: null,
+  })
+}
+
+function normalizeAccountArgs(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return ["app-server"]
+  }
+  return value.filter((entry): entry is string => typeof entry === "string")
 }
 
 function extractThreadName(event: CodexJsonRpcResponse): string | null {
@@ -4360,58 +3928,36 @@ function extractThreadName(event: CodexJsonRpcResponse): string | null {
   )
 }
 
-function normalizeChatTitle(value: string): string | null {
-  const title = value.replace(/\s+/g, " ").trim()
-  return title ? title.slice(0, 160) : null
-}
-
-function normalizeTitleComparisonValue(value: string | null | undefined): string {
-  return value?.replace(/\s+/g, " ").trim().toLowerCase() ?? ""
-}
-
 function extractThreadTitleFromObject(value: unknown): string | null {
   const object = asJsonObject(value)
   if (!object) {
     return null
   }
-  const candidates = [
+  const explicitNameCandidates = [
     object.threadName,
     object.thread_name,
     object.name,
-    object.title,
   ]
-  for (const candidate of candidates) {
+  for (const candidate of explicitNameCandidates) {
     const title = normalizeChatTitle(readString(candidate) ?? "")
     if (title) {
       return title
     }
   }
+  const title = normalizeChatTitle(readString(object.title) ?? "")
+  if (title && !isGenericChatTitle(title)) {
+    return title
+  }
   const thread = asJsonObject(object.thread)
   return thread ? extractThreadTitleFromObject(thread) : null
 }
 
-async function refreshChatTitleFromCodex(
-  runtime: Pick<CodexRuntimeSession, "request">,
-  chatId: string,
-  threadId: string | null,
-): Promise<void> {
-  if (!threadId) {
-    return
-  }
-  const title = await readThreadTitleFromCodex(runtime, threadId)
-  if (title) {
-    await updateChatTitleFromCodex(chatId, title)
-  }
-}
-
 function scheduleAutomaticChatTitleIfNeeded({
-  chatId,
   cwd,
   runtime,
   seed,
   threadId,
 }: {
-  chatId: string
   cwd: string
   runtime: Pick<CodexRuntimeSession, "request">
   seed: string | null
@@ -4422,36 +3968,17 @@ function scheduleAutomaticChatTitleIfNeeded({
     return
   }
   const fallbackTitle = fallbackChatTitle(trimmedSeed)
-  const allowedCurrentTitles = new Set([
-    "untitled chat",
-    "conversation",
-    ...(fallbackTitle ? [normalizeTitleComparisonValue(fallbackTitle)] : []),
-  ])
-
   void (async () => {
     if (fallbackTitle) {
-      await applyAutomaticChatTitleIfAllowed(
-        runtime,
-        chatId,
-        threadId,
-        fallbackTitle,
-        allowedCurrentTitles,
-      )
+      await applyAutomaticThreadTitleIfAllowed(runtime, threadId, fallbackTitle)
     }
     const generatedTitle = await generatedChatTitleOrNull(runtime, {
       cwd,
       seed: trimmedSeed,
     })
-    if (!generatedTitle) {
-      return
+    if (generatedTitle) {
+      await applyAutomaticThreadTitleIfAllowed(runtime, threadId, generatedTitle)
     }
-    await applyAutomaticChatTitleIfAllowed(
-      runtime,
-      chatId,
-      threadId,
-      generatedTitle,
-      allowedCurrentTitles,
-    )
   })().catch(() => undefined)
 }
 
@@ -4476,9 +4003,10 @@ async function generatedChatTitleOrNull(
     )
     const result = asJsonObject(response.result)
     return normalizeChatTitle(
-      readString(result?.title) ??
-        readString(result?.name) ??
+      readString(result?.name) ??
         readString(result?.threadName) ??
+        readString(result?.thread_name) ??
+        readString(result?.title) ??
         "",
     )
   } catch {
@@ -4486,30 +4014,20 @@ async function generatedChatTitleOrNull(
   }
 }
 
-async function applyAutomaticChatTitleIfAllowed(
+async function applyAutomaticThreadTitleIfAllowed(
   runtime: Pick<CodexRuntimeSession, "request">,
-  chatId: string,
   threadId: string,
   title: string,
-  allowedCurrentTitles: Set<string>,
 ): Promise<boolean> {
   const normalizedTitle = normalizeChatTitle(title)
-  if (!normalizedTitle) {
+  if (!normalizedTitle || isGenericChatTitle(normalizedTitle)) {
     return false
   }
-
-  const chat = await prisma.chat.findUnique({ where: { id: chatId } })
-  if (!chat) {
+  const preference = await getThreadPreference(threadId)
+  if (preference?.title && !isGenericChatTitle(preference.title)) {
     return false
   }
-  const currentTitle = normalizeTitleComparisonValue(chat.title)
-  const canReplace =
-    isGenericChatTitle(chat.title) || allowedCurrentTitles.has(currentTitle)
-  if (!canReplace) {
-    return false
-  }
-
-  await updateChatTitleFromCodex(chatId, normalizedTitle)
+  await updateThreadTitleFromCodex(threadId, normalizedTitle)
   void sendThreadNameSet(runtime, threadId, normalizedTitle)
   return true
 }
@@ -4534,31 +4052,31 @@ async function sendThreadNameSet(
   }
 }
 
-async function persistChatTitleToCodex(chat: Chat): Promise<void> {
-  if (!chat.accountId || !chat.externalThreadId) {
+async function persistThreadTitleToCodex(
+  threadId: string,
+  preference: ThreadPreference,
+  title: string,
+): Promise<void> {
+  if (!preference.accountId) {
     return
   }
   const account = await prisma.codexAccount.findUnique({
-    where: { id: chat.accountId },
+    where: { id: preference.accountId },
   })
   if (!account || account.status !== "CONNECTED") {
     return
   }
-  const runtime = codexRuntimeService.getRuntime({
-    accountId: account.id,
-    command: account.command,
-    args: normalizeAccountArgs(account.args),
-    workingDirectory: null,
-    environment: normalizeEnvironment(account.environment),
-  })
-  await sendThreadNameSet(runtime, chat.externalThreadId, chat.title)
+  await sendThreadNameSet(runtimeForAccount(account), threadId, title)
 }
 
-function normalizeAccountArgs(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return ["app-server"]
+async function refreshThreadTitleFromCodex(
+  runtime: Pick<CodexRuntimeSession, "request">,
+  threadId: string,
+): Promise<void> {
+  const title = await readThreadTitleFromCodex(runtime, threadId)
+  if (title) {
+    await updateThreadTitleFromCodex(threadId, title)
   }
-  return value.filter((entry): entry is string => typeof entry === "string")
 }
 
 async function readThreadTitleFromCodex(
@@ -4571,15 +4089,13 @@ async function readThreadTitleFromCodex(
       { includeTurns: false, threadId },
       30_000,
     )
-    const result = asJsonObject(response.result)
-    const title = extractThreadTitleFromObject(result)
+    const title = extractThreadTitleFromObject(response.result)
     if (title) {
       return title
     }
   } catch {
-    // Fall back to thread/list for runtimes that do not support thread/read.
+    // Fall back to thread/list.
   }
-
   try {
     const response = await runtime.request(
       "thread/list",
@@ -4593,9 +4109,9 @@ async function readThreadTitleFromCodex(
     )
     const result = asJsonObject(response.result)
     const rows =
-      readThreadRows(result?.data) ??
-      readThreadRows(result?.items) ??
-      readThreadRows(result?.threads) ??
+      readJsonObjectArray(result?.data) ??
+      readJsonObjectArray(result?.items) ??
+      readJsonObjectArray(result?.threads) ??
       []
     const thread = rows.find((row) => readString(row.id) === threadId)
     return extractThreadTitleFromObject(thread)
@@ -4604,30 +4120,22 @@ async function readThreadTitleFromCodex(
   }
 }
 
-function readThreadRows(value: unknown): JsonObject[] | null {
-  if (!Array.isArray(value)) {
-    return null
-  }
-  return value
-    .map((entry) => asJsonObject(entry))
-    .filter((entry): entry is JsonObject => !!entry)
-}
-
-async function updateChatTitleFromCodex(
-  chatId: string,
+async function updateThreadTitleFromCodex(
+  threadId: string,
   title: string,
 ): Promise<void> {
-  const chat = await prisma.chat.update({
-    where: { id: chatId },
-    data: { title },
-  })
-  emit(chatId, "chat.updated", toChatResponse(chat))
+  const normalizedTitle = normalizeChatTitle(title)
+  if (!normalizedTitle || isGenericChatTitle(normalizedTitle)) {
+    return
+  }
+  const preference = await upsertThreadPreference(threadId, { title: normalizedTitle })
+  emit(threadId, "chat.updated", await buildChatResponse(threadId, preference))
 }
 
 export const __testing = {
   approvalMetadata,
-  extractThreadName,
   extractAssistantText,
+  extractThreadName,
   requestMethodKind,
   serverRequestResult,
   threadModeOverrides,

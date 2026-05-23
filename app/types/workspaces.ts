@@ -68,6 +68,21 @@ export interface GitDiffResponse {
   stat: string;
 }
 
+export interface GitCommit {
+  authorEmail: string;
+  authorName: string;
+  authoredAt: string;
+  hash: string;
+  refs: string[];
+  shortHash: string;
+  subject: string;
+}
+
+export interface GitHistoryResponse {
+  commits: GitCommit[];
+  isRepo: boolean;
+}
+
 export type GitActionType =
   | 'checkout'
   | 'createBranch'

@@ -1,11 +1,25 @@
 import "dotenv/config"
 import { constants } from "node:fs"
-import { access, copyFile, mkdir, readdir, readFile, stat } from "node:fs/promises"
+import {
+  access,
+  appendFile,
+  copyFile,
+  mkdir,
+  readdir,
+  readFile,
+  realpath,
+  stat,
+} from "node:fs/promises"
 import { homedir } from "node:os"
-import { basename, delimiter, dirname, join, resolve, sep } from "node:path"
-import type { Prisma } from "@prisma/client"
+import { basename, dirname, join, resolve, sep } from "node:path"
+import { PrismaClient, type Prisma } from "@prisma/client"
 import type { ContextWindowUsagePayload, JsonObject, MessageKind } from "@/types"
-import { resolveAccountCodexHome } from "./codex-runtime.server"
+import {
+  ensureAccountCodexHome,
+  resolveCodexSharedChatHome,
+  resolveCodexSharedSessionIndexPath,
+  resolveCodexSharedStateDatabasePath,
+} from "./codex-runtime.server"
 import { asJsonObject, readString } from "./json.server"
 import { prisma } from "./prisma.server"
 
@@ -30,6 +44,17 @@ export type ParsedLocalCodexSession = {
   workingDirectory?: string
 }
 
+export type LocalCodexSessionSummary = {
+  createdAt: Date
+  externalThreadId: string
+  firstUserMessage?: string | null
+  path: string
+  preview?: string | null
+  title: string | null
+  updatedAt: Date
+  workingDirectory?: string
+}
+
 type LocalCodexSessionFile = {
   mtimeMs: number
   path: string
@@ -45,11 +70,48 @@ type LocalImportState = {
   promise?: Promise<void>
 }
 
+type FileCacheEntry<T> = {
+  mtimeMs: number
+  size: number
+  value: T
+}
+
+type CodexStateThreadRow = {
+  archived: number | null
+  archivedAt: number | null
+  createdAt: number | string | bigint | null
+  cwd: string | null
+  firstUserMessage: string | null
+  id: string
+  preview: string | null
+  rolloutPath: string | null
+  title: string | null
+  updatedAt: number | string | bigint | null
+}
+
+type SqliteTableColumn = {
+  name: string
+}
+
+const globalForCodexState = globalThis as typeof globalThis & {
+  codexStateDatabasePath?: string
+  codexStatePrisma?: PrismaClient
+}
+
 const DEFAULT_SCAN_INTERVAL_MS = 30_000
 const DEFAULT_MAX_FILES = 1_000
 const DEFAULT_MAX_FILE_BYTES = 25 * 1024 * 1024
+const FILE_CACHE_MAX_ENTRIES = 100
 const GLOBAL_IMPORT_STATE_KEY = "global"
 const importStates = new Map<string, LocalImportState>()
+const contextUsageFileCache = new Map<
+  string,
+  FileCacheEntry<ContextWindowUsagePayload | null>
+>()
+const transcriptFileCache = new Map<
+  string,
+  FileCacheEntry<ParsedLocalCodexSession | null>
+>()
 
 export async function importLocalCodexChats(
   options: { force?: boolean } = {},
@@ -94,31 +156,24 @@ export async function importLocalCodexChats(
   await repairImportedLocalCodexChats()
 }
 
-export async function mirrorImportedCodexSessionForAccount(
-  chatId: string,
+export async function mirrorCodexSessionForAccount(
+  threadId: string,
   accountId: string,
 ): Promise<void> {
-  const chat = await prisma.chat.findUnique({
-    where: { id: chatId },
-    select: { externalThreadId: true },
-  })
-  const sessionPath =
-    (await readImportedSessionPath(chatId)) ??
-    (chat?.externalThreadId
-      ? await findLocalCodexSessionPath(chat.externalThreadId)
-      : null)
+  const sessionPath = await findLocalCodexSessionPath(threadId)
   if (!sessionPath) {
     return
   }
 
   const destination = join(
-    resolveAccountCodexHome(accountId),
+    ensureAccountCodexHome(accountId),
     "sessions",
     sessionRelativePath(sessionPath),
   )
   if (resolve(sessionPath) === resolve(destination)) {
     return
   }
+  await mirrorSessionIndex(sessionPath)
   try {
     await access(destination, constants.R_OK)
     return
@@ -130,21 +185,34 @@ export async function mirrorImportedCodexSessionForAccount(
   await copyFile(sessionPath, destination)
 }
 
+async function mirrorSessionIndex(sessionPath: string): Promise<void> {
+  const indexPath = localSessionIndexPath(sessionPath)
+  const destination = resolveCodexSharedSessionIndexPath()
+  if (!indexPath || resolve(indexPath) === resolve(destination)) {
+    return
+  }
+  try {
+    const content = await readFile(indexPath, "utf8")
+    if (!content.trim()) {
+      return
+    }
+    const destinationContent = await readFile(destination, "utf8").catch(() => "")
+    const prefix =
+      destinationContent && !destinationContent.endsWith("\n") ? "\n" : ""
+    await appendFile(
+      destination,
+      `${prefix}${content.endsWith("\n") ? content : `${content}\n`}`,
+    )
+  } catch {
+    // The session file itself is enough for transcript import; index mirroring is best effort.
+  }
+}
+
 export async function readLocalCodexSessionTranscriptForChat(
   chatId: string,
   threadId: string,
 ): Promise<ParsedLocalCodexSession | null> {
-  const importedPath = await readImportedSessionPath(chatId)
-  if (importedPath) {
-    const transcript = await readLocalCodexSessionTranscriptFile(
-      importedPath,
-      threadId,
-    )
-    if (transcript) {
-      return transcript
-    }
-  }
-
+  void chatId
   const sessionPath = await findLocalCodexSessionPath(threadId)
   return sessionPath
     ? readLocalCodexSessionTranscriptFile(sessionPath, threadId)
@@ -155,18 +223,45 @@ export async function readLatestLocalCodexContextUsageForChat(
   chatId: string,
   threadId: string,
 ): Promise<ContextWindowUsagePayload | null> {
-  const importedPath = await readImportedSessionPath(chatId)
-  if (importedPath) {
-    const usage = await readLatestLocalCodexContextUsageFile(importedPath, threadId)
-    if (usage) {
-      return usage
-    }
-  }
-
+  void chatId
   const sessionPath = await findLocalCodexSessionPath(threadId)
   return sessionPath
     ? readLatestLocalCodexContextUsageFile(sessionPath, threadId)
     : null
+}
+
+export async function readLocalCodexSessionTranscript(
+  threadId: string,
+): Promise<ParsedLocalCodexSession | null> {
+  const sessionPath = await findLocalCodexSessionPath(threadId)
+  return sessionPath
+    ? readLocalCodexSessionTranscriptFile(sessionPath, threadId)
+    : null
+}
+
+export async function readLatestLocalCodexContextUsage(
+  threadId: string,
+): Promise<ContextWindowUsagePayload | null> {
+  const sessionPath = await findLocalCodexSessionPath(threadId)
+  return sessionPath
+    ? readLatestLocalCodexContextUsageFile(sessionPath, threadId)
+    : null
+}
+
+export async function readLocalCodexSessionMetadata(
+  threadId: string,
+): Promise<LocalCodexSessionSummary | null> {
+  const row = await readCodexStateThread(threadId)
+  return row ? summaryFromCodexStateThread(row) : null
+}
+
+export async function listLocalCodexSessionSummaries(): Promise<
+  LocalCodexSessionSummary[]
+> {
+  const rows = await readCodexStateThreads(localImportMaxFiles())
+  return rows.map(summaryFromCodexStateThread).sort(
+    (left, right) => right.updatedAt.getTime() - left.updatedAt.getTime(),
+  )
 }
 
 async function scanAndImportLocalCodexChats(): Promise<void> {
@@ -433,10 +528,7 @@ async function repairImportedLocalCodexChat(
   const sourceMetadata =
     indexedMetadata ??
     (chat.externalThreadId
-      ? await readSourceSessionIndexMetadata(
-          importedMessages,
-          chat.externalThreadId,
-        )
+      ? await readSourceSessionIndexMetadata(chat.externalThreadId)
       : null)
   const sourceTitle = sourceMetadata?.title ?? null
   const sourceUpdatedAt = sourceMetadata?.updatedAt ?? fallbackLastActivityAt ?? null
@@ -509,12 +601,9 @@ function importedResponseMessage(
 }
 
 async function readSourceSessionIndexMetadata(
-  importedMessages: Array<{ metadata: Prisma.JsonValue }>,
   threadId: string,
 ): Promise<LocalCodexSessionIndexMetadata | null> {
-  const sessionPath =
-    readImportedSessionPathFromMessages(importedMessages) ??
-    (await findLocalCodexSessionPath(threadId))
+  const sessionPath = await findLocalCodexSessionPath(threadId)
   return sessionPath
     ? readLocalSessionIndexMetadata(sessionPath, threadId)
     : null
@@ -799,25 +888,244 @@ function readSessionIndex(
   return entries
 }
 
-function normalizeImportedTitle(value: string | null | undefined): string | null {
+function normalizeImportedTitle(
+  value: string | null | undefined,
+  options: { allowGeneric?: boolean } = {},
+): string | null {
   const title = value?.replace(/\s+/g, " ").trim()
-  if (!title || isInternalEnvironmentContext(title)) {
+  if (
+    !title ||
+    isInternalEnvironmentContext(title) ||
+    (!options.allowGeneric && isGenericImportedTitle(title))
+  ) {
     return null
   }
   return title.slice(0, 160)
 }
 
+function isGenericImportedTitle(value: string): boolean {
+  const normalized = normalizeTitleComparisonValue(value)
+  return (
+    normalized === "untitled chat" ||
+    normalized === "conversation" ||
+    normalized === "new chat" ||
+    normalized === "new thread" ||
+    normalized === "chat" ||
+    normalized === "codex chat"
+  )
+}
+
+async function readCodexStateThreads(limit: number): Promise<CodexStateThreadRow[]> {
+  const client = await codexStateClient()
+  if (!client) {
+    return []
+  }
+  try {
+    const columns = await readCodexStateThreadColumns(client)
+    return await client.$queryRawUnsafe<CodexStateThreadRow[]>(
+      `
+        SELECT ${codexStateThreadSelectSql(columns)}
+        FROM threads
+        ${codexStateThreadWhereSql(columns)}
+        ORDER BY ${codexStateThreadUpdatedAtColumn(columns)} DESC
+        LIMIT ?
+      `,
+      limit,
+    )
+  } catch (error) {
+    console.warn(
+      "Failed to read root Codex thread database.",
+      error instanceof Error ? error.message : error,
+    )
+    return []
+  }
+}
+
+async function readCodexStateThread(
+  threadId: string,
+): Promise<CodexStateThreadRow | null> {
+  const client = await codexStateClient()
+  if (!client) {
+    return null
+  }
+  try {
+    const columns = await readCodexStateThreadColumns(client)
+    const rows = await client.$queryRawUnsafe<CodexStateThreadRow[]>(
+      `
+        SELECT ${codexStateThreadSelectSql(columns)}
+        FROM threads
+        WHERE id = ?
+        LIMIT 1
+      `,
+      threadId,
+    )
+    return rows[0] ?? null
+  } catch {
+    return null
+  }
+}
+
+async function readCodexStateThreadColumns(
+  client: PrismaClient,
+): Promise<Set<string>> {
+  const rows = await client.$queryRawUnsafe<SqliteTableColumn[]>(
+    "PRAGMA table_info(threads)",
+  )
+  return new Set(rows.map((row) => row.name))
+}
+
+function codexStateThreadSelectSql(columns: Set<string>): string {
+  return [
+    codexStateColumnSql(columns, "id"),
+    codexStateColumnSql(columns, "rollout_path", "rolloutPath"),
+    codexStateDateColumnSql(
+      columns,
+      columns.has("created_at_ms") ? "created_at_ms" : "created_at",
+      "createdAt",
+    ),
+    codexStateDateColumnSql(
+      columns,
+      codexStateThreadUpdatedAtColumn(columns),
+      "updatedAt",
+    ),
+    codexStateColumnSql(columns, "cwd"),
+    codexStateColumnSql(columns, "title"),
+    codexStateColumnSql(columns, "first_user_message", "firstUserMessage"),
+    codexStateColumnSql(columns, "preview"),
+    codexStateColumnSql(columns, "archived"),
+    codexStateColumnSql(columns, "archived_at", "archivedAt"),
+  ].join(",\n          ")
+}
+
+function codexStateColumnSql(
+  columns: Set<string>,
+  column: string,
+  alias?: string,
+): string {
+  return columns.has(column)
+    ? `${column}${alias ? ` AS ${alias}` : ""}`
+    : `NULL AS ${alias ?? column}`
+}
+
+function codexStateDateColumnSql(
+  columns: Set<string>,
+  column: string,
+  alias: string,
+): string {
+  return columns.has(column) ? `CAST(${column} AS TEXT) AS ${alias}` : `NULL AS ${alias}`
+}
+
+function codexStateThreadWhereSql(columns: Set<string>): string {
+  return columns.has("archived") ? "WHERE COALESCE(archived, 0) = 0" : ""
+}
+
+function codexStateThreadUpdatedAtColumn(columns: Set<string>): string {
+  if (columns.has("updated_at_ms")) {
+    return "updated_at_ms"
+  }
+  if (columns.has("updated_at")) {
+    return "updated_at"
+  }
+  return "rowid"
+}
+
+async function codexStateClient(): Promise<PrismaClient | null> {
+  const databasePath = resolveCodexSharedStateDatabasePath()
+  try {
+    await access(databasePath, constants.R_OK)
+  } catch {
+    return null
+  }
+  if (
+    globalForCodexState.codexStatePrisma &&
+    globalForCodexState.codexStateDatabasePath === databasePath
+  ) {
+    return globalForCodexState.codexStatePrisma
+  }
+  await globalForCodexState.codexStatePrisma?.$disconnect().catch(() => undefined)
+  globalForCodexState.codexStateDatabasePath = databasePath
+  globalForCodexState.codexStatePrisma = new PrismaClient({
+    datasources: { db: { url: sqliteDatabaseUrl(databasePath) } },
+  })
+  return globalForCodexState.codexStatePrisma
+}
+
+function summaryFromCodexStateThread(
+  row: CodexStateThreadRow,
+): LocalCodexSessionSummary {
+  const fallbackTimestamp = new Date(0)
+  const updatedAt = dateFromCodexTimestamp(row.updatedAt, fallbackTimestamp)
+  const createdAt = dateFromCodexTimestamp(row.createdAt, updatedAt)
+  const path = rootCodexSessionPathCandidates(row.rolloutPath)[0] ?? ""
+  const firstUserMessage = normalizeImportedTitle(row.firstUserMessage, {
+    allowGeneric: true,
+  })
+  const preview = normalizeImportedTitle(row.preview, { allowGeneric: true })
+  return {
+    createdAt,
+    externalThreadId: row.id,
+    firstUserMessage,
+    path,
+    preview,
+    title:
+      normalizeImportedTitle(row.title, { allowGeneric: false }) ??
+      fallbackChatTitle(firstUserMessage ?? "") ??
+      fallbackChatTitle(preview ?? "") ??
+      null,
+    updatedAt,
+    workingDirectory: row.cwd ?? undefined,
+  }
+}
+
+function dateFromCodexTimestamp(
+  value: number | string | bigint | null | undefined,
+  fallback: Date,
+): Date {
+  const numeric =
+    typeof value === "bigint"
+      ? Number(value)
+      : typeof value === "number"
+        ? value
+        : typeof value === "string" && value.trim()
+          ? Number(value)
+          : Number.NaN
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return fallback
+  }
+  return new Date(numeric > 10_000_000_000 ? numeric : numeric * 1000)
+}
+
+function sqliteDatabaseUrl(path: string): string {
+  return `file:${path}?connection_limit=1&pool_timeout=30`
+}
+
+function rootCodexSessionPathCandidates(
+  rolloutPath: string | null | undefined,
+): string[] {
+  const trimmed = rolloutPath?.trim()
+  if (!trimmed) {
+    return []
+  }
+  const sharedPath = join(
+    resolveCodexSharedChatHome(),
+    "sessions",
+    sessionRelativePath(trimmed),
+  )
+  return [...new Set([trimmed, sharedPath])]
+}
+
 async function existingSessionRoots(): Promise<string[]> {
-  const roots = [
-    ...configuredImportRoots(),
-    join(resolveHomePath(process.env.CODEX_HOME?.trim() || "~/.codex"), "sessions"),
-    ...(await codexConnectAccountSessionRoots()),
-  ]
-  const uniqueRoots = [...new Set(roots.map((root) => resolveHomePath(root)))]
+  const roots = [join(resolveCodexSharedChatHome(), "sessions")]
   const existing: string[] = []
-  for (const root of uniqueRoots) {
+  const seen = new Set<string>()
+  for (const root of roots.map((entry) => resolveHomePath(entry))) {
     try {
       await access(root, constants.R_OK)
+      const key = await realpath(root).catch(() => root)
+      if (seen.has(key)) {
+        continue
+      }
+      seen.add(key)
       existing.push(root)
     } catch {
       // Missing Codex installs should not make chat listing fail.
@@ -827,25 +1135,13 @@ async function existingSessionRoots(): Promise<string[]> {
 }
 
 async function findLocalCodexSessionPath(threadId: string): Promise<string | null> {
-  const roots = await existingSessionRoots()
-  const files = (await Promise.all(roots.map((root) => listSessionFiles(root))))
-    .flat()
-    .sort((left, right) => right.mtimeMs - left.mtimeMs)
-
-  const pathMatch = files.find(
-    (file) => extractSessionIdFromPath(file.path) === threadId,
-  )
-  if (pathMatch) {
-    return pathMatch.path
-  }
-
-  for (const file of files.slice(0, localImportMaxFiles())) {
-    const transcript = await readLocalCodexSessionTranscriptFile(
-      file.path,
-      threadId,
-    )
-    if (transcript) {
-      return file.path
+  const row = await readCodexStateThread(threadId)
+  for (const path of rootCodexSessionPathCandidates(row?.rolloutPath)) {
+    try {
+      await access(path, constants.R_OK)
+      return path
+    } catch {
+      // Try the next root Codex path candidate.
     }
   }
   return null
@@ -860,12 +1156,19 @@ async function readLocalCodexSessionTranscriptFile(
     if (!info.isFile() || info.size > localImportMaxFileBytes()) {
       return null
     }
+    const cacheKey = `${threadId}:${path}`
+    const cached = transcriptFileCache.get(cacheKey)
+    if (cached && fileCacheEntryMatches(cached, info)) {
+      return cached.value
+    }
     const parsed = parseLocalCodexSessionJsonl(
       await readFile(path, "utf8"),
       path,
       new Date(info.mtimeMs),
     )
-    return parsed?.externalThreadId === threadId ? parsed : null
+    const result = parsed?.externalThreadId === threadId ? parsed : null
+    setFileCacheEntry(transcriptFileCache, cacheKey, info, result)
+    return result
   } catch {
     return null
   }
@@ -879,6 +1182,11 @@ async function readLatestLocalCodexContextUsageFile(
     const info = await stat(path)
     if (!info.isFile() || info.size > localImportMaxFileBytes()) {
       return null
+    }
+    const cacheKey = `${threadId}:${path}`
+    const cached = contextUsageFileCache.get(cacheKey)
+    if (cached && fileCacheEntryMatches(cached, info)) {
+      return cached.value
     }
     let latestUsage: ContextWindowUsagePayload | null = null
     let sessionId: string | undefined
@@ -900,35 +1208,11 @@ async function readLatestLocalCodexContextUsageFile(
       }
     }
     const matchedThreadId = sessionId ?? extractSessionIdFromPath(path)
-    return matchedThreadId === threadId ? latestUsage : null
+    const result = matchedThreadId === threadId ? latestUsage : null
+    setFileCacheEntry(contextUsageFileCache, cacheKey, info, result)
+    return result
   } catch {
     return null
-  }
-}
-
-function configuredImportRoots(): string[] {
-  const raw = process.env.CODEX_LOCAL_CHAT_IMPORT_ROOTS?.trim()
-  if (!raw) {
-    return []
-  }
-  return raw
-    .split(delimiter)
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-    .map((entry) => (entry.endsWith("/sessions") ? entry : join(entry, "sessions")))
-}
-
-async function codexConnectAccountSessionRoots(): Promise<string[]> {
-  const accountsHome = resolveHomePath(
-    process.env.CODEX_ACCOUNTS_HOME?.trim() || "~/.xedoc/accounts",
-  )
-  try {
-    const entries = await readdir(accountsHome, { withFileTypes: true })
-    return entries
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => join(accountsHome, entry.name, "sessions"))
-  } catch {
-    return []
   }
 }
 
@@ -991,6 +1275,32 @@ function localImportMaxFileBytes(): number {
     "CODEX_LOCAL_CHAT_IMPORT_MAX_FILE_BYTES",
     DEFAULT_MAX_FILE_BYTES,
   )
+}
+
+function fileCacheEntryMatches<T>(
+  entry: FileCacheEntry<T>,
+  info: { mtimeMs: number; size: number },
+): boolean {
+  return entry.mtimeMs === info.mtimeMs && entry.size === info.size
+}
+
+function setFileCacheEntry<T>(
+  cache: Map<string, FileCacheEntry<T>>,
+  key: string,
+  info: { mtimeMs: number; size: number },
+  value: T,
+): void {
+  if (cache.size >= FILE_CACHE_MAX_ENTRIES) {
+    const oldestKey = cache.keys().next().value
+    if (oldestKey) {
+      cache.delete(oldestKey)
+    }
+  }
+  cache.set(key, {
+    mtimeMs: info.mtimeMs,
+    size: info.size,
+    value,
+  })
 }
 
 function readPositiveIntegerEnv(name: string, fallback: number): number {
@@ -1216,42 +1526,6 @@ function resolveHomePath(path: string): string {
     return join(homedir(), path.slice(2))
   }
   return resolve(path)
-}
-
-async function readImportedSessionPath(chatId: string): Promise<string | null> {
-  const messages = await prisma.chatMessage.findMany({
-    where: { chatId },
-    orderBy: { sequence: "asc" },
-    select: { metadata: true },
-    take: 10,
-  })
-  for (const message of messages) {
-    const metadata = asJsonObject(message.metadata)
-    if (metadata?.kind !== "localCodexImport") {
-      continue
-    }
-    const sessionPath = readString(metadata.sessionPath)
-    if (sessionPath) {
-      return sessionPath
-    }
-  }
-  return null
-}
-
-function readImportedSessionPathFromMessages(
-  messages: Array<{ metadata: Prisma.JsonValue }>,
-): string | null {
-  for (const message of messages) {
-    const metadata = asJsonObject(message.metadata)
-    if (metadata?.kind !== "localCodexImport") {
-      continue
-    }
-    const sessionPath = readString(metadata.sessionPath)
-    if (sessionPath) {
-      return sessionPath
-    }
-  }
-  return null
 }
 
 function sessionRelativePath(path: string): string {

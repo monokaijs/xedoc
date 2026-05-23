@@ -5,12 +5,15 @@ import type {
   GitActionResponse,
   GitBranchesResponse,
   GitBranch,
+  GitCommit,
   GitDiffResponse,
+  GitHistoryResponse,
   GitFileStatus,
   GitStatusResponse,
 } from "@/types"
+import { readInMemoryThreadStatus } from "./chats.server"
 import { HttpError } from "./http.server"
-import { prisma } from "./prisma.server"
+import { resolveThreadWorkingDirectory } from "./thread-preferences.server"
 import { resolveDirectory } from "./workspaces.server"
 
 const execFileAsync = promisify(execFile)
@@ -124,6 +127,28 @@ export async function readGitDiff(
   }
 }
 
+export async function readGitHistory(chatId: string): Promise<GitHistoryResponse> {
+  const context = await gitContext(chatId)
+  if (!(await gitRoot(context.cwd))) {
+    return {
+      commits: [],
+      isRepo: false,
+    }
+  }
+  const output = await tryGit(context.cwd, [
+    "log",
+    "--max-count=80",
+    "--date=iso-strict",
+    "--pretty=format:%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%D%x1f%s%x1e",
+    "--decorate=short",
+    "--all",
+  ])
+  return {
+    commits: parseGitHistory(output ?? ""),
+    isRepo: true,
+  }
+}
+
 export async function performGitAction(
   chatId: string,
   request: GitActionRequest,
@@ -175,19 +200,13 @@ export async function performGitAction(
 }
 
 async function gitContext(chatId: string): Promise<GitContext> {
-  const chat = await prisma.chat.findUnique({
-    where: { id: chatId },
-    select: { status: true, workingDirectory: true },
-  })
-  if (!chat) {
-    throw new HttpError(404, "Chat not found.")
-  }
-  if (!chat.workingDirectory) {
+  const workingDirectory = await resolveThreadWorkingDirectory(chatId)
+  if (!workingDirectory) {
     throw new HttpError(400, "Chat does not have a working directory.")
   }
   return {
-    cwd: resolveDirectory(chat.workingDirectory),
-    status: chat.status,
+    cwd: resolveDirectory(workingDirectory),
+    status: readInMemoryThreadStatus(chatId),
   }
 }
 
@@ -275,6 +294,33 @@ function parsePorcelainStatus(output: string): GitFileStatus[] {
         unstaged,
       }
     })
+}
+
+function parseGitHistory(output: string): GitCommit[] {
+  return output
+    .split("\x1e")
+    .map((record) => record.trim())
+    .filter(Boolean)
+    .map((record): GitCommit | null => {
+      const [hash, shortHash, authorName, authorEmail, authoredAt, refs, ...subject] =
+        record.split("\x1f")
+      if (!hash || !shortHash) {
+        return null
+      }
+      return {
+        authorEmail: authorEmail ?? "",
+        authorName: authorName ?? "",
+        authoredAt: authoredAt ?? "",
+        hash,
+        refs: (refs ?? "")
+          .split(",")
+          .map((ref) => ref.trim())
+          .filter(Boolean),
+        shortHash,
+        subject: subject.join("\x1f") || "(no subject)",
+      }
+    })
+    .filter((commit): commit is GitCommit => !!commit)
 }
 
 function requireBranch(branch: string | undefined): string {

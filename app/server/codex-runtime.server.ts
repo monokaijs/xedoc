@@ -1,9 +1,23 @@
 import "dotenv/config"
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { chmodSync, mkdirSync } from "node:fs"
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  copyFileSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  renameSync,
+  statSync,
+  symlinkSync,
+} from "node:fs"
 import { homedir } from "node:os"
-import { join, resolve } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 import type {
   CodexEventHandler,
   CodexJsonRpcResponse,
@@ -16,6 +30,7 @@ import type {
   JsonObject,
   JsonSerializable,
 } from "@/types"
+import { prisma } from "./prisma.server"
 
 class CodexRuntime {
   private child?: ChildProcessWithoutNullStreams
@@ -137,6 +152,9 @@ class CodexRuntime {
       const message = chunk.toString("utf8").trim()
       if (message) {
         console.warn(`[codex:${this.config.accountId}] ${message}`)
+        if (isCodexAuthTokenInvalidatedMessage(message)) {
+          void markCodexAccountInvalidated(this.config.accountId, message)
+        }
       }
     })
     this.child.on("error", (error) => this.failAll(error))
@@ -218,6 +236,12 @@ class CodexRuntime {
     clearTimeout(waiter.timeout)
     this.pending.delete(jsonRpcIdKey(message.id))
     if (message.error) {
+      if (isCodexAuthTokenInvalidatedMessage(message.error.message)) {
+        void markCodexAccountInvalidated(
+          this.config.accountId,
+          message.error.message,
+        )
+      }
       waiter.reject(new Error(message.error.message ?? "Codex request failed."))
       return
     }
@@ -261,6 +285,71 @@ class CodexRuntimeService {
 }
 
 export const codexRuntimeService = new CodexRuntimeService()
+
+const invalidatedCodexAccountIds = new Set<string>()
+
+export async function markCodexAccountInvalidated(
+  accountId: string,
+  cause?: unknown,
+): Promise<void> {
+  invalidatedCodexAccountIds.add(accountId)
+  await prisma.codexAccount.updateMany({
+    where: { id: accountId },
+    data: {
+      status: "INVALIDATED",
+      lastAuthUrl: null,
+      lastAuthMode: null,
+      lastAuthLoginId: null,
+      lastAuthUserCode: null,
+      lastError: formatCodexAuthInvalidatedMessage(cause),
+    },
+  })
+}
+
+export function clearCodexAccountInvalidated(accountId: string): void {
+  invalidatedCodexAccountIds.delete(accountId)
+}
+
+export function isCodexAccountMarkedInvalidated(accountId: string): boolean {
+  return invalidatedCodexAccountIds.has(accountId)
+}
+
+export function isCodexAuthTokenInvalidatedError(error: unknown): boolean {
+  return isCodexAuthTokenInvalidatedMessage(
+    error instanceof Error ? error.message : String(error ?? ""),
+  )
+}
+
+function isCodexAuthTokenInvalidatedMessage(message: unknown): boolean {
+  if (typeof message !== "string") {
+    return false
+  }
+  const normalized = message.toLowerCase()
+  return (
+    normalized.includes("token_invalidated") ||
+    normalized.includes("authentication token has been invalidated") ||
+    (normalized.includes("401") &&
+      normalized.includes("unauthorized") &&
+      normalized.includes("invalidated"))
+  )
+}
+
+function formatCodexAuthInvalidatedMessage(cause: unknown): string {
+  const message =
+    cause instanceof Error
+      ? cause.message
+      : typeof cause === "string"
+        ? cause
+        : ""
+  const trimmed = message.trim()
+  if (!trimmed) {
+    return "Codex authentication token was invalidated. Re-authenticate this account."
+  }
+  return [
+    "Codex authentication token was invalidated. Re-authenticate this account.",
+    trimmed.length > 700 ? `${trimmed.slice(0, 700)}...` : trimmed,
+  ].join("\n")
+}
 
 export function buildCodexRuntimeSpawnConfig(
   config: CodexRuntimeConfig,
@@ -306,6 +395,33 @@ export function resolveAccountCodexHome(accountId: string): string {
   return join(resolveCodexAccountsHome(), accountId)
 }
 
+export function ensureAccountCodexHome(accountId: string): string {
+  const codexHome = resolveAccountCodexHome(accountId)
+  ensureCodexHome(codexHome)
+  return codexHome
+}
+
+export function resolveCodexSharedChatHome(): string {
+  return resolveHomePath(
+    process.env.CODEX_SHARED_CHAT_HOME?.trim() ||
+      process.env.CODEX_HOME?.trim() ||
+      "~/.codex",
+  )
+}
+
+export function resolveCodexSharedSessionIndexPath(): string {
+  return join(resolveCodexSharedChatHome(), "session_index.jsonl")
+}
+
+export function resolveCodexSharedStateDatabasePath(): string {
+  const sharedChatHome = resolveCodexSharedChatHome()
+  const newest = readDirectoryNames(sharedChatHome)
+    .filter((name) => /^state_\d+\.sqlite$/i.test(name))
+    .sort((left, right) => stateDatabaseVersion(right) - stateDatabaseVersion(left))
+    .at(0)
+  return join(sharedChatHome, newest ?? "state_5.sqlite")
+}
+
 export type CodexMessageClassification =
   | "notification"
   | "server-request"
@@ -348,4 +464,268 @@ function resolveHomePath(path: string): string {
 function ensureCodexHome(codexHome: string): void {
   mkdirSync(codexHome, { recursive: true, mode: 0o700 })
   chmodSync(codexHome, 0o700)
+  ensureSharedCodexChatStorage(codexHome)
+}
+
+function ensureSharedCodexChatStorage(codexHome: string): void {
+  const sharedChatHome = resolveCodexSharedChatHome()
+  if (resolve(codexHome) === resolve(sharedChatHome)) {
+    return
+  }
+
+  mkdirSync(sharedChatHome, { recursive: true, mode: 0o700 })
+  chmodSync(sharedChatHome, 0o700)
+  ensureSharedSessionsLink(codexHome, sharedChatHome)
+  ensureSharedSessionIndexLink(codexHome, sharedChatHome)
+  ensureSharedStateDatabaseLinks(codexHome, sharedChatHome)
+  ensureSharedPersonalizationLinks(codexHome, sharedChatHome)
+}
+
+function ensureSharedSessionsLink(
+  codexHome: string,
+  sharedChatHome: string,
+): void {
+  const target = join(sharedChatHome, "sessions")
+  const link = join(codexHome, "sessions")
+  mkdirSync(target, { recursive: true, mode: 0o700 })
+
+  if (isSymlinkTo(link, target)) {
+    return
+  }
+
+  if (pathExists(link)) {
+    const readableDirectory = statIfExists(link)?.isDirectory() ?? false
+    if (readableDirectory) {
+      copyDirectoryContents(link, target)
+    }
+    renameSync(link, nextBackupPath(link))
+  }
+
+  symlinkSync(target, link, "dir")
+}
+
+function ensureSharedSessionIndexLink(
+  codexHome: string,
+  sharedChatHome: string,
+): void {
+  const target = join(sharedChatHome, "session_index.jsonl")
+  const link = join(codexHome, "session_index.jsonl")
+  ensureFile(target, 0o600)
+
+  if (isSymlinkTo(link, target)) {
+    return
+  }
+
+  if (pathExists(link)) {
+    if (statIfExists(link)?.isFile()) {
+      appendIndexFile(link, target)
+    }
+    renameSync(link, nextBackupPath(link))
+  }
+
+  symlinkSync(target, link, "file")
+}
+
+function ensureSharedStateDatabaseLinks(
+  codexHome: string,
+  sharedChatHome: string,
+): void {
+  for (const name of sharedStateDatabaseFileNames(codexHome, sharedChatHome)) {
+    ensureSharedStateFileLink(codexHome, sharedChatHome, name)
+  }
+}
+
+function sharedStateDatabaseFileNames(
+  codexHome: string,
+  sharedChatHome: string,
+): string[] {
+  const bases = new Set([basename(resolveCodexSharedStateDatabasePath())])
+  for (const root of [sharedChatHome, codexHome]) {
+    for (const name of readDirectoryNames(root)) {
+      if (/^state_\d+\.sqlite$/i.test(name)) {
+        bases.add(name)
+      }
+    }
+  }
+  return [...bases].flatMap((base) => [base, `${base}-wal`, `${base}-shm`])
+}
+
+function ensureSharedStateFileLink(
+  codexHome: string,
+  sharedChatHome: string,
+  name: string,
+): void {
+  const target = join(sharedChatHome, name)
+  const link = join(codexHome, name)
+  if (isSymlinkTo(link, target)) {
+    return
+  }
+
+  const linkInfo = statIfExists(link)
+  if (linkInfo?.isFile()) {
+    copyFileIfMissing(link, target)
+  }
+  if (!name.endsWith("-wal") && !name.endsWith("-shm")) {
+    ensureFile(target, 0o600)
+  }
+  if (pathExists(link)) {
+    renameSync(link, nextBackupPath(link))
+  }
+  symlinkSync(target, link, "file")
+}
+
+function ensureSharedPersonalizationLinks(
+  codexHome: string,
+  sharedChatHome: string,
+): void {
+  ensureSharedTextFileLink(codexHome, sharedChatHome, "AGENTS.md", true)
+  ensureSharedTextFileLink(codexHome, sharedChatHome, "AGENTS.override.md", false)
+}
+
+function ensureSharedTextFileLink(
+  codexHome: string,
+  sharedChatHome: string,
+  name: string,
+  createWhenMissing: boolean,
+): void {
+  const target = join(sharedChatHome, name)
+  const link = join(codexHome, name)
+
+  if (!createWhenMissing && !pathExists(target) && !pathExists(link)) {
+    return
+  }
+
+  ensureFile(target, 0o600)
+
+  if (isSymlinkTo(link, target)) {
+    return
+  }
+
+  const linkInfo = statIfExists(link)
+  if (linkInfo?.isFile()) {
+    mergeTextFile(link, target)
+  }
+  if (pathExists(link)) {
+    renameSync(link, nextBackupPath(link))
+  }
+  symlinkSync(target, link, "file")
+}
+
+function readDirectoryNames(path: string): string[] {
+  try {
+    return readdirSync(path)
+  } catch {
+    return []
+  }
+}
+
+function stateDatabaseVersion(name: string): number {
+  return Number(/^state_(\d+)\.sqlite$/i.exec(name)?.[1] ?? 0)
+}
+
+function ensureFile(path: string, mode: number): void {
+  const fd = openSync(path, "a", mode)
+  closeSync(fd)
+  chmodSync(path, mode)
+}
+
+function copyDirectoryContents(source: string, destination: string): void {
+  mkdirSync(destination, { recursive: true, mode: 0o700 })
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    const sourcePath = join(source, entry.name)
+    const destinationPath = join(destination, entry.name)
+    if (entry.isDirectory()) {
+      copyDirectoryContents(sourcePath, destinationPath)
+      continue
+    }
+    if (entry.isFile()) {
+      copyFileIfMissing(sourcePath, destinationPath)
+    }
+  }
+}
+
+function copyFileIfMissing(source: string, destination: string): void {
+  if (pathExists(destination)) {
+    return
+  }
+  mkdirSync(dirname(destination), { recursive: true, mode: 0o700 })
+  copyFileSync(source, destination)
+}
+
+function appendIndexFile(source: string, destination: string): void {
+  const content = readFileSync(source, "utf8")
+  if (!content.trim()) {
+    return
+  }
+  const destinationContent = readFileSync(destination, "utf8")
+  const prefix =
+    destinationContent && !destinationContent.endsWith("\n") ? "\n" : ""
+  appendFileSync(
+    destination,
+    `${prefix}${content.endsWith("\n") ? content : `${content}\n`}`,
+  )
+}
+
+function mergeTextFile(source: string, destination: string): void {
+  const content = readFileSync(source, "utf8")
+  if (!content.trim()) {
+    return
+  }
+
+  const destinationContent = readFileSync(destination, "utf8")
+  if (!destinationContent.trim()) {
+    copyFileSync(source, destination)
+    chmodSync(destination, 0o600)
+    return
+  }
+  if (destinationContent === content || destinationContent.includes(content)) {
+    return
+  }
+
+  const prefix = destinationContent.endsWith("\n") ? "" : "\n"
+  const suffix = content.endsWith("\n") ? content : `${content}\n`
+  appendFileSync(
+    destination,
+    `${prefix}\n<!-- Imported from ${basename(dirname(source))}/${basename(source)} during xedoc sharing. -->\n${suffix}`,
+  )
+}
+
+function isSymlinkTo(path: string, target: string): boolean {
+  try {
+    const info = lstatSync(path)
+    if (!info.isSymbolicLink()) {
+      return false
+    }
+    return resolve(dirname(path), readlinkSync(path)) === resolve(target)
+  } catch {
+    return false
+  }
+}
+
+function statIfExists(path: string): ReturnType<typeof statSync> | null {
+  try {
+    return statSync(path)
+  } catch {
+    return null
+  }
+}
+
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function nextBackupPath(path: string): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-")
+  let candidate = `${path}.pre-shared-${stamp}`
+  let suffix = 1
+  while (pathExists(candidate)) {
+    candidate = `${path}.pre-shared-${stamp}-${suffix}`
+    suffix += 1
+  }
+  return candidate
 }
