@@ -13,15 +13,11 @@ import {
   ChevronDown,
   CheckCircle2,
   CircleAlert,
-  Copy,
   Download,
   ExternalLink,
   Import,
   KeyRound,
-  Laptop,
   Loader2,
-  MoreVertical,
-  Pencil,
   Plus,
   PowerOff,
   RotateCw,
@@ -42,7 +38,6 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -62,12 +57,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
-import { StatusBadge } from "@/components/status-badge"
+import { AccountCardEntry } from "@/components/account-card-entry"
 import {
   authenticateAccount,
   cancelAccountAuthentication,
@@ -82,12 +72,15 @@ import {
   setLocalCodexActiveAccount,
   updateAccount,
 } from "@/lib/api"
-import {
-  usageCapacityLabel,
-  usageCapacitySeverity,
-} from "@/lib/rate-limits"
 import type { WebSession } from "@/lib/session-storage"
-import { cn } from "@/lib/utils"
+import {
+  AuthenticationDialog,
+  authenticationDialogEqual,
+  authenticationDialogFromAccount,
+  authenticationDialogFromResponse,
+  normalizeAccountAuthMode,
+  type AuthenticationDialogState,
+} from "@/components/account-auth-dialog"
 
 interface AccountFormState {
   args: string
@@ -110,16 +103,6 @@ interface AuthenticateMutationInput {
 interface ImportAccountsMutationInput {
   accounts: AccountImportEntry[]
   popup?: Window | null
-}
-
-interface AuthenticationDialogState {
-  accountId: string
-  accountName: string
-  authUrl: string | null
-  message: string | null
-  mode: AccountAuthMode
-  status: string
-  userCode: string | null
 }
 
 const emptyForm: AccountFormState = {
@@ -191,14 +174,15 @@ export function AccountManagementPanel({
       if (!account) {
         return current
       }
-      const nextMode = normalizeAccountAuthMode(account.lastAuthMode) ?? current.mode
+      const nextMode =
+        normalizeAccountAuthMode(account.lastAuthMode) ?? current.mode
       const nextAuthUrl =
         account.status === "AUTHENTICATING"
-          ? account.lastAuthUrl ?? current.authUrl
+          ? (account.lastAuthUrl ?? current.authUrl)
           : account.lastAuthUrl
       const nextUserCode =
         account.status === "AUTHENTICATING"
-          ? account.lastAuthUserCode ?? current.userCode
+          ? (account.lastAuthUserCode ?? current.userCode)
           : account.lastAuthUserCode
       const next = {
         ...current,
@@ -452,10 +436,9 @@ export function AccountManagementPanel({
   }
 
   async function ensureBrowserCallbackPortAvailable(): Promise<boolean> {
-    const status =
-      callbackPortQuery.data?.inUse
-        ? callbackPortQuery.data
-        : (await callbackPortQuery.refetch()).data
+    const status = callbackPortQuery.data?.inUse
+      ? callbackPortQuery.data
+      : (await callbackPortQuery.refetch()).data
 
     if (!status?.inUse) {
       return true
@@ -599,7 +582,6 @@ export function AccountManagementPanel({
                 Search, authenticate, and inspect current Codex quota.
               </p>
             </div>
-            
           </div>
 
           <LoginCallbackPortWarning
@@ -656,12 +638,14 @@ export function AccountManagementPanel({
                 Export
               </Button>
               <DropdownMenu open={addMenuOpen} onOpenChange={setAddMenuOpen}>
-                <DropdownMenuTrigger render={<Button className="w-full sm:w-auto" />}>
-                {createMutation.isPending || localImportMutation.isPending ? (
-                  <Loader2 className="animate-spin" />
-                ) : (
-                  <Plus />
-                )}
+                <DropdownMenuTrigger
+                  render={<Button className="w-full sm:w-auto" />}
+                >
+                  {createMutation.isPending || localImportMutation.isPending ? (
+                    <Loader2 className="animate-spin" />
+                  ) : (
+                    <Plus />
+                  )}
                   Add
                   <ChevronDown data-icon="inline-end" />
                 </DropdownMenuTrigger>
@@ -724,7 +708,9 @@ export function AccountManagementPanel({
                   quotaSnapshot={accountRateLimitSnapshots[account.id]}
                   onDelete={() => setDeleteTarget(account)}
                   onEdit={() => startEditing(account)}
-                  onAuthenticate={(mode) => startAuthentication(account.id, mode)}
+                  onAuthenticate={(mode) =>
+                    startAuthentication(account.id, mode)
+                  }
                   onCancelAuthentication={() =>
                     cancelAuthMutation.mutate(account.id)
                   }
@@ -813,7 +799,9 @@ export function AccountManagementPanel({
               Cancel
             </Button>
             <Button
-              disabled={!editForm.displayName.trim() || updateMutation.isPending}
+              disabled={
+                !editForm.displayName.trim() || updateMutation.isPending
+              }
               onClick={() => updateMutation.mutate()}
             >
               {updateMutation.isPending ? (
@@ -908,7 +896,9 @@ function AccountForm({
             id={`${prefix}-args`}
             placeholder="app-server"
             value={form.args}
-            onChange={(event) => onChange({ ...form, args: event.target.value })}
+            onChange={(event) =>
+              onChange({ ...form, args: event.target.value })
+            }
           />
         </div>
       </div>
@@ -925,171 +915,6 @@ function AccountForm({
         />
       </div>
     </div>
-  )
-}
-
-function AuthenticationDialog({
-  callbackUrl,
-  cancelPending,
-  completePending,
-  state,
-  onCallbackUrlChange,
-  onCancelAuthentication,
-  onClose,
-  onComplete,
-  onCopyDeviceCode,
-  onReopen,
-}: {
-  callbackUrl: string
-  cancelPending: boolean
-  completePending: boolean
-  state: AuthenticationDialogState | null
-  onCallbackUrlChange: (value: string) => void
-  onCancelAuthentication: () => void
-  onClose: () => void
-  onComplete: () => void
-  onCopyDeviceCode: () => void
-  onReopen: () => void
-}) {
-  const isDevice = state?.mode === "device"
-  const connected = state?.status === "CONNECTED"
-
-  return (
-    <Dialog
-      open={!!state}
-      onOpenChange={(nextOpen) => {
-        if (!nextOpen) {
-          onClose()
-        }
-      }}
-    >
-      <DialogContent className="max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>
-            {isDevice ? "Device authentication" : "Normal authentication"}
-          </DialogTitle>
-          <DialogDescription>
-            {state?.accountName ?? "Codex account"}
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="grid gap-4">
-          <div
-            className={cn(
-              "rounded-md border px-3 py-2 text-sm",
-              connected
-                ? "border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-900/70 dark:bg-emerald-950/35 dark:text-emerald-200"
-                : "bg-muted/35 text-muted-foreground",
-            )}
-          >
-            {connected
-              ? "Codex reported this account as connected. xedoc will use the email from the authenticated account as its name."
-              : isDevice
-                ? "Open the verification link, enter the device code, then use the response URL field if Codex does not finish automatically."
-                : "Complete the browser login. If the browser lands on a localhost callback page, paste that full URL below."}
-          </div>
-
-          {state?.authUrl ? (
-            <div className="grid gap-2">
-              <Label htmlFor="account-auth-url">
-                {isDevice ? "Verification link" : "Authentication link"}
-              </Label>
-              <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
-                <Input
-                  className="font-mono text-xs"
-                  id="account-auth-url"
-                  readOnly
-                  value={state.authUrl}
-                />
-                <Button variant="outline" onClick={onReopen}>
-                  <ExternalLink />
-                  Reopen
-                </Button>
-              </div>
-            </div>
-          ) : null}
-
-          {isDevice && state?.userCode ? (
-            <div className="grid gap-2">
-              <Label htmlFor="account-device-code">Device code</Label>
-              <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
-                <Input
-                  className="font-mono text-sm tracking-wider"
-                  id="account-device-code"
-                  readOnly
-                  value={state.userCode}
-                />
-                <Button variant="outline" onClick={onCopyDeviceCode}>
-                  <Copy />
-                  Copy
-                </Button>
-              </div>
-            </div>
-          ) : null}
-
-          <div className="grid gap-2">
-            <Label htmlFor="account-callback-url">Response URL</Label>
-            <Textarea
-              className="min-h-24 font-mono text-xs"
-              id="account-callback-url"
-              placeholder="http://localhost:1455/auth/callback?code=..."
-              value={callbackUrl}
-              onChange={(event) => onCallbackUrlChange(event.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              Paste the complete localhost callback URL from the Codex browser
-              tab when automatic completion is blocked.
-            </p>
-          </div>
-
-          {state?.message ? (
-            <p className="rounded-md border bg-background px-3 py-2 text-sm text-muted-foreground">
-              {state.message}
-            </p>
-          ) : null}
-        </div>
-
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            <X />
-            Close
-          </Button>
-          {state?.status === "AUTHENTICATING" ? (
-            <Button
-              disabled={!state.accountId || cancelPending}
-              variant="destructive"
-              onClick={onCancelAuthentication}
-            >
-              {cancelPending ? (
-                <Loader2 className="animate-spin" />
-              ) : (
-                <X />
-              )}
-              Cancel Auth
-            </Button>
-          ) : null}
-          <Button
-            disabled={!state?.authUrl}
-            variant="secondary"
-            onClick={onReopen}
-          >
-            <ExternalLink />
-            Reopen Link
-          </Button>
-          <Button
-            disabled={!state?.accountId || !callbackUrl.trim() || completePending}
-            onClick={onComplete}
-          >
-            {completePending ? (
-              <Loader2 className="animate-spin" />
-            ) : (
-              <CheckCircle2 />
-            )}
-            Submit Response URL
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   )
 }
 
@@ -1113,16 +938,15 @@ function LoginCallbackPortWarning({
   }
 
   const processLabel = formatCallbackPortProcesses(status)
-  const killLabel = status.processes.length === 1 ? "Kill Process" : "Kill Processes"
+  const killLabel =
+    status.processes.length === 1 ? "Kill Process" : "Kill Processes"
 
   return (
     <div className="flex flex-col gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-3 text-amber-950 dark:border-amber-900/70 dark:bg-amber-950/35 dark:text-amber-100 sm:flex-row sm:items-start sm:justify-between">
       <div className="flex min-w-0 gap-2">
         <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-300" />
         <div className="grid min-w-0 gap-1">
-          <div className="text-sm font-medium">
-            Login callback port is busy
-          </div>
+          <div className="text-sm font-medium">Login callback port is busy</div>
           <p className="text-sm leading-relaxed">
             {browserAuthenticationInProgress
               ? `${status.host}:${status.port} is already listening for a browser login. Starting another Normal Auth can fail while this listener is active.`
@@ -1152,287 +976,6 @@ function LoginCallbackPortWarning({
           {killing ? <Loader2 className="animate-spin" /> : <PowerOff />}
           {killLabel}
         </Button>
-      </div>
-    </div>
-  )
-}
-
-function AccountCardEntry({
-  account,
-  authPending,
-  authPendingMode,
-  cancelPending,
-  localActivePending,
-  quotaLabel,
-  quotaPending,
-  quotaSnapshot,
-  onAuthenticate,
-  onCancelAuthentication,
-  onDelete,
-  onEdit,
-  onSetLocalActive,
-  onShowAuthentication,
-}: {
-  account: AccountResponse
-  authPending: boolean
-  authPendingMode: AccountAuthMode
-  cancelPending: boolean
-  localActivePending: boolean
-  quotaLabel?: string
-  quotaPending: boolean
-  quotaSnapshot?: CodexRateLimitSnapshot
-  onAuthenticate: (mode: AccountAuthMode) => void
-  onCancelAuthentication: () => void
-  onDelete: () => void
-  onEdit: () => void
-  onSetLocalActive: () => void
-  onShowAuthentication: () => void
-}) {
-  const pendingAccountAuthMode =
-    normalizeAccountAuthMode(account.lastAuthMode) ?? "browser"
-  const browserAuthPending = authPending && authPendingMode === "browser"
-  const deviceAuthPending = authPending && authPendingMode === "device"
-  const authMode = account.status === "AUTHENTICATING" ? pendingAccountAuthMode : "browser"
-  const authLabel =
-    account.status === "AUTHENTICATING"
-      ? "Check"
-      : account.status === "CONNECTED"
-        ? "Re-authenticate"
-        : "Authenticate"
-  const canSetLocalActive =
-    account.status === "CONNECTED" && !account.isLocalCodexActive
-  const authenticatingLabel =
-    pendingAccountAuthMode === "device"
-      ? "Device login pending"
-      : "Browser login pending"
-
-  return (
-    <div
-      className={cn(
-        "rounded-md border bg-background px-3 py-3 text-sm",
-        account.isLocalCodexActive &&
-          "border-primary/40 bg-primary/5 dark:bg-primary/10",
-      )}
-    >
-      <div className="grid gap-3">
-        <div className="flex min-w-0 items-start justify-between gap-3">
-          <div className="grid min-w-0 gap-1.5">
-            <div className="flex min-w-0 flex-wrap items-center gap-2">
-              <div className="min-w-0 max-w-full truncate font-medium">
-                {account.displayName}
-              </div>
-              <AccountPlanBadge planType={quotaSnapshot?.planType} />
-              {account.isLocalCodexActive ? <LocalCodexActiveBadge /> : null}
-            </div>
-            <div className="truncate text-xs text-muted-foreground">
-              {formatAccountCommand(account)}
-            </div>
-          </div>
-
-          <div className="flex shrink-0 items-center gap-2">
-            <AccountStatusBadge account={account} />
-            <DropdownMenu>
-              <DropdownMenuTrigger render={<Button size="icon-sm" variant="ghost" />}>
-                {authPending || cancelPending || localActivePending ? (
-                  <Loader2 className="animate-spin" />
-                ) : (
-                  <MoreVertical />
-                )}
-                <span className="sr-only">Account actions</span>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-48">
-                <DropdownMenuItem
-                  disabled={authPending}
-                  onClick={() => onAuthenticate(authMode)}
-                >
-                  {browserAuthPending ? (
-                    <Loader2 className="animate-spin" />
-                  ) : account.status === "AUTHENTICATING" ? (
-                    <RotateCw />
-                  ) : (
-                    <ExternalLink />
-                  )}
-                  {account.status === "AUTHENTICATING" ? authLabel : "Normal Auth"}
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  disabled={authPending}
-                  onClick={() => onAuthenticate("device")}
-                >
-                  {deviceAuthPending ? (
-                    <Loader2 className="animate-spin" />
-                  ) : (
-                    <KeyRound />
-                  )}
-                  Device Auth
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  disabled={!canSetLocalActive || localActivePending}
-                  onClick={onSetLocalActive}
-                >
-                  {localActivePending ? (
-                    <Loader2 className="animate-spin" />
-                  ) : (
-                    <Laptop />
-                  )}
-                  {account.isLocalCodexActive
-                    ? "Local Active"
-                    : "Make Local Active"}
-                </DropdownMenuItem>
-                {account.status === "AUTHENTICATING" ? (
-                  <DropdownMenuItem
-                    disabled={cancelPending}
-                    variant="destructive"
-                    onClick={onCancelAuthentication}
-                  >
-                    {cancelPending ? (
-                      <Loader2 className="animate-spin" />
-                    ) : (
-                      <X />
-                    )}
-                    Cancel Auth
-                  </DropdownMenuItem>
-                ) : null}
-                {account.status === "AUTHENTICATING" || account.lastAuthUrl ? (
-                  <DropdownMenuItem onClick={onShowAuthentication}>
-                    <ExternalLink />
-                    Authentication Details
-                  </DropdownMenuItem>
-                ) : null}
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={onEdit}>
-                  <Pencil />
-                  Edit
-                </DropdownMenuItem>
-                <DropdownMenuItem variant="destructive" onClick={onDelete}>
-                  <Trash2 />
-                  Delete
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
-        </div>
-
-        <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-          <div className="grid min-w-0 gap-1.5">
-            <QuotaSummary
-              accountStatus={account.status}
-              label={quotaLabel}
-              pending={quotaPending}
-              snapshot={quotaSnapshot}
-            />
-            {account.status === "AUTHENTICATING" ? (
-              <span className="text-xs text-muted-foreground">
-                {authenticatingLabel}
-              </span>
-            ) : null}
-          </div>
-          {account.status === "AUTHENTICATING" ? (
-            <Button
-              className="min-w-0 sm:w-auto"
-              disabled={cancelPending}
-              size="sm"
-              variant="destructive"
-              onClick={onCancelAuthentication}
-            >
-              {cancelPending ? (
-                <Loader2 className="animate-spin" />
-              ) : (
-                <X />
-              )}
-              Cancel
-            </Button>
-          ) : null}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function AccountPlanBadge({ planType }: { planType?: string | null }) {
-  if (!planType) {
-    return null
-  }
-
-  return (
-    <Badge
-      className="border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-900/70 dark:bg-emerald-950/35 dark:text-emerald-300"
-      variant="outline"
-    >
-      {formatPlanType(planType)}
-    </Badge>
-  )
-}
-
-function LocalCodexActiveBadge() {
-  return (
-    <Badge
-      className="border-sky-300 bg-sky-50 text-sky-700 dark:border-sky-900/70 dark:bg-sky-950/35 dark:text-sky-300"
-      variant="outline"
-    >
-      <Laptop />
-      local active
-    </Badge>
-  )
-}
-
-function AccountStatusBadge({ account }: { account: AccountResponse }) {
-  const detail = account.lastError?.trim()
-  if (!detail) {
-    return <StatusBadge status={account.status} />
-  }
-
-  return (
-    <Tooltip>
-      <TooltipTrigger render={<span className="inline-flex cursor-help" />}>
-        <StatusBadge status={account.status} />
-      </TooltipTrigger>
-      <TooltipContent
-        align="start"
-        className="max-w-96 whitespace-pre-wrap break-words text-left leading-relaxed"
-        side="right"
-      >
-        {detail}
-      </TooltipContent>
-    </Tooltip>
-  )
-}
-
-function QuotaSummary({
-  accountStatus,
-  label,
-  pending,
-  snapshot,
-}: {
-  accountStatus: AccountResponse["status"]
-  label?: string
-  pending: boolean
-  snapshot?: CodexRateLimitSnapshot
-}) {
-  if (accountStatus !== "CONNECTED") {
-    return (
-      <div className="text-xs text-muted-foreground">
-        {accountStatus === "INVALIDATED"
-          ? "Re-authenticate account to load quota."
-          : "Connect account to load quota."}
-      </div>
-    )
-  }
-
-  const effectiveLabel = label ?? usageCapacityLabel(snapshot)
-  const severity = usageCapacitySeverity(snapshot)
-  return (
-    <div className="grid gap-1.5">
-      <div
-        className={cn(
-          "inline-flex w-fit items-center gap-1.5 rounded-md border px-2 py-1 text-xs",
-          severity === "fiveHour" &&
-            "border-orange-300 bg-orange-50 text-orange-700 dark:border-orange-900/70 dark:bg-orange-950/35 dark:text-orange-300",
-          severity === "weekly" &&
-            "border-red-300 bg-red-50 text-red-700 dark:border-red-900/70 dark:bg-red-950/35 dark:text-red-300",
-        )}
-      >
-        {pending ? <Loader2 className="size-3 animate-spin" /> : null}
-        <span>{effectiveLabel}</span>
       </div>
     </div>
   )
@@ -1487,9 +1030,7 @@ function downloadAccountsExport(document: AccountExportDocument) {
   const url = URL.createObjectURL(blob)
   const link = window.document.createElement("a")
   link.href = url
-  link.download = `xedoc-accounts-${new Date()
-    .toISOString()
-    .slice(0, 10)}.json`
+  link.download = `xedoc-accounts-${new Date().toISOString().slice(0, 10)}.json`
   window.document.body.append(link)
   link.click()
   link.remove()
@@ -1500,10 +1041,6 @@ function formatEnvironment(
   environment: AccountResponse["environment"],
 ): string {
   return environment ? JSON.stringify(environment, null, 2) : ""
-}
-
-function formatAccountCommand(account: AccountResponse): string {
-  return [account.command, ...account.args].filter(Boolean).join(" ")
 }
 
 function filterAccounts(
@@ -1533,71 +1070,8 @@ function filterAccounts(
   )
 }
 
-function formatPlanType(value: string): string {
-  return value
-    .split("_")
-    .filter(Boolean)
-    .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
-    .join(" ")
-}
-
 function accountLabel(count: number): string {
   return count === 1 ? "account" : "accounts"
-}
-
-function normalizeAccountAuthMode(value: unknown): AccountAuthMode | null {
-  return value === "browser" || value === "device" ? value : null
-}
-
-function authenticationDialogFromAccount(
-  account: AccountResponse | undefined,
-  mode: AccountAuthMode,
-): AuthenticationDialogState {
-  return {
-    accountId: account?.id ?? "",
-    accountName: account?.displayName ?? "Codex account",
-    authUrl: account?.lastAuthUrl ?? null,
-    message:
-      account?.status === "AUTHENTICATING"
-        ? "Authentication is in progress."
-        : "Starting Codex authentication.",
-    mode,
-    status: account?.status ?? "AUTHENTICATING",
-    userCode: account?.lastAuthUserCode ?? null,
-  }
-}
-
-function authenticationDialogFromResponse(
-  response: AuthenticateAccountResponse,
-  account?: AccountResponse,
-): AuthenticationDialogState {
-  return {
-    accountId: response.accountId,
-    accountName: account?.displayName ?? "Codex account",
-    authUrl: response.authUrl ?? account?.lastAuthUrl ?? null,
-    message: response.message ?? null,
-    mode:
-      response.authMode ??
-      normalizeAccountAuthMode(account?.lastAuthMode) ??
-      "browser",
-    status: response.status,
-    userCode: response.userCode ?? account?.lastAuthUserCode ?? null,
-  }
-}
-
-function authenticationDialogEqual(
-  left: AuthenticationDialogState,
-  right: AuthenticationDialogState,
-): boolean {
-  return (
-    left.accountId === right.accountId &&
-    left.accountName === right.accountName &&
-    left.authUrl === right.authUrl &&
-    left.message === right.message &&
-    left.mode === right.mode &&
-    left.status === right.status &&
-    left.userCode === right.userCode
-  )
 }
 
 async function copyDeviceCode(code: string) {
