@@ -770,11 +770,13 @@ function sourceMessageFromLocalSession(
     completedAt: message.createdAt,
     content: message.content,
     createdAt: message.createdAt,
+    itemId: message.itemId,
     kind: message.kind,
     metadata: message.metadata,
     rawPayload: message.rawPayload,
     role: message.role,
     source: "session",
+    turnId: message.turnId,
   }
 }
 

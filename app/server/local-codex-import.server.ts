@@ -13,7 +13,11 @@ import {
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve, sep } from "node:path"
 import { PrismaClient, type Prisma } from "@prisma/client"
-import type { ContextWindowUsagePayload, JsonObject, MessageKind } from "@/types"
+import type {
+  ContextWindowUsagePayload,
+  JsonObject,
+  MessageKind,
+} from "@/types"
 import {
   ensureAccountCodexHome,
   resolveCodexSharedChatHome,
@@ -26,10 +30,12 @@ import { prisma } from "./prisma.server"
 export type ImportedLocalMessage = {
   content: string
   createdAt: Date
+  itemId?: string
   kind?: MessageKind
   metadata: JsonObject
   rawPayload: JsonObject
   role: "ASSISTANT" | "SYSTEM" | "USER"
+  turnId?: string
 }
 
 export type ParsedLocalCodexSession = {
@@ -75,6 +81,16 @@ type FileCacheEntry<T> = {
   size: number
   value: T
 }
+
+type LocalSessionMessageContext = {
+  originator?: string
+  path: string
+  sessionId?: string
+  source?: string
+  turnId?: string
+}
+
+type OrderedImportedLocalMessage = ImportedLocalMessage & { order: number }
 
 type CodexStateThreadRow = {
   archived: number | null
@@ -375,13 +391,17 @@ function parseLocalCodexSessionJsonl(
   let workingDirectory: string | undefined
   let createdAt: Date | undefined
   let updatedAt: Date | undefined
-  const responseMessages: ImportedLocalMessage[] = []
-  const eventMessages: ImportedLocalMessage[] = []
+  let currentTurnId: string | undefined
+  let lineIndex = 0
+  let turnIndex = 0
+  const responseMessages: OrderedImportedLocalMessage[] = []
+  const eventMessages: OrderedImportedLocalMessage[] = []
 
   for (const line of content.split(/\r?\n/)) {
     if (!line.trim()) {
       continue
     }
+    lineIndex += 1
     const record = parseJsonObject(line)
     if (!record) {
       continue
@@ -400,34 +420,43 @@ function parseLocalCodexSessionJsonl(
       continue
     }
 
+    const payloadType = readString(payload?.type)
+    if (record.type === "event_msg" && payloadType === "task_started") {
+      turnIndex += 1
+      currentTurnId =
+        readTurnIdFromPayload(payload) ?? localTurnId(sessionId, path, turnIndex)
+    }
+
     if (record.type === "turn_context" && payload) {
       workingDirectory = readString(payload.cwd) ?? workingDirectory
       continue
     }
 
-    const responseMessage = importedResponseMessage(record, timestamp, {
+    const context: LocalSessionMessageContext = {
       originator,
       path,
       sessionId,
       source,
-    })
+      turnId: readTurnIdFromPayload(payload) ?? currentTurnId,
+    }
+
+    const responseMessage = importedResponseMessage(record, timestamp, context)
     if (responseMessage) {
-      responseMessages.push(responseMessage)
+      responseMessages.push({ ...responseMessage, order: lineIndex })
       continue
     }
 
-    const eventMessage = importedEventMessage(record, timestamp, {
-      originator,
-      path,
-      sessionId,
-      source,
-    })
+    const eventMessage = importedEventMessage(record, timestamp, context)
     if (eventMessage) {
-      eventMessages.push(eventMessage)
+      eventMessages.push({ ...eventMessage, order: lineIndex })
+    }
+
+    if (record.type === "event_msg" && payloadType === "task_complete") {
+      currentTurnId = undefined
     }
   }
 
-  const messages = responseMessages.length ? responseMessages : eventMessages
+  const messages = reconcileImportedMessages(responseMessages, eventMessages)
   const externalThreadId = sessionId ?? extractSessionIdFromPath(path)
   if (!externalThreadId || !messages.length) {
     return null
@@ -569,20 +598,49 @@ async function repairImportedLocalCodexChat(
 function importedResponseMessage(
   record: JsonObject,
   timestamp: Date,
-  session: {
-    originator?: string
-    path: string
-    sessionId?: string
-    source?: string
-  },
+  session: LocalSessionMessageContext,
 ): ImportedLocalMessage | null {
   if (record.type !== "response_item") {
     return null
   }
   const payload = asJsonObject(record.payload)
-  if (!payload || payload.type !== "message") {
+  const payloadType = readString(payload?.type)
+  if (!payload || !payloadType) {
     return null
   }
+
+  if (payloadType === "message") {
+    return importedResponseChatMessage(record, payload, timestamp, session)
+  }
+  if (payloadType === "reasoning") {
+    return importedReasoningResponseMessage(record, payload, timestamp, session)
+  }
+  if (isToolCallResponseItem(payloadType)) {
+    return importedToolCallResponseMessage(record, payload, timestamp, session)
+  }
+  if (isToolOutputResponseItem(payloadType)) {
+    return importedToolOutputResponseMessage(record, payload, timestamp, session)
+  }
+  if (payloadType === "compaction" || payloadType === "context_compaction") {
+    return importedSystemActivityMessage(
+      record,
+      payload,
+      timestamp,
+      session,
+      compactionMessage(payloadType),
+      "contextCompaction",
+    )
+  }
+
+  return null
+}
+
+function importedResponseChatMessage(
+  record: JsonObject,
+  payload: JsonObject,
+  timestamp: Date,
+  session: LocalSessionMessageContext,
+): ImportedLocalMessage | null {
   const role = importedRole(payload.role)
   if (!role) {
     return null
@@ -594,9 +652,157 @@ function importedResponseMessage(
   return {
     content,
     createdAt: timestamp,
+    itemId: responseItemId(payload),
     metadata: importedMessageMetadata(payload, session),
     rawPayload: compactRawPayload(record, payload),
     role,
+    turnId: session.turnId,
+  }
+}
+
+function importedReasoningResponseMessage(
+  record: JsonObject,
+  payload: JsonObject,
+  timestamp: Date,
+  session: LocalSessionMessageContext,
+): ImportedLocalMessage | null {
+  const content = reasoningResponseText(payload)
+  if (!content.trim()) {
+    return null
+  }
+  return {
+    content,
+    createdAt: timestamp,
+    itemId: responseItemId(payload),
+    kind: "THINKING",
+    metadata: {
+      ...importedMessageMetadata(payload, session),
+      responseItemType: readString(payload.type),
+    },
+    rawPayload: compactRawPayload(record, payload),
+    role: "SYSTEM",
+    turnId: session.turnId,
+  }
+}
+
+function importedToolCallResponseMessage(
+  record: JsonObject,
+  payload: JsonObject,
+  timestamp: Date,
+  session: LocalSessionMessageContext,
+): ImportedLocalMessage | null {
+  const payloadType = readString(payload.type) ?? "tool_call"
+  if (payloadType === "web_search_call") {
+    return importedSystemActivityMessage(
+      record,
+      payload,
+      timestamp,
+      session,
+      webSearchLabel(payload),
+      "webSearch",
+    )
+  }
+  if (payloadType === "image_generation_call") {
+    return importedSystemActivityMessage(
+      record,
+      payload,
+      timestamp,
+      session,
+      "Image generation",
+      "imageGeneration",
+    )
+  }
+
+  const argumentsObject = readArgumentsObject(payload.arguments)
+  const command = commandLabelFromToolCall(payload, argumentsObject)
+  const toolName = readString(payload.name) ?? payloadType.replaceAll("_", " ")
+  const isCommand = commandLikeToolCall(payloadType, toolName)
+  if (isCommand) {
+    return {
+      content: command ?? toolName,
+      createdAt: timestamp,
+      itemId: responseItemId(payload),
+      kind: "COMMAND_EXECUTION",
+      metadata: {
+        ...importedMessageMetadata(payload, session),
+        command: command ?? toolName,
+        cwd:
+          readString(argumentsObject?.cwd) ??
+          readString(argumentsObject?.workdir) ??
+          readString(asJsonObject(payload.action)?.cwd),
+        kind: "command",
+        status: readString(payload.status) ?? "completed",
+      },
+      rawPayload: compactRawPayload(record, payload),
+      role: "SYSTEM",
+      turnId: session.turnId,
+    }
+  }
+
+  return importedSystemActivityMessage(
+    record,
+    payload,
+    timestamp,
+    session,
+    toolName,
+    "toolCall",
+  )
+}
+
+function importedToolOutputResponseMessage(
+  record: JsonObject,
+  payload: JsonObject,
+  timestamp: Date,
+  session: LocalSessionMessageContext,
+): ImportedLocalMessage | null {
+  const output = outputPayloadText(payload.output)
+  if (!output.trim()) {
+    return null
+  }
+  return {
+    content: output,
+    createdAt: timestamp,
+    itemId: responseItemOutputId(payload),
+    kind: "TOOL_ACTIVITY",
+    metadata: {
+      ...importedMessageMetadata(payload, session),
+      callId: readCallId(payload),
+      kind: "localCodexToolOutput",
+      responseItemType: readString(payload.type),
+      status: readString(payload.status) ?? "completed",
+      toolName: readString(payload.name),
+    },
+    rawPayload: compactRawPayload(record, payload),
+    role: "SYSTEM",
+    turnId: session.turnId,
+  }
+}
+
+function importedSystemActivityMessage(
+  record: JsonObject,
+  payload: JsonObject,
+  timestamp: Date,
+  session: LocalSessionMessageContext,
+  content: string,
+  eventKind: string,
+): ImportedLocalMessage | null {
+  if (!content.trim()) {
+    return null
+  }
+  return {
+    content,
+    createdAt: timestamp,
+    itemId: responseItemId(payload),
+    kind: "TOOL_ACTIVITY",
+    metadata: {
+      ...importedMessageMetadata(payload, session),
+      eventKind,
+      responseItemType: readString(payload.type),
+      status: readString(payload.status),
+    },
+    rawPayload: compactRawPayload(record, payload),
+    role: "SYSTEM",
+    turnId: session.turnId,
   }
 }
 
@@ -612,12 +818,7 @@ async function readSourceSessionIndexMetadata(
 function importedEventMessage(
   record: JsonObject,
   timestamp: Date,
-  session: {
-    originator?: string
-    path: string
-    sessionId?: string
-    source?: string
-  },
+  session: LocalSessionMessageContext,
 ): ImportedLocalMessage | null {
   if (record.type !== "event_msg") {
     return null
@@ -627,6 +828,38 @@ function importedEventMessage(
     return null
   }
   const payloadType = readString(payload.type)
+  if (payloadType === "patch_apply_end") {
+    return importedPatchApplyEventMessage(record, payload, timestamp, session)
+  }
+  if (payloadType === "web_search_end") {
+    return importedSystemActivityMessage(
+      record,
+      payload,
+      timestamp,
+      session,
+      webSearchLabel(payload),
+      "webSearch",
+    )
+  }
+  if (payloadType === "task_complete") {
+    const content = readString(payload.last_agent_message) ?? ""
+    if (!content.trim() || isInternalEnvironmentContext(content)) {
+      return null
+    }
+    return {
+      content,
+      createdAt: timestamp,
+      itemId: responseItemId(payload) ?? `task-complete:${session.turnId ?? timestamp.getTime()}`,
+      metadata: {
+        ...importedMessageMetadata(payload, session),
+        eventKind: "taskComplete",
+      },
+      rawPayload: compactRawPayload(record, payload),
+      role: "ASSISTANT",
+      turnId: session.turnId,
+    }
+  }
+
   const role =
     payloadType === "user_message"
       ? "USER"
@@ -650,6 +883,7 @@ function importedEventMessage(
   return {
     content,
     createdAt: timestamp,
+    itemId: responseItemId(payload),
     kind: role === "SYSTEM" ? "TOOL_ACTIVITY" : undefined,
     metadata: {
       ...importedMessageMetadata(payload, session),
@@ -657,6 +891,47 @@ function importedEventMessage(
     },
     rawPayload: compactRawPayload(record, payload),
     role,
+    turnId: session.turnId,
+  }
+}
+
+function importedPatchApplyEventMessage(
+  record: JsonObject,
+  payload: JsonObject,
+  timestamp: Date,
+  session: LocalSessionMessageContext,
+): ImportedLocalMessage | null {
+  const changes = asJsonObject(payload.changes)
+  const paths = changes ? Object.keys(changes) : []
+  const status =
+    readString(payload.status) ??
+    (payload.success === false ? "failed" : "completed")
+  if (!paths.length) {
+    return importedSystemActivityMessage(
+      record,
+      payload,
+      timestamp,
+      session,
+      readString(payload.stderr) ?? readString(payload.stdout) ?? "Patch applied",
+      "patchApply",
+    )
+  }
+  return {
+    content: paths.join("\n"),
+    createdAt: timestamp,
+    itemId: responseItemId(payload) ?? `patch:${session.turnId ?? timestamp.getTime()}`,
+    kind: "FILE_CHANGE",
+    metadata: {
+      ...importedMessageMetadata(payload, session),
+      additions: 0,
+      deletions: 0,
+      kind: "fileChange",
+      paths,
+      status,
+    },
+    rawPayload: compactRawPayload(record, payload),
+    role: "SYSTEM",
+    turnId: session.turnId,
   }
 }
 
@@ -700,12 +975,7 @@ export function isInternalEnvironmentContext(content: string): boolean {
 
 function importedMessageMetadata(
   payload: JsonObject,
-  session: {
-    originator?: string
-    path: string
-    sessionId?: string
-    source?: string
-  },
+  session: LocalSessionMessageContext,
 ): JsonObject {
   return {
     kind: "localCodexImport",
@@ -715,15 +985,19 @@ function importedMessageMetadata(
     sessionPath: session.path,
     source: session.source,
     sourcePayloadType: readString(payload.type),
+    turnId: session.turnId,
   }
 }
 
 function compactRawPayload(record: JsonObject, payload: JsonObject): JsonObject {
   return {
     payload: {
+      callId: readCallId(payload),
+      id: readString(payload.id),
       name: readString(payload.name),
       phase: readString(payload.phase),
       role: readString(payload.role),
+      status: readString(payload.status),
       type: readString(payload.type),
     },
     timestamp: readString(record.timestamp),
@@ -759,6 +1033,213 @@ function extractMessageContent(payload: JsonObject): string {
     })
     .join("")
   return appendImageTags(content, payload)
+}
+
+function reconcileImportedMessages(
+  responseMessages: OrderedImportedLocalMessage[],
+  eventMessages: OrderedImportedLocalMessage[],
+): ImportedLocalMessage[] {
+  if (!responseMessages.length) {
+    return eventMessages.sort(compareImportedMessageOrder).map(stripImportOrder)
+  }
+
+  const merged = [...responseMessages]
+  for (const eventMessage of eventMessages) {
+    if (eventMessage.role === "SYSTEM") {
+      if (!merged.some((message) => importedSystemEventsOverlap(message, eventMessage))) {
+        merged.push(eventMessage)
+      }
+      continue
+    }
+
+    const matchingIndex = merged.findIndex((message) =>
+      importedMessagesOverlap(message, eventMessage),
+    )
+    if (matchingIndex < 0) {
+      merged.push(eventMessage)
+      continue
+    }
+
+    const matchingMessage = merged[matchingIndex]
+    if (eventMessage.content.length > matchingMessage.content.length) {
+      merged[matchingIndex] = {
+        ...matchingMessage,
+        content: eventMessage.content,
+      }
+    }
+  }
+
+  return merged.sort(compareImportedMessageOrder).map(stripImportOrder)
+}
+
+function importedSystemEventsOverlap(
+  left: ImportedLocalMessage,
+  right: ImportedLocalMessage,
+): boolean {
+  const leftEventKind = readString(asJsonObject(left.metadata)?.eventKind)
+  const rightEventKind = readString(asJsonObject(right.metadata)?.eventKind)
+  return (
+    !!leftEventKind &&
+    leftEventKind === rightEventKind &&
+    importedMessagesOverlap(left, right)
+  )
+}
+
+function importedMessagesOverlap(
+  left: ImportedLocalMessage,
+  right: ImportedLocalMessage,
+): boolean {
+  if (left.role !== right.role) {
+    return false
+  }
+  if ((left.kind ?? "CHAT") !== (right.kind ?? "CHAT")) {
+    return false
+  }
+  if (left.turnId && right.turnId && left.turnId !== right.turnId) {
+    return false
+  }
+  const leftContent = left.content.trim()
+  const rightContent = right.content.trim()
+  return (
+    leftContent === rightContent ||
+    leftContent.startsWith(rightContent) ||
+    rightContent.startsWith(leftContent)
+  )
+}
+
+function compareImportedMessageOrder(
+  left: OrderedImportedLocalMessage,
+  right: OrderedImportedLocalMessage,
+): number {
+  return left.order - right.order
+}
+
+function stripImportOrder({
+  order: _order,
+  ...message
+}: OrderedImportedLocalMessage): ImportedLocalMessage {
+  return message
+}
+
+function isToolCallResponseItem(payloadType: string): boolean {
+  return [
+    "custom_tool_call",
+    "function_call",
+    "image_generation_call",
+    "local_shell_call",
+    "tool_search_call",
+    "web_search_call",
+  ].includes(payloadType)
+}
+
+function isToolOutputResponseItem(payloadType: string): boolean {
+  return [
+    "custom_tool_call_output",
+    "function_call_output",
+    "tool_search_output",
+  ].includes(payloadType)
+}
+
+function reasoningResponseText(payload: JsonObject): string {
+  return [
+    contentArrayText(payload.summary),
+    contentArrayText(payload.content),
+    readString(payload.summary),
+    readString(payload.text),
+  ]
+    .filter((text): text is string => !!text?.trim())
+    .join("\n\n")
+}
+
+function outputPayloadText(value: unknown): string {
+  if (typeof value === "string") {
+    return value
+  }
+  return contentArrayText(value) ?? ""
+}
+
+function contentArrayText(value: unknown): string | undefined {
+  if (!Array.isArray(value)) {
+    return undefined
+  }
+  const text = value
+    .map((entry) => {
+      if (typeof entry === "string") {
+        return entry
+      }
+      const object = asJsonObject(entry)
+      return readString(object?.text) ?? imageTagFromObject(object) ?? ""
+    })
+    .filter(Boolean)
+    .join("\n")
+  return text || undefined
+}
+
+function readArgumentsObject(value: unknown): JsonObject | undefined {
+  if (typeof value === "string") {
+    try {
+      return asJsonObject(JSON.parse(value))
+    } catch {
+      return undefined
+    }
+  }
+  return asJsonObject(value)
+}
+
+function commandLabelFromToolCall(
+  payload: JsonObject,
+  argumentsObject: JsonObject | undefined,
+): string | undefined {
+  const action = asJsonObject(payload.action)
+  return (
+    readString(argumentsObject?.cmd) ??
+    readString(argumentsObject?.command) ??
+    readString(action?.command) ??
+    readString(action?.cmd)
+  )
+}
+
+function commandLikeToolCall(payloadType: string, toolName: string): boolean {
+  return (
+    payloadType === "local_shell_call" ||
+    ["exec_command", "shell_command", "write_stdin"].includes(toolName)
+  )
+}
+
+function webSearchLabel(payload: JsonObject): string {
+  const action = asJsonObject(payload.action)
+  const query =
+    readString(payload.query) ??
+    readString(action?.query) ??
+    readString(action?.pattern) ??
+    readString(action?.url)
+  return query ? `Web search: ${query}` : "Web search"
+}
+
+function responseItemId(payload: JsonObject): string | undefined {
+  return readString(payload.id) ?? readCallId(payload)
+}
+
+function responseItemOutputId(payload: JsonObject): string | undefined {
+  const callId = readCallId(payload)
+  return callId ? `${callId}:output` : responseItemId(payload)
+}
+
+function readCallId(payload: JsonObject): string | undefined {
+  return readString(payload.call_id) ?? readString(payload.callId)
+}
+
+function readTurnIdFromPayload(payload: JsonObject | undefined): string | undefined {
+  return readString(payload?.turn_id) ?? readString(payload?.turnId)
+}
+
+function localTurnId(
+  sessionId: string | undefined,
+  path: string,
+  turnIndex: number,
+): string {
+  const base = sessionId ?? extractSessionIdFromPath(path) ?? basename(path)
+  return `${base}:turn:${turnIndex}`
 }
 
 function appendImageTags(content: string, payload: JsonObject): string {
