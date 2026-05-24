@@ -18,6 +18,7 @@ import type {
   ImportAccountsRequest,
   ImportAccountsResponse,
   InterruptChatRunResponse,
+  LoginCallbackPortStatus,
   MessagePageResponse,
   ServerRequestResponseRequest,
   AuthExchangeRequest,
@@ -136,6 +137,26 @@ export async function importAccounts(
     session.serverUrl,
     "/api/accounts/import",
     { body, token: session.token },
+  )
+}
+
+export async function readLoginCallbackPortStatus(
+  session: ApiSession,
+): Promise<LoginCallbackPortStatus> {
+  return fetchJson<LoginCallbackPortStatus>(
+    session.serverUrl,
+    "/api/accounts/login-callback-port",
+    { token: session.token },
+  )
+}
+
+export async function killLoginCallbackPortProcess(
+  session: ApiSession,
+): Promise<LoginCallbackPortStatus> {
+  return fetchJson<LoginCallbackPortStatus>(
+    session.serverUrl,
+    "/api/accounts/login-callback-port",
+    { body: {}, token: session.token },
   )
 }
 

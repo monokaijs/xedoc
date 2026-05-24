@@ -5,12 +5,14 @@ import type {
   AccountResponse,
   AuthenticateAccountResponse,
   CodexRateLimitSnapshot,
+  LoginCallbackPortStatus,
   UpdateAccountRequest,
 } from "@/types"
-import { useMutation, useQueryClient } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   ChevronDown,
   CheckCircle2,
+  CircleAlert,
   Copy,
   Download,
   ExternalLink,
@@ -19,6 +21,7 @@ import {
   MoreVertical,
   Pencil,
   Plus,
+  PowerOff,
   RotateCw,
   Search,
   Trash2,
@@ -69,6 +72,8 @@ import {
   deleteAccount,
   exportAccounts,
   importAccounts,
+  killLoginCallbackPortProcess,
+  readLoginCallbackPortStatus,
   updateAccount,
 } from "@/lib/api"
 import {
@@ -146,6 +151,18 @@ export function AccountManagementPanel({
   const authPopupRef = useRef<Window | null>(null)
   const importInputRef = useRef<HTMLInputElement | null>(null)
   const queryClient = useQueryClient()
+  const callbackPortQueryKey = useMemo(
+    () => ["login-callback-port", session.serverUrl] as const,
+    [session.serverUrl],
+  )
+
+  const callbackPortQuery = useQuery({
+    queryKey: callbackPortQueryKey,
+    queryFn: () => readLoginCallbackPortStatus(session),
+    refetchInterval: (query) => (query.state.data?.inUse ? 5_000 : 15_000),
+    retry: 1,
+    staleTime: 3_000,
+  })
 
   useEffect(() => {
     if (createFocusKey <= 0) {
@@ -209,6 +226,15 @@ export function AccountManagementPanel({
   const filteredAccounts = useMemo(
     () => filterAccounts(accounts, accountSearch),
     [accounts, accountSearch],
+  )
+  const browserAuthenticationInProgress = useMemo(
+    () =>
+      accounts.some(
+        (account) =>
+          account.status === "AUTHENTICATING" &&
+          normalizeAccountAuthMode(account.lastAuthMode) !== "device",
+      ),
+    [accounts],
   )
 
   const createMutation = useMutation({
@@ -315,8 +341,23 @@ export function AccountManagementPanel({
     onSuccess: (document) => {
       downloadAccountsExport(document)
       toast.success(
-        `Exported ${document.accounts.length} ${accountLabel(document.accounts.length)}.`,
+        `Exported ${document.accounts.length} ${accountLabel(document.accounts.length)}. Keep the file private; it may include Codex auth tokens.`,
       )
+    },
+  })
+
+  const killCallbackPortMutation = useMutation({
+    mutationFn: () => killLoginCallbackPortProcess(session),
+    onError: (caught) => toast.error(readError(caught)),
+    onSuccess: (status) => {
+      queryClient.setQueryData(callbackPortQueryKey, status)
+      if (status.inUse) {
+        toast.warning(
+          `${status.host}:${status.port} is still in use. The process may need more time to exit.`,
+        )
+        return
+      }
+      toast.success(formatKilledCallbackPortProcesses(status))
     },
   })
 
@@ -369,7 +410,30 @@ export function AccountManagementPanel({
     }
   }
 
-  function startAuthentication(accountId: string, mode: AccountAuthMode = "browser") {
+  async function ensureBrowserCallbackPortAvailable(): Promise<boolean> {
+    const status =
+      callbackPortQuery.data?.inUse
+        ? callbackPortQuery.data
+        : (await callbackPortQuery.refetch()).data
+
+    if (!status?.inUse) {
+      return true
+    }
+
+    toast.error(
+      `${status.host}:${status.port} is already in use. Kill the process or use Device Auth.`,
+    )
+    return false
+  }
+
+  async function startAuthentication(
+    accountId: string,
+    mode: AccountAuthMode = "browser",
+  ) {
+    if (mode === "browser" && !(await ensureBrowserCallbackPortAvailable())) {
+      return
+    }
+
     const account = accounts.find((entry) => entry.id === accountId)
     const popup = openPreparedAuthWindow()
     authPopupRef.current = popup
@@ -382,7 +446,15 @@ export function AccountManagementPanel({
     })
   }
 
-  function createAndAuthenticate(authMode: AccountAuthMode) {
+  async function createAndAuthenticate(authMode: AccountAuthMode) {
+    if (
+      authMode === "browser" &&
+      !(await ensureBrowserCallbackPortAvailable())
+    ) {
+      setAddMenuOpen(false)
+      return
+    }
+
     const popup = openPreparedAuthWindow()
     authPopupRef.current = popup
     setAddMenuOpen(false)
@@ -486,6 +558,28 @@ export function AccountManagementPanel({
                 Search, authenticate, and inspect current Codex quota.
               </p>
             </div>
+            
+          </div>
+
+          <LoginCallbackPortWarning
+            browserAuthenticationInProgress={browserAuthenticationInProgress}
+            checking={callbackPortQuery.isFetching}
+            killing={killCallbackPortMutation.isPending}
+            status={callbackPortQuery.data}
+            onKill={() => killCallbackPortMutation.mutate()}
+            onRefresh={() => void callbackPortQuery.refetch()}
+          />
+
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="relative min-w-64 flex-1">
+              <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                className="pl-8"
+                placeholder="Search accounts"
+                value={accountSearch}
+                onChange={(event) => setAccountSearch(event.target.value)}
+              />
+            </div>
             <div className="flex flex-wrap gap-2">
               <input
                 ref={importInputRef}
@@ -496,7 +590,7 @@ export function AccountManagementPanel({
               />
               <Button
                 disabled={importMutation.isPending}
-                variant="secondary"
+                variant="outline"
                 onClick={() => importInputRef.current?.click()}
               >
                 {importMutation.isPending ? (
@@ -504,7 +598,7 @@ export function AccountManagementPanel({
                 ) : (
                   <Upload />
                 )}
-                Import JSON
+                Import
               </Button>
               <Button
                 disabled={exportMutation.isPending}
@@ -516,7 +610,7 @@ export function AccountManagementPanel({
                 ) : (
                   <Download />
                 )}
-                Export JSON
+                Export
               </Button>
               <DropdownMenu open={addMenuOpen} onOpenChange={setAddMenuOpen}>
                 <DropdownMenuTrigger render={<Button />}>
@@ -525,7 +619,7 @@ export function AccountManagementPanel({
                 ) : (
                   <Plus />
                 )}
-                  Add Account
+                  Add
                   <ChevronDown data-icon="inline-end" />
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-56">
@@ -545,22 +639,6 @@ export function AccountManagementPanel({
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="relative min-w-64 flex-1">
-              <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                className="pl-8"
-                placeholder="Search accounts"
-                value={accountSearch}
-                onChange={(event) => setAccountSearch(event.target.value)}
-              />
-            </div>
-            <div className="text-xs text-muted-foreground">
-              {filteredAccounts.length} of {accounts.length}{" "}
-              {accountLabel(accounts.length)}
             </div>
           </div>
 
@@ -931,6 +1009,70 @@ function AuthenticationDialog({
   )
 }
 
+function LoginCallbackPortWarning({
+  browserAuthenticationInProgress,
+  checking,
+  killing,
+  status,
+  onKill,
+  onRefresh,
+}: {
+  browserAuthenticationInProgress: boolean
+  checking: boolean
+  killing: boolean
+  status?: LoginCallbackPortStatus
+  onKill: () => void
+  onRefresh: () => void
+}) {
+  if (!status?.inUse) {
+    return null
+  }
+
+  const processLabel = formatCallbackPortProcesses(status)
+  const killLabel = status.processes.length === 1 ? "Kill Process" : "Kill Processes"
+
+  return (
+    <div className="flex flex-col gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-3 text-amber-950 dark:border-amber-900/70 dark:bg-amber-950/35 dark:text-amber-100 sm:flex-row sm:items-start sm:justify-between">
+      <div className="flex min-w-0 gap-2">
+        <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-300" />
+        <div className="grid min-w-0 gap-1">
+          <div className="text-sm font-medium">
+            Login callback port is busy
+          </div>
+          <p className="text-sm leading-relaxed">
+            {browserAuthenticationInProgress
+              ? `${status.host}:${status.port} is already listening for a browser login. Starting another Normal Auth can fail while this listener is active.`
+              : `${status.host}:${status.port} is already listening. Normal Auth can fail until this process is stopped.`}
+          </p>
+          <p className="break-words text-xs text-amber-800 dark:text-amber-200/80">
+            {processLabel ?? "Process details are unavailable."}
+          </p>
+        </div>
+      </div>
+      <div className="flex shrink-0 flex-wrap gap-2 sm:justify-end">
+        <Button
+          disabled={checking || killing}
+          size="sm"
+          variant="outline"
+          onClick={onRefresh}
+        >
+          {checking ? <Loader2 className="animate-spin" /> : <RotateCw />}
+          Refresh
+        </Button>
+        <Button
+          disabled={!status.killable || killing}
+          size="sm"
+          variant="destructive"
+          onClick={onKill}
+        >
+          {killing ? <Loader2 className="animate-spin" /> : <PowerOff />}
+          {killLabel}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 function AccountTableEntry({
   account,
   authPending,
@@ -1284,6 +1426,36 @@ async function copyDeviceCode(code: string) {
   } catch {
     toast.error("Could not copy device code.")
   }
+}
+
+function formatCallbackPortProcesses(
+  status: LoginCallbackPortStatus,
+): string | null {
+  if (!status.processes.length) {
+    return null
+  }
+
+  return status.processes
+    .map((entry) =>
+      [
+        entry.command ?? "process",
+        `PID ${entry.pid}`,
+        entry.user ? `user ${entry.user}` : null,
+      ]
+        .filter(Boolean)
+        .join(" "),
+    )
+    .join(", ")
+}
+
+function formatKilledCallbackPortProcesses(
+  status: LoginCallbackPortStatus,
+): string {
+  const processIds = status.killedProcessIds ?? []
+  if (!processIds.length) {
+    return "Login callback port is available."
+  }
+  return `Killed ${processIds.length === 1 ? "process" : "processes"} ${processIds.join(", ")}.`
 }
 
 function readError(caught: unknown): string {

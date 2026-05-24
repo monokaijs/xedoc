@@ -3,6 +3,7 @@ import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import type {
   AccountAuthMode,
+  AccountAuthExport,
   AuthenticateAccountResponse,
   CodexJsonRpcResponse,
   AccountExportDocument,
@@ -38,6 +39,7 @@ type RuntimeAccount = {
 type NormalizedImportAccount = Required<
   Pick<AccountImportEntry, "displayName" | "command" | "args">
 > & {
+  auth: AccountAuthExport | null
   defaultModel: string | null
   defaultPermissionMode: string | null
   defaultReasoningEffort: string | null
@@ -48,6 +50,8 @@ type NormalizedImportAccount = Required<
 
 const PERSONALIZATION_FILE_NAME = "AGENTS.md"
 const PERSONALIZATION_MAX_BYTES = 32 * 1024
+const ACCOUNT_AUTH_FILE_NAME = "auth.json"
+const ACCOUNT_AUTH_MAX_BYTES = 256 * 1024
 
 export async function createAccount(dto: CreateAccountRequest) {
   const account = await prisma.codexAccount.create({
@@ -80,13 +84,14 @@ export async function exportAccounts(): Promise<AccountExportDocument> {
   })
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     exportedAt: new Date().toISOString(),
     accounts: accounts.map((account) => ({
       id: account.id,
       displayName: account.displayName,
       command: account.command,
       args: normalizeAccountArgs(account.args),
+      auth: readAccountAuthExport(account.id),
       defaultModel: account.defaultModel,
       defaultPermissionMode:
         account.defaultPermissionMode as AccountResponse["defaultPermissionMode"],
@@ -114,23 +119,23 @@ export async function importAccounts(
 
     if (existing) {
       codexRuntimeService.stopRuntime(existing.id)
-      imported.push(
-        await prisma.codexAccount.update({
-          where: { id: existing.id },
-          data: importedAccountData(account),
-        }),
-      )
+      const importedAccount = await prisma.codexAccount.update({
+        where: { id: existing.id },
+        data: importedAccountData(account),
+      })
+      writeImportedAccountAuthFile(importedAccount.id, account.auth)
+      imported.push(importedAccount)
       continue
     }
 
-    imported.push(
-      await prisma.codexAccount.create({
-        data: {
-          ...(account.id ? { id: account.id } : {}),
-          ...importedAccountData(account),
-        },
-      }),
-    )
+    const importedAccount = await prisma.codexAccount.create({
+      data: {
+        ...(account.id ? { id: account.id } : {}),
+        ...importedAccountData(account),
+      },
+    })
+    writeImportedAccountAuthFile(importedAccount.id, account.auth)
+    imported.push(importedAccount)
   }
 
   if (!imported.length) {
@@ -344,12 +349,7 @@ export async function authenticateAccount(
   try {
     const runtime = getRuntime(account)
     if (!authTokenInvalidated) {
-      const existingAccount = await runtime.request("account/read", {
-        refreshToken: false,
-      })
-      const existingRuntimeAccount = asJsonObject(
-        asJsonObject(existingAccount.result)?.account,
-      )
+      const existingRuntimeAccount = await readExistingRuntimeAccount(runtime)
       if (existingRuntimeAccount) {
         await prisma.codexAccount.update({
           where: { id: accountId },
@@ -685,6 +685,23 @@ function getRuntime(account: RuntimeAccount) {
   })
 }
 
+async function readExistingRuntimeAccount(runtime: {
+  request(
+    method: string,
+    params: JsonObject,
+    timeoutMs?: number,
+  ): Promise<CodexJsonRpcResponse>
+}): Promise<JsonObject | null> {
+  try {
+    const response = await runtime.request("account/read", {
+      refreshToken: false,
+    })
+    return asJsonObject(asJsonObject(response.result)?.account) ?? null
+  } catch {
+    return null
+  }
+}
+
 async function readAccountConnected(
   accountId: string,
   runtime: {
@@ -747,16 +764,45 @@ function readAccountAuthEmail(accountId: string): string | null {
 
 function readAccountAuthFile(accountId: string): JsonObject {
   const raw = readFileSync(
-    `${resolveAccountCodexHome(accountId)}/auth.json`,
+    join(resolveAccountCodexHome(accountId), ACCOUNT_AUTH_FILE_NAME),
     "utf8",
   )
   return asJsonObject(JSON.parse(raw)) ?? {}
 }
 
 function removeAccountAuthFile(accountId: string): void {
-  rmSync(`${resolveAccountCodexHome(accountId)}/auth.json`, {
+  rmSync(join(resolveAccountCodexHome(accountId), ACCOUNT_AUTH_FILE_NAME), {
     force: true,
   })
+}
+
+function readAccountAuthExport(accountId: string): AccountAuthExport | null {
+  try {
+    const authJson = readAccountAuthFile(accountId)
+    if (!Object.keys(authJson).length) {
+      return null
+    }
+    return { authJson }
+  } catch {
+    return null
+  }
+}
+
+function writeImportedAccountAuthFile(
+  accountId: string,
+  auth: AccountAuthExport | null,
+): void {
+  if (!auth) {
+    return
+  }
+
+  const codexHome = ensureAccountCodexHome(accountId)
+  const content = `${JSON.stringify(auth.authJson)}\n`
+  writeFileSync(join(codexHome, ACCOUNT_AUTH_FILE_NAME), content, {
+    encoding: "utf8",
+    mode: 0o600,
+  })
+  chmodSync(join(codexHome, ACCOUNT_AUTH_FILE_NAME), 0o600)
 }
 
 function readAccountEmailFromAuth(auth: JsonObject): string | null {
@@ -999,6 +1045,7 @@ function normalizeImportAccount(
       "codex",
     args: normalizeOptionalStringArray(value.args, `${fieldPrefix}.args`) ??
       parseDefaultCodexArgs(),
+    auth: normalizeImportAuth(value.auth, `${fieldPrefix}.auth`),
     defaultModel:
       normalizeOptionalString(value.defaultModel, `${fieldPrefix}.defaultModel`, 128) ??
       null,
@@ -1122,6 +1169,25 @@ function normalizeOptionalStringArray(
     .filter(Boolean)
 }
 
+function normalizeImportAuth(
+  value: unknown,
+  field: string,
+): AccountAuthExport | null {
+  if (value === undefined || value === null) {
+    return null
+  }
+  const object = asJsonObject(value)
+  if (!object) {
+    throw new HttpError(400, `${field} must be an object.`)
+  }
+  const authJson = asJsonObject(object.authJson)
+  if (!authJson) {
+    throw new HttpError(400, `${field}.authJson must be an object.`)
+  }
+  validateJsonByteSize(authJson, `${field}.authJson`, ACCOUNT_AUTH_MAX_BYTES)
+  return { authJson }
+}
+
 function normalizeImportEnvironment(
   value: unknown,
   field: string,
@@ -1136,4 +1202,14 @@ function normalizeImportEnvironment(
   return Object.fromEntries(
     Object.entries(object).map(([key, entry]) => [key, String(entry)]),
   )
+}
+
+function validateJsonByteSize(
+  value: unknown,
+  field: string,
+  maxBytes: number,
+): void {
+  if (Buffer.byteLength(JSON.stringify(value), "utf8") > maxBytes) {
+    throw new HttpError(400, `${field} must be ${maxBytes} bytes or fewer.`)
+  }
 }

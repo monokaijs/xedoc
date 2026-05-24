@@ -4,6 +4,7 @@ import type {
   CodexReasoningEffort,
   CodexServiceTier,
 } from './codex';
+import type { JsonObject } from './json';
 
 export type AccountStatus =
   | 'DISCONNECTED'
@@ -47,11 +48,16 @@ export interface AccountResponse {
   updatedAt: ApiDate;
 }
 
+export interface AccountAuthExport {
+  authJson: JsonObject;
+}
+
 export interface AccountExportEntry {
   id: string;
   displayName: string;
   command: string;
   args: string[];
+  auth?: AccountAuthExport | null;
   environment?: Record<string, string> | null;
   defaultModel?: string | null;
   defaultPermissionMode?: CodexPermissionMode | null;
@@ -62,7 +68,7 @@ export interface AccountExportEntry {
 }
 
 export interface AccountExportDocument {
-  schemaVersion: 1;
+  schemaVersion: 2;
   exportedAt: ApiDate;
   accounts: AccountExportEntry[];
 }
@@ -72,6 +78,7 @@ export interface AccountImportEntry {
   displayName: string;
   command?: string;
   args?: string[];
+  auth?: AccountAuthExport | null;
   environment?: Record<string, string> | null;
   defaultModel?: string | null;
   defaultPermissionMode?: CodexPermissionMode | null;
@@ -96,6 +103,24 @@ export interface AccountPersonalizationResponse {
 
 export interface UpdateAccountPersonalizationRequest {
   instructions: string;
+}
+
+export interface LoginCallbackPortProcess {
+  pid: number;
+  command?: string;
+  user?: string;
+  address?: string;
+}
+
+export interface LoginCallbackPortStatus {
+  checkedAt: ApiDate;
+  host: string;
+  port: number;
+  inUse: boolean;
+  killable: boolean;
+  processes: LoginCallbackPortProcess[];
+  killedProcessIds?: number[];
+  message?: string;
 }
 
 export interface ImportAccountsRequest {
