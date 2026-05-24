@@ -19,6 +19,7 @@ export default [
   route("api/accounts", "routes/api.accounts.ts"),
   route("api/accounts/export", "routes/api.accounts.export.ts"),
   route("api/accounts/import", "routes/api.accounts.import.ts"),
+  route("api/accounts/personalization", "routes/api.accounts.personalization.ts"),
   route(
     "api/accounts/import-local-active",
     "routes/api.accounts.import-local-active.ts",
@@ -63,6 +64,10 @@ export default [
   ),
   route("api/chats/:chatId/messages", "routes/api.chats.$chatId.messages.ts"),
   route("api/chats/:chatId/interrupt", "routes/api.chats.$chatId.interrupt.ts"),
+  route(
+    "api/chats/:chatId/queued/:queueId/steer",
+    "routes/api.chats.$chatId.queued.$queueId.steer.ts",
+  ),
   route(
     "api/chats/:chatId/server-requests/:requestId/respond",
     "routes/api.chats.$chatId.server-requests.$requestId.respond.ts",

@@ -95,11 +95,12 @@ export interface AccountRuntimeSettingsRequest {
 }
 
 export interface AccountPersonalizationResponse {
-  accountId: string;
+  accountId: string | null;
   codexHome: string;
   instructionsPath: string;
   instructions: string;
   maxBytes: number;
+  shared: boolean;
 }
 
 export interface UpdateAccountPersonalizationRequest {

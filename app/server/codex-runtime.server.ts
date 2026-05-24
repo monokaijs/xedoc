@@ -409,6 +409,23 @@ export function resolveCodexSharedChatHome(): string {
   )
 }
 
+export function ensureCodexSharedChatHome(): string {
+  const sharedChatHome = resolveCodexSharedChatHome()
+  mkdirSync(sharedChatHome, { recursive: true, mode: 0o700 })
+  chmodSync(sharedChatHome, 0o700)
+  return sharedChatHome
+}
+
+export function ensureCodexSharedPersonalizationFile(): {
+  codexHome: string
+  instructionsPath: string
+} {
+  const codexHome = ensureCodexSharedChatHome()
+  const instructionsPath = join(codexHome, "AGENTS.md")
+  ensureFile(instructionsPath, 0o600)
+  return { codexHome, instructionsPath }
+}
+
 export function resolveCodexSharedSessionIndexPath(): string {
   return join(resolveCodexSharedChatHome(), "session_index.jsonl")
 }
@@ -468,13 +485,11 @@ function ensureCodexHome(codexHome: string): void {
 }
 
 function ensureSharedCodexChatStorage(codexHome: string): void {
-  const sharedChatHome = resolveCodexSharedChatHome()
+  const sharedChatHome = ensureCodexSharedChatHome()
   if (resolve(codexHome) === resolve(sharedChatHome)) {
     return
   }
 
-  mkdirSync(sharedChatHome, { recursive: true, mode: 0o700 })
-  chmodSync(sharedChatHome, 0o700)
   ensureSharedSessionsLink(codexHome, sharedChatHome)
   ensureSharedSessionIndexLink(codexHome, sharedChatHome)
   ensureSharedStateDatabaseLinks(codexHome, sharedChatHome)

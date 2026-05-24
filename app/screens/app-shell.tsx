@@ -83,12 +83,18 @@ import { ThemeSwitcher } from "@/components/theme-switcher"
 import {
   ChatComposerContextPanel,
   ChatTimeline,
+  PinnedPlanTasksPanel,
+  QueuedMessagesPanel,
+  findPendingQueuedMessages,
+  findPinnedProgressPlanMessage,
   findStickyChatContext,
+  pinnedPlanMessageSignature,
 } from "@/components/timeline/chat-timeline"
 import type {
   FileChangePromptAction,
   ProposedPlanAction,
   ProposedPlanRevisionAction,
+  QueuedMessageAction,
 } from "@/components/timeline/chat-timeline"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -159,6 +165,7 @@ import {
   listChats,
   readCodexRateLimits,
   runGitAction,
+  steerQueuedChatMessage,
   updateAccountRuntimeSettings,
   updateChat,
 } from "@/lib/api"
@@ -1646,16 +1653,43 @@ export function ChatDetailPane() {
     () => messagesQuery.data?.data ?? [],
     [messagesQuery.data],
   )
+  const loadedChat = chatQuery.data
+  const loadedAccount = accounts.find((entry) => entry.id === loadedChat?.accountId)
+  const isRunning = loadedChat?.status === "RUNNING"
   const stickyChatContext = useMemo(
     () => findStickyChatContext(messages),
     [messages],
   )
+  const pinnedPlanMessage = useMemo(
+    () => findPinnedProgressPlanMessage(messages, isRunning),
+    [isRunning, messages],
+  )
+  const pendingQueuedMessages = useMemo(
+    () => findPendingQueuedMessages(messages),
+    [messages],
+  )
+  const composerAccessoryVisible = !(terminalOpen && loadedChat?.workingDirectory)
   const hiddenTimelineMessageIds = useMemo(
     () =>
-      stickyChatContext.pendingRequest
-        ? [stickyChatContext.pendingRequest.id]
-        : [],
-    [stickyChatContext.pendingRequest],
+      [
+        stickyChatContext.pendingRequest?.id,
+        composerAccessoryVisible ? pinnedPlanMessage?.id : undefined,
+        ...(composerAccessoryVisible
+          ? pendingQueuedMessages.map((message) => message.id)
+          : []),
+      ].filter(
+        (id): id is string => !!id,
+      ),
+    [
+      composerAccessoryVisible,
+      pendingQueuedMessages,
+      pinnedPlanMessage?.id,
+      stickyChatContext.pendingRequest?.id,
+    ],
+  )
+  const pinnedPlanSignature = useMemo(
+    () => pinnedPlanMessageSignature(pinnedPlanMessage),
+    [pinnedPlanMessage],
   )
   const scrollSignature = useMemo(
     () =>
@@ -1667,9 +1701,6 @@ export function ChatDetailPane() {
         .join("|"),
     [messages],
   )
-
-  const loadedChat = chatQuery.data
-  const loadedAccount = accounts.find((entry) => entry.id === loadedChat?.accountId)
 
   useEffect(() => {
     setActiveProjectPath(loadedChat?.workingDirectory?.trim() ?? "")
@@ -1789,6 +1820,20 @@ export function ChatDetailPane() {
     onError: (caught) => toast.error(readError(caught)),
     onSuccess: () => {
       toast.message("Stop requested.")
+    },
+  })
+
+  const steerQueuedMessageMutation = useMutation({
+    mutationFn: (action: QueuedMessageAction) =>
+      steerQueuedChatMessage(session, chatId!, action.queueId),
+    onError: (caught) => toast.error(readError(caught)),
+    onSuccess: (message) => {
+      queryClient.setQueryData<MessagePageResponse | undefined>(
+        messagesQueryKey,
+        (page) => appendMessage(page, message),
+      )
+      void queryClient.invalidateQueries({ queryKey: chatQueryKey })
+      void queryClient.invalidateQueries({ queryKey: ["chats"] })
     },
   })
 
@@ -1990,7 +2035,7 @@ export function ChatDetailPane() {
       cancelAnimationFrame(firstFrame)
       cancelAnimationFrame(secondFrame)
     }
-  }, [scrollSignature, scrollToBottom])
+  }, [pinnedPlanSignature, scrollSignature, scrollToBottom])
 
   if (!chatId) {
     return <Navigate replace to="/" />
@@ -2019,7 +2064,6 @@ export function ChatDetailPane() {
 
   const chat = loadedChat
   const account = loadedAccount
-  const isRunning = chat?.status === "RUNNING"
   const modelOptions = modelsQuery.data?.data ?? []
   const canSwitchAccount =
     !!chat && !isRunning && connectedAccounts.length > 0
@@ -2030,6 +2074,13 @@ export function ChatDetailPane() {
   const activeReasoningEffort =
     chat?.reasoningEffort ?? selectedModel?.defaultReasoningEffort ?? null
   const serviceTierOptions = selectedModel?.additionalSpeedTiers ?? []
+  const composerHasDraft = content.trim().length > 0 || attachments.length > 0
+  const composerCanSend = canSend(
+    content,
+    chat?.workingDirectory ?? "",
+    account,
+    attachments,
+  )
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-sidebar">
@@ -2055,10 +2106,20 @@ export function ChatDetailPane() {
                 onImplementPlan={implementPlan}
                 onRevisePlan={revisePlan}
                 onReviewFileChanges={reviewFileChanges}
+                onSteerQueuedMessage={(action) =>
+                  steerQueuedMessageMutation.mutate(action)
+                }
                 onUndoFileChanges={undoFileChanges}
                 planActionDisabled={isRunning}
                 planActionPending={sendMutation.isPending}
+                queuedMessageActionDisabled={
+                  !isRunning || steerQueuedMessageMutation.isPending
+                }
+                queuedMessageActionPendingId={
+                  steerQueuedMessageMutation.variables?.queueId ?? null
+                }
                 session={session}
+                showProcessingTail={isRunning && !stickyChatContext.pendingRequest}
               />
             ) : (
               <div className="py-20 text-center text-sm text-muted-foreground">
@@ -2089,6 +2150,15 @@ export function ChatDetailPane() {
           </div>
         ) : (
           <>
+            <PinnedPlanTasksPanel message={pinnedPlanMessage} />
+            <QueuedMessagesPanel
+              disabled={!isRunning || steerQueuedMessageMutation.isPending}
+              messages={pendingQueuedMessages}
+              pendingQueueId={steerQueuedMessageMutation.variables?.queueId ?? null}
+              onSteerQueuedMessage={(action) =>
+                steerQueuedMessageMutation.mutate(action)
+              }
+            />
             <ChatComposerContextPanel
               chatId={chatId}
               messages={messages}
@@ -2117,9 +2187,7 @@ export function ChatDetailPane() {
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault()
-                    if (
-                      canSend(content, chat?.workingDirectory ?? "", account, attachments)
-                    ) {
+                    if (composerCanSend) {
                       sendMutation.mutate({
                         attachments: composerAttachmentsToRequest(attachments),
                         clearComposer: true,
@@ -2156,18 +2224,6 @@ export function ChatDetailPane() {
                   onAttachFile={attachWorkspaceFile}
                   onAttachImage={() => imageInputRef.current?.click()}
                   pending={updateRuntimeMutation.isPending}
-                  steerDisabled={
-                    !isRunning ||
-                    sendMutation.isPending ||
-                    !canSend(content, chat?.workingDirectory ?? "", account, attachments)
-                  }
-                  onSteerActiveTurn={() =>
-                    sendMutation.mutate({
-                      attachments: composerAttachmentsToRequest(attachments),
-                      clearComposer: true,
-                      delivery: "steer",
-                    })
-                  }
                   onSelectMode={(collaborationMode) =>
                     updateRuntimeMutation.mutate({ collaborationMode })
                   }
@@ -2278,15 +2334,22 @@ export function ChatDetailPane() {
                 <ComposerActionButton
                   loading={sendMutation.isPending}
                   running={isRunning}
-                  sendDisabled={
-                    !canSend(content, chat?.workingDirectory ?? "", account, attachments)
-                  }
+                  hasDraft={composerHasDraft}
+                  sendDisabled={!composerCanSend}
                   stopPending={interruptMutation.isPending}
                   onSend={() =>
                     sendMutation.mutate({
                       attachments: composerAttachmentsToRequest(attachments),
                       clearComposer: true,
                       delivery: isRunning ? "queue" : undefined,
+                    })
+                  }
+                  steerDisabled={!isRunning || sendMutation.isPending || !composerCanSend}
+                  onSteer={() =>
+                    sendMutation.mutate({
+                      attachments: composerAttachmentsToRequest(attachments),
+                      clearComposer: true,
+                      delivery: "steer",
                     })
                   }
                   onStop={() => interruptMutation.mutate()}
@@ -3583,9 +3646,7 @@ function PlanModeSelector({
   onAttachFile,
   onAttachImage,
   onSelectMode,
-  onSteerActiveTurn,
   pending,
-  steerDisabled,
 }: {
   attachmentDisabled?: boolean
   disabled?: boolean
@@ -3594,9 +3655,7 @@ function PlanModeSelector({
   onAttachFile?: () => void
   onAttachImage?: () => void
   onSelectMode: (mode: CodexCollaborationMode) => void
-  onSteerActiveTurn?: () => void
   pending?: boolean
-  steerDisabled?: boolean
 }) {
   const planEnabled = mode === "plan"
   const attachmentsLocked = attachmentDisabled || disabled
@@ -3652,16 +3711,6 @@ function PlanModeSelector({
           <Paperclip />
           <span>Attach workspace file</span>
         </DropdownMenuItem>
-        {onSteerActiveTurn ? (
-          <DropdownMenuItem
-            className="gap-3 py-2"
-            disabled={steerDisabled}
-            onClick={onSteerActiveTurn}
-          >
-            <ArrowUp />
-            <span>Steer active turn</span>
-          </DropdownMenuItem>
-        ) : null}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -3736,23 +3785,68 @@ function PermissionModeSelector({
 }
 
 function ComposerActionButton({
+  hasDraft,
   loading,
   onSend,
+  onSteer,
   onStop,
   running = false,
   sendDisabled,
+  steerDisabled,
   stopPending = false,
 }: {
+  hasDraft?: boolean
   loading?: boolean
   onSend: () => void
+  onSteer?: () => void
   onStop?: () => void
   running?: boolean
   sendDisabled?: boolean
+  steerDisabled?: boolean
   stopPending?: boolean
 }) {
-  if (running) {
+  if (running && !hasDraft) {
     return (
-      <div className="flex items-center gap-1">
+      <Button
+        aria-label="Stop task"
+        className="size-9 rounded-full"
+        disabled={stopPending || !onStop}
+        size="icon"
+        title="Stop task"
+        type="button"
+        variant="secondary"
+        onClick={onStop}
+      >
+        {stopPending ? <Loader2 className="animate-spin" /> : <Square />}
+      </Button>
+    )
+  }
+
+  if (running && hasDraft) {
+    return (
+      <div className="group relative flex shrink-0">
+        <div className="absolute right-0 bottom-full z-20 hidden min-w-48 pb-2 group-focus-within:block group-hover:block">
+          <div className="grid gap-1 rounded-lg border bg-popover p-1 text-popover-foreground shadow-md ring-1 ring-foreground/10">
+            <button
+              className="flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
+              disabled={steerDisabled || loading || !onSteer}
+              type="button"
+              onClick={onSteer}
+            >
+              <ArrowUp className="size-4 shrink-0" />
+              <span className="min-w-0">Steer active task</span>
+            </button>
+            <button
+              className="flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
+              disabled={sendDisabled || loading}
+              type="button"
+              onClick={onSend}
+            >
+              <Clock className="size-4 shrink-0" />
+              <span className="min-w-0">Queue after current task</span>
+            </button>
+          </div>
+        </div>
         <Button
           aria-label="Queue message"
           className="size-9 rounded-full"
@@ -3763,18 +3857,6 @@ function ComposerActionButton({
           onClick={onSend}
         >
           {loading ? <Loader2 className="animate-spin" /> : <ArrowUp />}
-        </Button>
-        <Button
-          aria-label="Stop task"
-          className="size-9 rounded-full"
-          disabled={stopPending || !onStop}
-          size="icon"
-          title="Stop task"
-          type="button"
-          variant="secondary"
-          onClick={onStop}
-        >
-          {stopPending ? <Loader2 className="animate-spin" /> : <Square />}
         </Button>
       </div>
     )

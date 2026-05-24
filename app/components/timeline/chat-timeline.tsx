@@ -3,6 +3,7 @@ import type {
   ChatCommandMetadata,
   ChatErrorMetadata,
   ChatFileChangeMetadata,
+  ChatGenericMetadata,
   ChatMessageAttachment,
   ChatMessageMetadata,
   ChatMessageResponse,
@@ -21,6 +22,7 @@ import {
   ArrowRight,
   Check,
   ChevronDown,
+  Clock,
   Code2,
   Eye,
   FileCode,
@@ -77,8 +79,12 @@ export function ChatTimeline({
   onUndoFileChanges,
   fileChangeActionDisabled,
   fileChangeActionPending,
+  onSteerQueuedMessage,
   planActionDisabled,
   planActionPending,
+  queuedMessageActionDisabled,
+  queuedMessageActionPendingId,
+  showProcessingTail,
   session,
 }: {
   chatId: string
@@ -86,12 +92,16 @@ export function ChatTimeline({
   fileChangeActionPending?: boolean
   hiddenMessageIds?: string[]
   messages: ChatMessageResponse[]
+  onSteerQueuedMessage?: (action: QueuedMessageAction) => void
   onReviewFileChanges?: (action: FileChangePromptAction) => void
   onUndoFileChanges?: (action: FileChangePromptAction) => void
   onImplementPlan?: (action: ProposedPlanAction) => void
   onRevisePlan?: (action: ProposedPlanRevisionAction) => void
   planActionDisabled?: boolean
   planActionPending?: boolean
+  queuedMessageActionDisabled?: boolean
+  queuedMessageActionPendingId?: string | null
+  showProcessingTail?: boolean
   session: WebSession
 }) {
   const hiddenIds = useMemo(
@@ -126,12 +136,16 @@ export function ChatTimeline({
           onImplementPlan={onImplementPlan}
           onRevisePlan={onRevisePlan}
           onReviewFileChanges={onReviewFileChanges}
+          onSteerQueuedMessage={onSteerQueuedMessage}
           onUndoFileChanges={onUndoFileChanges}
           planActionDisabled={planActionDisabled}
           planActionPending={planActionPending}
+          queuedMessageActionDisabled={queuedMessageActionDisabled}
+          queuedMessageActionPendingId={queuedMessageActionPendingId}
           session={session}
         />
       ))}
+      {showProcessingTail ? <ProcessingTail /> : null}
       <FileViewerDialog
         chatId={chatId}
         session={session}
@@ -167,6 +181,167 @@ export function ChatComposerContextPanel({
       </div>
     </div>
   )
+}
+
+export function PinnedPlanTasksPanel({
+  message,
+}: {
+  message?: ChatMessageResponse | null
+}) {
+  if (!message) {
+    return null
+  }
+
+  const metadata = metadataAs<ChatPlanMetadata>(message.metadata)
+  const steps = metadata?.steps ?? []
+  const completedStepCount = steps.filter((step) => planStepIsComplete(step.status)).length
+  const highlightedStepIndex = highlightedPlanStepIndex(steps)
+  const highlightedStep = highlightedStepIndex >= 0 ? steps[highlightedStepIndex] : undefined
+  const summary =
+    highlightedStep?.step ??
+    normalizedPlanText(metadata?.explanation) ??
+    normalizedPlanText(message.content) ??
+    "Planning..."
+  const statusLabel = pinnedPlanStatusLabel(message, steps)
+
+  return (
+    <section
+      aria-label="Active plan"
+      aria-live="polite"
+      className="border-b bg-background px-3 py-2"
+    >
+      <div className="mx-auto w-full min-w-0 max-w-3xl">
+        <div className="min-w-0 overflow-hidden rounded-lg border bg-muted/20 shadow-sm">
+          <div className="grid min-w-0 gap-2 p-3">
+            <div className="flex min-w-0 items-start justify-between gap-3">
+              <div className="flex min-w-0 items-start gap-2">
+                <div className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-md bg-background text-muted-foreground">
+                  <ListChecks className="size-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium">Plan</span>
+                    <Badge variant="secondary">{statusLabel}</Badge>
+                  </div>
+                  <div className="mt-0.5 min-w-0 truncate text-xs text-muted-foreground">
+                    {summary}
+                  </div>
+                </div>
+              </div>
+              {steps.length ? (
+                <Badge className="shrink-0" variant="outline">
+                  {completedStepCount}/{steps.length}
+                </Badge>
+              ) : null}
+            </div>
+
+            {steps.length ? (
+              <div className="grid max-h-44 min-w-0 gap-1.5 overflow-y-auto pr-1">
+                {steps.map((step, index) => {
+                  const highlighted = index === highlightedStepIndex
+                  return (
+                    <div
+                      className={cn(
+                        "grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 rounded-md px-2 py-1.5 text-xs",
+                        highlighted
+                          ? "border bg-background shadow-xs"
+                          : "text-muted-foreground",
+                      )}
+                      key={`${step.step}-${index}`}
+                    >
+                      <PlanStepMarker highlighted={highlighted} status={step.status} />
+                      <div className="min-w-0 break-words leading-5 text-foreground">
+                        {step.step}
+                      </div>
+                      <span className="shrink-0 rounded bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                        {planStepStatusLabel(step.status)}
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+export function QueuedMessagesPanel({
+  disabled,
+  messages,
+  onSteerQueuedMessage,
+  pendingQueueId,
+}: {
+  disabled?: boolean
+  messages: ChatMessageResponse[]
+  onSteerQueuedMessage?: (action: QueuedMessageAction) => void
+  pendingQueueId?: string | null
+}) {
+  if (!messages.length) {
+    return null
+  }
+
+  return (
+    <section className="border-b bg-background px-3 py-2">
+      <div className="mx-auto grid w-full min-w-0 max-w-3xl gap-1.5">
+        <div className="min-w-0 overflow-hidden rounded-lg border bg-muted/20 shadow-sm">
+          <div className="flex min-w-0 items-center justify-between gap-2 border-b px-3 py-2">
+            <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
+              <Clock className="size-4 shrink-0 text-muted-foreground" />
+              <span>Queued messages</span>
+            </div>
+            <Badge variant="outline">{messages.length}</Badge>
+          </div>
+          <div className="grid max-h-44 min-w-0 gap-1 overflow-y-auto p-2">
+            {messages.map((message) => {
+              const delivery = userDeliveryState(message)
+              const queueId = delivery?.queueId
+              const pending = pendingQueueId === queueId
+              return (
+                <div
+                  className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-md bg-background px-2 py-1.5 text-xs"
+                  key={message.id}
+                >
+                  <Clock className="size-3.5 text-muted-foreground" />
+                  <div className="min-w-0">
+                    <div className="truncate text-foreground">
+                      {queuedMessagePreview(message)}
+                    </div>
+                    <div className="text-muted-foreground">
+                      Queued after the current task
+                    </div>
+                  </div>
+                  <Button
+                    className="h-7 shrink-0 px-2 text-xs"
+                    disabled={disabled || pending || !queueId || !onSteerQueuedMessage}
+                    size="sm"
+                    type="button"
+                    variant="outline"
+                    onClick={() => {
+                      if (queueId) {
+                        onSteerQueuedMessage?.({ message, queueId })
+                      }
+                    }}
+                  >
+                    {pending ? <Loader2 className="animate-spin" /> : <ArrowRight />}
+                    Steer
+                  </Button>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+export function findPendingQueuedMessages(
+  messages: ChatMessageResponse[],
+): ChatMessageResponse[] {
+  return projectTimelineMessages(messages).filter(isPendingQueuedMessage)
 }
 
 type TimelineEntry =
@@ -217,6 +392,11 @@ export type FileChangePromptAction = {
   prompt: string
 }
 
+export type QueuedMessageAction = {
+  message: ChatMessageResponse
+  queueId: string
+}
+
 type PlanActionHandlers = {
   latestProposedPlanMessageId?: string | null
   onImplementPlan?: (action: ProposedPlanAction) => void
@@ -232,6 +412,12 @@ type FileChangeActionHandlers = {
   onUndoFileChanges?: (action: FileChangePromptAction) => void
 }
 
+type QueuedMessageActionHandlers = {
+  onSteerQueuedMessage?: (action: QueuedMessageAction) => void
+  queuedMessageActionDisabled?: boolean
+  queuedMessageActionPendingId?: string | null
+}
+
 function TimelineEntryRow({
   chatId,
   entry,
@@ -241,18 +427,29 @@ function TimelineEntryRow({
   onImplementPlan,
   onRevisePlan,
   onReviewFileChanges,
+  onSteerQueuedMessage,
   onUndoFileChanges,
   planActionDisabled,
   planActionPending,
+  queuedMessageActionDisabled,
+  queuedMessageActionPendingId,
   session,
 }: {
   chatId: string
   entry: TimelineEntry
   session: WebSession
 } & PlanActionHandlers &
-  FileChangeActionHandlers) {
+  FileChangeActionHandlers &
+  QueuedMessageActionHandlers) {
   if (entry.type === "user") {
-    return <UserMessageRow message={entry.message} />
+    return (
+      <UserMessageRow
+        message={entry.message}
+        queuedMessageActionDisabled={queuedMessageActionDisabled}
+        queuedMessageActionPendingId={queuedMessageActionPendingId}
+        onSteerQueuedMessage={onSteerQueuedMessage}
+      />
+    )
   }
 
   return (
@@ -398,8 +595,16 @@ function CodexRenderItemContent({
   )
 }
 
-function UserMessageRow({ message }: { message: ChatMessageResponse }) {
+function UserMessageRow({
+  message,
+  onSteerQueuedMessage,
+  queuedMessageActionDisabled,
+  queuedMessageActionPendingId,
+}: {
+  message: ChatMessageResponse
+} & QueuedMessageActionHandlers) {
   const attachments = messageAttachments(message)
+  const delivery = userDeliveryState(message)
   const imageTaggedParts = useMemo(
     () => splitImageTags(message.content),
     [message.content],
@@ -442,9 +647,16 @@ function UserMessageRow({ message }: { message: ChatMessageResponse }) {
         ) : null}
         {hasTextBubble ? (
           <div className="min-w-0 max-w-full overflow-hidden rounded-lg border border-border bg-card px-3 py-2 text-sm leading-6 text-card-foreground">
-            <div className="mb-1 flex items-center gap-2 text-muted-foreground">
-              <UserRound className="size-3.5 opacity-80" />
-              <span className="text-xs font-medium">You</span>
+            <div className="mb-1 flex min-w-0 items-center justify-between gap-2 text-muted-foreground">
+              <div className="flex min-w-0 items-center gap-2">
+                <UserRound className="size-3.5 opacity-80" />
+                <span className="text-xs font-medium">You</span>
+              </div>
+              {delivery ? (
+                <Badge className="shrink-0" variant={delivery.badgeVariant}>
+                  {delivery.label}
+                </Badge>
+              ) : null}
             </div>
             {textContent ? (
               <div className="whitespace-pre-wrap break-words">{textContent}</div>
@@ -461,6 +673,18 @@ function UserMessageRow({ message }: { message: ChatMessageResponse }) {
                   </span>
                 ))}
               </div>
+            ) : null}
+            {delivery ? (
+              <UserDeliveryFooter
+                delivery={delivery}
+                disabled={queuedMessageActionDisabled}
+                pending={queuedMessageActionPendingId === delivery.queueId}
+                onSteerQueuedMessage={
+                  delivery.queueId
+                    ? () => onSteerQueuedMessage?.({ message, queueId: delivery.queueId! })
+                    : undefined
+                }
+              />
             ) : null}
           </div>
         ) : null}
@@ -491,6 +715,134 @@ function UserMessageRow({ message }: { message: ChatMessageResponse }) {
       </Dialog>
     </article>
   )
+}
+
+function ProcessingTail() {
+  return (
+    <article className="mx-auto flex w-full min-w-0 max-w-full justify-start overflow-hidden">
+      <div className="flex min-w-0 items-center gap-2 rounded-md px-1 py-2 text-xs text-muted-foreground">
+        <Loader2 className="size-3.5 animate-spin" />
+        <span>Codex is processing</span>
+      </div>
+    </article>
+  )
+}
+
+type UserDeliveryState = {
+  badgeVariant: "default" | "secondary" | "destructive" | "outline"
+  canSteer: boolean
+  detail: string
+  label: string
+  queueId?: string
+}
+
+function UserDeliveryFooter({
+  delivery,
+  disabled,
+  onSteerQueuedMessage,
+  pending,
+}: {
+  delivery: UserDeliveryState
+  disabled?: boolean
+  onSteerQueuedMessage?: () => void
+  pending?: boolean
+}) {
+  const canSteer = delivery.canSteer && !!onSteerQueuedMessage && !disabled && !pending
+  return (
+    <div className="mt-2 flex min-w-0 flex-wrap items-center justify-between gap-2 border-t pt-2 text-xs text-muted-foreground">
+      <span className="min-w-0 break-words leading-5">{delivery.detail}</span>
+      {delivery.canSteer ? (
+        <Button
+          className="h-7 shrink-0 px-2 text-xs"
+          disabled={!canSteer}
+          size="sm"
+          type="button"
+          variant="outline"
+          onClick={onSteerQueuedMessage}
+        >
+          {pending ? <Loader2 className="animate-spin" /> : <ArrowRight />}
+          Steer
+        </Button>
+      ) : null}
+    </div>
+  )
+}
+
+function userDeliveryState(message: ChatMessageResponse): UserDeliveryState | null {
+  const metadata = metadataAs<ChatGenericMetadata>(message.metadata)
+  const delivery = readMetadataString(metadata?.delivery)
+  const queueStatus = readMetadataString(metadata?.queueStatus)
+  const queueId = readMetadataString(metadata?.queueId)
+  const error = readMetadataString(metadata?.error)
+
+  if (delivery === "queue" || queueId) {
+    const status = queueStatus ?? "queued"
+    if (status === "failed") {
+      return {
+        badgeVariant: "destructive",
+        canSteer: false,
+        detail: error ? `Queue failed: ${error}` : "Queued message failed.",
+        label: "failed",
+        queueId,
+      }
+    }
+    if (status === "running") {
+      return {
+        badgeVariant: "secondary",
+        canSteer: false,
+        detail: "Queued message is now running.",
+        label: "running",
+        queueId,
+      }
+    }
+    if (status === "steered" || delivery === "steer") {
+      return {
+        badgeVariant: "secondary",
+        canSteer: false,
+        detail: "Steered into the active task.",
+        label: "steered",
+        queueId,
+      }
+    }
+    return {
+      badgeVariant: "outline",
+      canSteer: !!queueId,
+      detail: "Queued after the current task.",
+      label: "queued",
+      queueId,
+    }
+  }
+
+  if (delivery === "steer") {
+    return {
+      badgeVariant: "secondary",
+      canSteer: false,
+      detail: "Steered into the active task.",
+      label: "steered",
+    }
+  }
+
+  return null
+}
+
+function isPendingQueuedMessage(message: ChatMessageResponse): boolean {
+  return message.role === "USER" && userDeliveryState(message)?.canSteer === true
+}
+
+function queuedMessagePreview(message: ChatMessageResponse): string {
+  const text = textFromImageTaggedParts(splitImageTags(message.content)).trim()
+  if (text) {
+    return text.length > 160 ? `${text.slice(0, 160)}...` : text
+  }
+  const attachments = messageAttachments(message)
+  if (attachments.length) {
+    return `${attachments.length} ${attachments.length === 1 ? "attachment" : "attachments"}`
+  }
+  return "Queued message"
+}
+
+function readMetadataString(value: JsonSerializable | undefined): string | undefined {
+  return typeof value === "string" ? value : undefined
 }
 
 function TimelineContent({
@@ -1178,6 +1530,161 @@ function PlanBlock({
       ) : null}
     </div>
   )
+}
+
+type PlanStep = NonNullable<ChatPlanMetadata["steps"]>[number]
+
+export function findPinnedProgressPlanMessage(
+  messages: ChatMessageResponse[],
+  isRunning: boolean,
+): ChatMessageResponse | null {
+  if (!isRunning) {
+    return null
+  }
+
+  const ordered = collapseDuplicateTimelineMessages(messages)
+    .filter((message) => !isHiddenTimelineMessage(message))
+    .sort((a, b) => a.sequence - b.sequence)
+
+  for (let index = ordered.length - 1; index >= 0; index -= 1) {
+    const message = ordered[index]
+    if (shouldDisplayPinnedProgressPlanMessage(message)) {
+      return message
+    }
+  }
+
+  return null
+}
+
+export function pinnedPlanMessageSignature(
+  message?: ChatMessageResponse | null,
+): string {
+  if (!message) {
+    return ""
+  }
+  const metadata = metadataAs<ChatPlanMetadata>(message.metadata)
+  const steps = (metadata?.steps ?? [])
+    .map((step) => `${step.status}:${step.step}`)
+    .join("|")
+  return [
+    message.id,
+    message.status,
+    message.content.length,
+    metadata?.explanation?.length ?? 0,
+    steps,
+  ].join(":")
+}
+
+function shouldDisplayPinnedProgressPlanMessage(
+  message: ChatMessageResponse,
+): boolean {
+  if (message.role !== "SYSTEM" || message.kind !== "PLAN") {
+    return false
+  }
+  if (message.status === "FAILED" || isEmptyPlanMessage(message)) {
+    return false
+  }
+
+  const metadata = metadataAs<ChatPlanMetadata>(message.metadata)
+  if (metadata?.presentation !== "progress") {
+    return false
+  }
+
+  const steps = metadata.steps ?? []
+  if (steps.length && steps.every((step) => planStepIsComplete(step.status))) {
+    return false
+  }
+
+  return (
+    steps.length > 0 ||
+    isActiveMessage(message) ||
+    !!normalizedPlanText(metadata.explanation) ||
+    !!normalizedPlanText(message.content)
+  )
+}
+
+function highlightedPlanStepIndex(steps: PlanStep[]): number {
+  const activeIndex = steps.findIndex((step) => planStepIsActive(step.status))
+  if (activeIndex >= 0) {
+    return activeIndex
+  }
+  const pendingIndex = steps.findIndex((step) => !planStepIsComplete(step.status))
+  if (pendingIndex >= 0) {
+    return pendingIndex
+  }
+  return steps.length ? steps.length - 1 : -1
+}
+
+function pinnedPlanStatusLabel(
+  message: ChatMessageResponse,
+  steps: PlanStep[],
+): string {
+  if (steps.some((step) => planStepIsActive(step.status)) || isActiveMessage(message)) {
+    return "in progress"
+  }
+  if (steps.length) {
+    return "pending"
+  }
+  return "planning"
+}
+
+function PlanStepMarker({
+  highlighted,
+  status,
+}: {
+  highlighted: boolean
+  status: string
+}) {
+  if (planStepIsComplete(status)) {
+    return <Check className="mt-0.5 size-3.5 text-primary" />
+  }
+  if (planStepIsActive(status)) {
+    return <Loader2 className="mt-0.5 size-3.5 animate-spin text-muted-foreground" />
+  }
+  return (
+    <span
+      className={cn(
+        "mt-1.5 size-2 rounded-full",
+        highlighted ? "bg-primary" : "bg-muted-foreground/35",
+      )}
+    />
+  )
+}
+
+function planStepIsComplete(status: string): boolean {
+  return ["complete", "completed", "done", "success", "succeeded"].includes(
+    normalizedPlanStepStatus(status),
+  )
+}
+
+function planStepIsActive(status: string): boolean {
+  return [
+    "active",
+    "in_progress",
+    "running",
+    "started",
+    "streaming",
+    "working",
+  ].includes(normalizedPlanStepStatus(status))
+}
+
+function planStepStatusLabel(status: string): string {
+  return status.trim().replace(/[_-]+/g, " ").toLowerCase() || "pending"
+}
+
+function normalizedPlanStepStatus(status: string): string {
+  return status.trim().toLowerCase().replace(/[\s-]+/g, "_")
+}
+
+function normalizedPlanText(value?: string | null): string | null {
+  const text = value?.trim()
+  if (!text) {
+    return null
+  }
+  if (["...", "planning..."].includes(text.toLowerCase())) {
+    return null
+  }
+  return text
 }
 
 function ProposedPlanResultBlock({
@@ -2586,9 +3093,7 @@ type CodexRenderSourceItem =
 function collapseCompletedTurnActions(
   messages: ChatMessageResponse[],
 ): CodexRenderSourceItem[] {
-  const active = messages.some(
-    (message) => message.status === "STREAMING" || message.status === "PENDING",
-  )
+  const active = messages.some(isActiveMessage)
   if (active) {
     return messages.map((message) => ({
       message,
@@ -2676,6 +3181,16 @@ function compactToolBursts(items: CodexRenderSourceItem[]): CodexRenderItem[] {
     }
 
     if (isToolBurstCandidate(item.message)) {
+      if (isActiveMessage(item.message)) {
+        flushPending()
+        projected.push({
+          id: `message:${item.message.id}`,
+          message: item.message,
+          type: "message",
+        })
+        continue
+      }
+
       const previous = pending.at(-1)
       if (!previous || sameActionBurst(previous, item.message)) {
         pending.push(item.message)
@@ -2752,7 +3267,7 @@ export function projectTimelineMessages(messages: ChatMessageResponse[]) {
   }
 
   return Array.from(groups.values()).flatMap((group) => {
-    const active = group.some((message) => message.status === "STREAMING" || message.status === "PENDING")
+    const active = group.some(isActiveMessage)
     if (active) {
       return group
     }
@@ -2904,6 +3419,11 @@ function compactAssistantChatMessages(
 
   for (const message of messages) {
     if (message.role === "ASSISTANT" && message.kind === "CHAT") {
+      if (isActiveMessage(message)) {
+        flushAssistantChat()
+        compacted.push(message)
+        continue
+      }
       pendingAssistantChat.push(message)
       continue
     }
@@ -2969,6 +3489,10 @@ function mergeMessageStatus(
     return "PENDING"
   }
   return "COMPLETED"
+}
+
+function isActiveMessage(message: ChatMessageResponse): boolean {
+  return message.status === "STREAMING" || message.status === "PENDING"
 }
 
 export function findStickyChatContext(messages: ChatMessageResponse[]) {

@@ -221,6 +221,31 @@ export async function updateAccountRuntimeSettings(
   )
 }
 
+export async function getPersonalization(
+  session: ApiSession,
+): Promise<AccountPersonalizationResponse> {
+  return fetchJson<AccountPersonalizationResponse>(
+    session.serverUrl,
+    "/api/accounts/personalization",
+    { token: session.token },
+  )
+}
+
+export async function updatePersonalization(
+  session: ApiSession,
+  body: UpdateAccountPersonalizationRequest,
+): Promise<AccountPersonalizationResponse> {
+  return fetchJson<AccountPersonalizationResponse>(
+    session.serverUrl,
+    "/api/accounts/personalization",
+    {
+      body,
+      method: "PATCH",
+      token: session.token,
+    },
+  )
+}
+
 export async function getAccountPersonalization(
   session: ApiSession,
   accountId: string,
@@ -538,6 +563,18 @@ export async function respondToServerRequest(
       body,
       token: session.token,
     },
+  )
+}
+
+export async function steerQueuedChatMessage(
+  session: ApiSession,
+  chatId: string,
+  queueId: string,
+): Promise<ChatMessageResponse> {
+  return fetchJson<ChatMessageResponse>(
+    session.serverUrl,
+    `/api/chats/${chatId}/queued/${queueId}/steer`,
+    { method: "POST", token: session.token },
   )
 }
 

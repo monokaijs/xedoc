@@ -26,8 +26,8 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 import { Textarea } from "@/components/ui/textarea"
 import {
-  getAccountPersonalization,
-  updateAccountPersonalization,
+  getPersonalization,
+  updatePersonalization,
 } from "@/lib/api"
 import { cn } from "@/lib/utils"
 import type { WebSession } from "@/lib/session-storage"
@@ -94,7 +94,7 @@ export function ServerSettingsDialog({
           <ScrollArea className="h-[74vh]">
             <div className="p-5">
               {activeTab === "personalization" ? (
-                <PersonalizationPanel accounts={accounts} session={session} />
+                <PersonalizationPanel session={session} />
               ) : null}
               {activeTab === "accounts" ? (
                 <AccountManagementPanel
@@ -143,42 +143,16 @@ function SettingsTabButton({
 }
 
 function PersonalizationPanel({
-  accounts,
   session,
 }: {
-  accounts: AccountResponse[]
   session: WebSession
 }) {
-  const [selectedAccountId, setSelectedAccountId] = useState(
-    () => accounts[0]?.id ?? "",
-  )
   const [draft, setDraft] = useState("")
   const queryClient = useQueryClient()
 
-  useEffect(() => {
-    if (!accounts.length) {
-      setSelectedAccountId("")
-      return
-    }
-    if (!selectedAccountId || !accounts.some((entry) => entry.id === selectedAccountId)) {
-      setSelectedAccountId(accounts[0].id)
-    }
-  }, [accounts, selectedAccountId])
-
-  const selectedAccount = useMemo(
-    () => accounts.find((entry) => entry.id === selectedAccountId),
-    [accounts, selectedAccountId],
-  )
-
   const personalizationQuery = useQuery({
-    enabled: !!selectedAccountId,
-    queryKey: ["account-personalization", selectedAccountId],
-    queryFn: () => {
-      if (!selectedAccountId) {
-        throw new Error("Select an account.")
-      }
-      return getAccountPersonalization(session, selectedAccountId)
-    },
+    queryKey: ["account-personalization"],
+    queryFn: () => getPersonalization(session),
   })
 
   useEffect(() => {
@@ -188,20 +162,13 @@ function PersonalizationPanel({
   }, [personalizationQuery.data])
 
   const saveMutation = useMutation({
-    mutationFn: () => {
-      if (!selectedAccountId) {
-        throw new Error("Select an account.")
-      }
-      return updateAccountPersonalization(session, selectedAccountId, {
+    mutationFn: () =>
+      updatePersonalization(session, {
         instructions: draft,
-      })
-    },
+      }),
     onError: (caught) => toast.error(readError(caught)),
     onSuccess: (response) => {
-      queryClient.setQueryData(
-        ["account-personalization", response.accountId],
-        response,
-      )
+      queryClient.setQueryData(["account-personalization"], response)
       void queryClient.invalidateQueries({ queryKey: ["account-personalization"] })
       toast.success("Personalization saved.")
     },
@@ -213,17 +180,6 @@ function PersonalizationPanel({
     !!personalizationQuery.data &&
     draft !== personalizationQuery.data.instructions
   const isTooLarge = byteCount > maxBytes
-
-  if (!accounts.length) {
-    return (
-      <div className="rounded-md border border-dashed bg-muted/20 p-6">
-        <h3 className="text-sm font-semibold">No accounts</h3>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Create an account before configuring personalization.
-        </p>
-      </div>
-    )
-  }
 
   return (
     <div className="grid gap-5">
@@ -267,13 +223,7 @@ function PersonalizationPanel({
       ) : null}
 
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="min-w-0">
-          <div className="truncate font-mono text-xs text-muted-foreground">
-            {personalizationQuery.data?.instructionsPath ??
-              selectedAccount?.displayName ??
-              "Personalization file"}
-          </div>
-        </div>
+        <div />
         <div className="flex flex-wrap justify-end gap-2">
           <Button
             disabled={personalizationQuery.isFetching}

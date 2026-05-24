@@ -525,6 +525,69 @@ export async function interruptChatRun(threadId: string) {
   }
 }
 
+export async function steerQueuedMessage(
+  threadId: string,
+  queueId: string,
+): Promise<ChatMessageResponse> {
+  await getChat(threadId)
+  const state = runtimeStates.get(threadId)
+  if (!state || (state.status !== "RUNNING" && state.status !== "QUEUED")) {
+    throw new HttpError(409, "There is no running task to steer.")
+  }
+  if (!state.runtime) {
+    throw new HttpError(409, "The active turn is not ready for steering yet.")
+  }
+
+  const queueIndex = state.queuedTurns.findIndex((turn) => turn.id === queueId)
+  if (queueIndex < 0) {
+    throw new HttpError(410, "Queued message is no longer pending.")
+  }
+  const queuedTurn = state.queuedTurns[queueIndex]
+  const expectedTurnId =
+    state.turnId ?? (await resolveInFlightTurnId(state.runtime, threadId))
+  if (!expectedTurnId) {
+    throw new HttpError(409, "The active turn has not published a turn id yet.")
+  }
+
+  const preference = await getThreadPreference(threadId)
+  const collaborationSettings = await resolveCollaborationModeSettings(
+    state.runtime,
+    preference?.model ?? null,
+    (preference?.reasoningEffort as CodexReasoningEffort | null) ?? null,
+  )
+  const response = await steerCodexTurn(
+    state.runtime,
+    {
+      expectedTurnId,
+      threadId,
+      ...turnSteerModeOverrides(queuedTurn.collaborationMode, collaborationSettings),
+    },
+    queuedTurn.content,
+    queuedTurn.attachments,
+  )
+
+  state.turnId = getTurnId(response) ?? expectedTurnId
+  state.queuedTurns.splice(queueIndex, 1)
+  const steeredAt = new Date()
+  const updated = updateRuntimeMessage(threadId, queuedTurn.messageId, {
+    completedAt: steeredAt,
+    metadataPatch: {
+      delivery: "steer",
+      queueStatus: "steered",
+      runId: state.runId ?? null,
+      steeredAt: steeredAt.toISOString(),
+    },
+    turnId: state.turnId,
+  })
+  if (!updated) {
+    throw new HttpError(410, "Queued message is no longer available.")
+  }
+
+  emit(threadId, "chat.updated", await getChat(threadId))
+  emit(threadId, "message.updated", updated)
+  return updated
+}
+
 export function readInMemoryThreadStatus(threadId: string): ChatResponse["status"] {
   const status = runtimeStates.get(threadId)?.status
   return status === "RUNNING" || status === "QUEUED" ? "RUNNING" : "IDLE"

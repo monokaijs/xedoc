@@ -27,6 +27,7 @@ import {
   clearCodexAccountInvalidated,
   codexRuntimeService,
   ensureAccountCodexHome,
+  ensureCodexSharedPersonalizationFile,
   resolveAccountCodexHome,
 } from "./codex-runtime.server"
 import { prisma } from "./prisma.server"
@@ -56,7 +57,6 @@ type LocalCodexAuthSnapshot = {
   fingerprint: string
 }
 
-const PERSONALIZATION_FILE_NAME = "AGENTS.md"
 const PERSONALIZATION_MAX_BYTES = 32 * 1024
 const ACCOUNT_AUTH_FILE_NAME = "auth.json"
 const ACCOUNT_AUTH_MAX_BYTES = 256 * 1024
@@ -285,12 +285,9 @@ export async function updateAccountRuntimeSettings(
   )
 }
 
-export async function getAccountPersonalization(
-  accountId: string,
-): Promise<AccountPersonalizationResponse> {
-  await getAccount(accountId)
-  const codexHome = ensureAccountCodexHome(accountId)
-  const instructionsPath = join(codexHome, PERSONALIZATION_FILE_NAME)
+export async function getSharedAccountPersonalization(): Promise<AccountPersonalizationResponse> {
+  const { codexHome, instructionsPath } = ensureCodexSharedPersonalizationFile()
+  await prepareAllAccountCodexHomes()
 
   let instructions = ""
   try {
@@ -302,22 +299,31 @@ export async function getAccountPersonalization(
   }
 
   return {
-    accountId,
+    accountId: null,
     codexHome,
     instructionsPath,
     instructions,
     maxBytes: PERSONALIZATION_MAX_BYTES,
+    shared: true,
   }
 }
 
-export async function updateAccountPersonalization(
+export async function getAccountPersonalization(
   accountId: string,
+): Promise<AccountPersonalizationResponse> {
+  await getAccount(accountId)
+  return {
+    ...(await getSharedAccountPersonalization()),
+    accountId,
+  }
+}
+
+export async function updateSharedAccountPersonalization(
   dto: UpdateAccountPersonalizationRequest,
 ): Promise<AccountPersonalizationResponse> {
   const instructions = normalizePersonalizationInstructions(dto.instructions)
-  await getAccount(accountId)
-  const codexHome = ensureAccountCodexHome(accountId)
-  const instructionsPath = join(codexHome, PERSONALIZATION_FILE_NAME)
+  const { codexHome, instructionsPath } = ensureCodexSharedPersonalizationFile()
+  await prepareAllAccountCodexHomes()
 
   writeFileSync(instructionsPath, instructions, {
     encoding: "utf8",
@@ -326,11 +332,23 @@ export async function updateAccountPersonalization(
   chmodSync(instructionsPath, 0o600)
 
   return {
-    accountId,
+    accountId: null,
     codexHome,
     instructionsPath,
     instructions,
     maxBytes: PERSONALIZATION_MAX_BYTES,
+    shared: true,
+  }
+}
+
+export async function updateAccountPersonalization(
+  accountId: string,
+  dto: UpdateAccountPersonalizationRequest,
+): Promise<AccountPersonalizationResponse> {
+  await getAccount(accountId)
+  return {
+    ...(await updateSharedAccountPersonalization(dto)),
+    accountId,
   }
 }
 
@@ -1200,6 +1218,12 @@ function prepareAccountCodexHomes(accounts: Pick<CodexAccount, "id">[]) {
   for (const account of accounts) {
     prepareAccountCodexHome(account.id)
   }
+}
+
+async function prepareAllAccountCodexHomes() {
+  prepareAccountCodexHomes(
+    await prisma.codexAccount.findMany({ select: { id: true } }),
+  )
 }
 
 function prepareAccountCodexHome(accountId: string): void {
