@@ -49,7 +49,7 @@ import {
   updateAccountRuntimeSettings,
   updateChat,
 } from "@/lib/api"
-import { applyChatEvent, highestSequence } from "@/lib/chat-events"
+import { applyChatEvent, mergeMessagePage } from "@/lib/chat-events"
 import { connectChatEventSocket } from "@/lib/socket"
 import { cn } from "@/lib/utils"
 import { useShellContext } from "@/screens/shell-context"
@@ -143,6 +143,11 @@ export function ChatDetailPane() {
     enabled: !!chatId,
     queryKey: messagesQueryKey,
     queryFn: () => getChatMessages(session, chatId!, 0),
+    structuralSharing: (previous, next) =>
+      mergeMessagePage(
+        previous as MessagePageResponse | undefined,
+        next as MessagePageResponse,
+      ),
   })
   const contextQuery = useQuery({
     enabled: !!chatId && !contextWindowUsage,
@@ -504,12 +509,11 @@ export function ChatDetailPane() {
       onError: (caught) => toast.error(readError(caught)),
       onEvent: applyEvent,
       onOpen: () => {
-        const page =
-          queryClient.getQueryData<MessagePageResponse>(messagesQueryKey)
-        void getChatMessages(session, chatId, highestSequence(page))
+        void getChatMessages(session, chatId, 0)
           .then((next) => {
-            next.data.forEach((message) =>
-              applyEvent("message.created", message),
+            queryClient.setQueryData<MessagePageResponse | undefined>(
+              messagesQueryKey,
+              (page) => mergeMessagePage(page, next),
             )
           })
           .catch((caught) => toast.error(readError(caught)))

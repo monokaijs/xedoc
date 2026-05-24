@@ -44,3 +44,95 @@ export function applyChatEvent<TType extends ChatEventType>(
 export function highestSequence(page: MessagePageResponse | undefined): number {
   return Math.max(0, ...(page?.data.map((message) => message.sequence) ?? []))
 }
+
+export function mergeMessagePage(
+  previous: MessagePageResponse | undefined,
+  next: MessagePageResponse,
+): MessagePageResponse {
+  if (!previous?.data.length) {
+    return next
+  }
+
+  const merged = [...next.data]
+  for (const message of previous.data) {
+    if (!messageIsRepresented(message, merged)) {
+      merged.push(message)
+    }
+  }
+
+  const nextCursor = Math.max(
+    0,
+    previous.nextCursor ?? 0,
+    next.nextCursor ?? 0,
+    ...merged.map((message) => message.sequence),
+  )
+
+  return {
+    data: merged.sort(compareMessages),
+    nextCursor: nextCursor || null,
+  }
+}
+
+function messageIsRepresented(
+  candidate: ChatMessageResponse,
+  messages: ChatMessageResponse[],
+): boolean {
+  return messages.some(
+    (message) =>
+      message.id === candidate.id ||
+      messagesRepresentSameEntry(message, candidate),
+  )
+}
+
+function messagesRepresentSameEntry(
+  next: ChatMessageResponse,
+  previous: ChatMessageResponse,
+): boolean {
+  if (
+    next.chatId !== previous.chatId ||
+    next.role !== previous.role ||
+    next.kind !== previous.kind
+  ) {
+    return false
+  }
+
+  if (next.requestId && previous.requestId) {
+    return next.requestId === previous.requestId
+  }
+  if (next.itemId && previous.itemId) {
+    return next.itemId === previous.itemId
+  }
+
+  if (next.kind !== "CHAT") {
+    return false
+  }
+
+  const nextContent = normalizedContent(next.content)
+  const previousContent = normalizedContent(previous.content)
+  if (!nextContent || !previousContent) {
+    return false
+  }
+  if (nextContent === previousContent) {
+    return true
+  }
+  return isActive(previous) && nextContent.includes(previousContent)
+}
+
+function normalizedContent(value: string): string {
+  return value.replace(/\s+/g, " ").trim()
+}
+
+function isActive(message: ChatMessageResponse): boolean {
+  return message.status === "PENDING" || message.status === "STREAMING"
+}
+
+function compareMessages(
+  left: ChatMessageResponse,
+  right: ChatMessageResponse,
+): number {
+  return (
+    left.sequence - right.sequence ||
+    new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime() ||
+    left.id.localeCompare(right.id)
+  )
+}
