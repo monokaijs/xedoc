@@ -16,7 +16,9 @@ import {
   Copy,
   Download,
   ExternalLink,
+  Import,
   KeyRound,
+  Laptop,
   Loader2,
   MoreVertical,
   Pencil,
@@ -40,6 +42,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -67,13 +70,16 @@ import {
 import { StatusBadge } from "@/components/status-badge"
 import {
   authenticateAccount,
+  cancelAccountAuthentication,
   completeAccountLogin,
   createAccount,
   deleteAccount,
   exportAccounts,
   importAccounts,
+  importLocalCodexActiveAccount,
   killLoginCallbackPortProcess,
   readLoginCallbackPortStatus,
+  setLocalCodexActiveAccount,
   updateAccount,
 } from "@/lib/api"
 import {
@@ -298,6 +304,19 @@ export function AccountManagementPanel({
     },
   })
 
+  const cancelAuthMutation = useMutation({
+    mutationFn: (accountId: string) =>
+      cancelAccountAuthentication(session, accountId),
+    onError: (caught) => toast.error(readError(caught)),
+    onSuccess: (account) => {
+      closeAuthPopup()
+      setAuthDialog(null)
+      setCallbackUrl("")
+      toast.success(`Canceled authentication for ${account.displayName}.`)
+      void invalidateAccounts()
+    },
+  })
+
   const completeLoginMutation = useMutation({
     mutationFn: ({
       accountId,
@@ -380,6 +399,28 @@ export function AccountManagementPanel({
         response.authentications,
         variables.popup,
       )
+    },
+  })
+
+  const localImportMutation = useMutation({
+    mutationFn: () => importLocalCodexActiveAccount(session),
+    onError: (caught) => toast.error(readError(caught)),
+    onSuccess: (response) => {
+      toast.success(
+        `Imported ${response.imported} local ${accountLabel(response.imported)}.`,
+      )
+      void invalidateAccounts()
+      void queryClient.invalidateQueries({ queryKey: ["chats"] })
+    },
+  })
+
+  const setLocalActiveMutation = useMutation({
+    mutationFn: (accountId: string) =>
+      setLocalCodexActiveAccount(session, accountId),
+    onError: (caught) => toast.error(readError(caught)),
+    onSuccess: (account) => {
+      toast.success(`${account.displayName} is now active in local Codex.`)
+      void invalidateAccounts()
     },
   })
 
@@ -570,8 +611,8 @@ export function AccountManagementPanel({
             onRefresh={() => void callbackPortQuery.refetch()}
           />
 
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="relative min-w-64 flex-1">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="relative min-w-0 flex-1 sm:min-w-64">
               <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
               <Input
                 className="pl-8"
@@ -580,7 +621,7 @@ export function AccountManagementPanel({
                 onChange={(event) => setAccountSearch(event.target.value)}
               />
             </div>
-            <div className="flex flex-wrap gap-2">
+            <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:justify-end">
               <input
                 ref={importInputRef}
                 accept="application/json,.json"
@@ -589,6 +630,7 @@ export function AccountManagementPanel({
                 onChange={handleImportFile}
               />
               <Button
+                className="w-full sm:w-auto"
                 disabled={importMutation.isPending}
                 variant="outline"
                 onClick={() => importInputRef.current?.click()}
@@ -601,6 +643,7 @@ export function AccountManagementPanel({
                 Import
               </Button>
               <Button
+                className="w-full sm:w-auto"
                 disabled={exportMutation.isPending}
                 variant="outline"
                 onClick={() => exportMutation.mutate()}
@@ -613,8 +656,8 @@ export function AccountManagementPanel({
                 Export
               </Button>
               <DropdownMenu open={addMenuOpen} onOpenChange={setAddMenuOpen}>
-                <DropdownMenuTrigger render={<Button />}>
-                {createMutation.isPending ? (
+                <DropdownMenuTrigger render={<Button className="w-full sm:w-auto" />}>
+                {createMutation.isPending || localImportMutation.isPending ? (
                   <Loader2 className="animate-spin" />
                 ) : (
                   <Plus />
@@ -637,67 +680,90 @@ export function AccountManagementPanel({
                     <KeyRound />
                     Device Auth
                   </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    disabled={localImportMutation.isPending}
+                    onClick={() => {
+                      setAddMenuOpen(false)
+                      localImportMutation.mutate()
+                    }}
+                  >
+                    {localImportMutation.isPending ? (
+                      <Loader2 className="animate-spin" />
+                    ) : (
+                      <Import />
+                    )}
+                    Import Local
+                  </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
           </div>
 
-          <div className="overflow-x-auto rounded-md border bg-background">
-            <table className="w-full min-w-[720px] text-sm">
-              <thead className="border-b bg-muted/40 text-xs text-muted-foreground">
-                <tr>
-                  <th className="px-3 py-2 text-left font-medium">Account</th>
-                  <th className="px-3 py-2 text-left font-medium">Quota</th>
-                  <th className="w-12 px-3 py-2 text-right font-medium">
-                    <span className="sr-only">Actions</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredAccounts.length ? (
-                  filteredAccounts.map((account) => (
-                    <AccountTableEntry
-                      account={account}
-                      authPending={
-                        authMutation.isPending &&
-                        authMutation.variables?.accountId === account.id
-                      }
-                      authPendingMode={authMutation.variables?.mode ?? "browser"}
-                      key={account.id}
-                      quotaLabel={accountUsageSummaries[account.id]}
-                      quotaPending={!!accountRateLimitFetching[account.id]}
-                      quotaSnapshot={accountRateLimitSnapshots[account.id]}
-                      onDelete={() => setDeleteTarget(account)}
-                      onEdit={() => startEditing(account)}
-                      onAuthenticate={(mode) => startAuthentication(account.id, mode)}
-                      onShowAuthentication={() =>
-                        showAuthenticationDialogForAccount(account)
-                      }
-                    />
-                  ))
-                ) : (
-                  <tr>
-                    <td className="px-3 py-8 text-center text-sm text-muted-foreground" colSpan={3}>
-                      {accounts.length
-                        ? "No accounts match the current search."
-                        : "No accounts yet. Add an account or import account records."}
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+          <div className="grid gap-2">
+            {filteredAccounts.length ? (
+              filteredAccounts.map((account) => (
+                <AccountCardEntry
+                  account={account}
+                  authPending={
+                    authMutation.isPending &&
+                    authMutation.variables?.accountId === account.id
+                  }
+                  authPendingMode={authMutation.variables?.mode ?? "browser"}
+                  cancelPending={
+                    cancelAuthMutation.isPending &&
+                    cancelAuthMutation.variables === account.id
+                  }
+                  key={account.id}
+                  localActivePending={
+                    setLocalActiveMutation.isPending &&
+                    setLocalActiveMutation.variables === account.id
+                  }
+                  quotaLabel={accountUsageSummaries[account.id]}
+                  quotaPending={!!accountRateLimitFetching[account.id]}
+                  quotaSnapshot={accountRateLimitSnapshots[account.id]}
+                  onDelete={() => setDeleteTarget(account)}
+                  onEdit={() => startEditing(account)}
+                  onAuthenticate={(mode) => startAuthentication(account.id, mode)}
+                  onCancelAuthentication={() =>
+                    cancelAuthMutation.mutate(account.id)
+                  }
+                  onSetLocalActive={() =>
+                    setLocalActiveMutation.mutate(account.id)
+                  }
+                  onShowAuthentication={() =>
+                    showAuthenticationDialogForAccount(account)
+                  }
+                />
+              ))
+            ) : (
+              <div className="rounded-md border bg-background px-3 py-8 text-center text-sm text-muted-foreground">
+                {accounts.length
+                  ? "No accounts match the current search."
+                  : "No accounts yet. Add an account or import account records."}
+              </div>
+            )}
           </div>
         </section>
       </div>
 
       <AuthenticationDialog
         callbackUrl={callbackUrl}
+        cancelPending={
+          cancelAuthMutation.isPending &&
+          cancelAuthMutation.variables === authDialog?.accountId
+        }
         completePending={completeLoginMutation.isPending}
         state={authDialog}
         onCallbackUrlChange={setCallbackUrl}
         onClose={() => {
           setAuthDialog(null)
           setCallbackUrl("")
+        }}
+        onCancelAuthentication={() => {
+          if (authDialog?.accountId) {
+            cancelAuthMutation.mutate(authDialog.accountId)
+          }
         }}
         onComplete={() => {
           if (authDialog?.accountId) {
@@ -864,18 +930,22 @@ function AccountForm({
 
 function AuthenticationDialog({
   callbackUrl,
+  cancelPending,
   completePending,
   state,
   onCallbackUrlChange,
+  onCancelAuthentication,
   onClose,
   onComplete,
   onCopyDeviceCode,
   onReopen,
 }: {
   callbackUrl: string
+  cancelPending: boolean
   completePending: boolean
   state: AuthenticationDialogState | null
   onCallbackUrlChange: (value: string) => void
+  onCancelAuthentication: () => void
   onClose: () => void
   onComplete: () => void
   onCopyDeviceCode: () => void
@@ -984,6 +1054,20 @@ function AuthenticationDialog({
             <X />
             Close
           </Button>
+          {state?.status === "AUTHENTICATING" ? (
+            <Button
+              disabled={!state.accountId || cancelPending}
+              variant="destructive"
+              onClick={onCancelAuthentication}
+            >
+              {cancelPending ? (
+                <Loader2 className="animate-spin" />
+              ) : (
+                <X />
+              )}
+              Cancel Auth
+            </Button>
+          ) : null}
           <Button
             disabled={!state?.authUrl}
             variant="secondary"
@@ -1073,27 +1157,35 @@ function LoginCallbackPortWarning({
   )
 }
 
-function AccountTableEntry({
+function AccountCardEntry({
   account,
   authPending,
   authPendingMode,
+  cancelPending,
+  localActivePending,
   quotaLabel,
   quotaPending,
   quotaSnapshot,
   onAuthenticate,
+  onCancelAuthentication,
   onDelete,
   onEdit,
+  onSetLocalActive,
   onShowAuthentication,
 }: {
   account: AccountResponse
   authPending: boolean
   authPendingMode: AccountAuthMode
+  cancelPending: boolean
+  localActivePending: boolean
   quotaLabel?: string
   quotaPending: boolean
   quotaSnapshot?: CodexRateLimitSnapshot
   onAuthenticate: (mode: AccountAuthMode) => void
+  onCancelAuthentication: () => void
   onDelete: () => void
   onEdit: () => void
+  onSetLocalActive: () => void
   onShowAuthentication: () => void
 }) {
   const pendingAccountAuthMode =
@@ -1107,86 +1199,179 @@ function AccountTableEntry({
       : account.status === "CONNECTED"
         ? "Re-authenticate"
         : "Authenticate"
+  const canSetLocalActive =
+    account.status === "CONNECTED" && !account.isLocalCodexActive
+  const authenticatingLabel =
+    pendingAccountAuthMode === "device"
+      ? "Device login pending"
+      : "Browser login pending"
 
   return (
-    <tr className="border-b last:border-b-0">
-      <td className="px-3 py-3 align-top">
-        <div className="grid gap-1.5">
-          <div className="font-medium">{account.displayName}</div>
-          <div className="flex flex-wrap items-center gap-2">
+    <div
+      className={cn(
+        "rounded-md border bg-background px-3 py-3 text-sm",
+        account.isLocalCodexActive &&
+          "border-primary/40 bg-primary/5 dark:bg-primary/10",
+      )}
+    >
+      <div className="grid gap-3">
+        <div className="flex min-w-0 items-start justify-between gap-3">
+          <div className="grid min-w-0 gap-1.5">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <div className="min-w-0 max-w-full truncate font-medium">
+                {account.displayName}
+              </div>
+              <AccountPlanBadge planType={quotaSnapshot?.planType} />
+              {account.isLocalCodexActive ? <LocalCodexActiveBadge /> : null}
+            </div>
+            <div className="truncate text-xs text-muted-foreground">
+              {formatAccountCommand(account)}
+            </div>
+          </div>
+
+          <div className="flex shrink-0 items-center gap-2">
             <AccountStatusBadge account={account} />
+            <DropdownMenu>
+              <DropdownMenuTrigger render={<Button size="icon-sm" variant="ghost" />}>
+                {authPending || cancelPending || localActivePending ? (
+                  <Loader2 className="animate-spin" />
+                ) : (
+                  <MoreVertical />
+                )}
+                <span className="sr-only">Account actions</span>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-48">
+                <DropdownMenuItem
+                  disabled={authPending}
+                  onClick={() => onAuthenticate(authMode)}
+                >
+                  {browserAuthPending ? (
+                    <Loader2 className="animate-spin" />
+                  ) : account.status === "AUTHENTICATING" ? (
+                    <RotateCw />
+                  ) : (
+                    <ExternalLink />
+                  )}
+                  {account.status === "AUTHENTICATING" ? authLabel : "Normal Auth"}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  disabled={authPending}
+                  onClick={() => onAuthenticate("device")}
+                >
+                  {deviceAuthPending ? (
+                    <Loader2 className="animate-spin" />
+                  ) : (
+                    <KeyRound />
+                  )}
+                  Device Auth
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  disabled={!canSetLocalActive || localActivePending}
+                  onClick={onSetLocalActive}
+                >
+                  {localActivePending ? (
+                    <Loader2 className="animate-spin" />
+                  ) : (
+                    <Laptop />
+                  )}
+                  {account.isLocalCodexActive
+                    ? "Local Active"
+                    : "Make Local Active"}
+                </DropdownMenuItem>
+                {account.status === "AUTHENTICATING" ? (
+                  <DropdownMenuItem
+                    disabled={cancelPending}
+                    variant="destructive"
+                    onClick={onCancelAuthentication}
+                  >
+                    {cancelPending ? (
+                      <Loader2 className="animate-spin" />
+                    ) : (
+                      <X />
+                    )}
+                    Cancel Auth
+                  </DropdownMenuItem>
+                ) : null}
+                {account.status === "AUTHENTICATING" || account.lastAuthUrl ? (
+                  <DropdownMenuItem onClick={onShowAuthentication}>
+                    <ExternalLink />
+                    Authentication Details
+                  </DropdownMenuItem>
+                ) : null}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={onEdit}>
+                  <Pencil />
+                  Edit
+                </DropdownMenuItem>
+                <DropdownMenuItem variant="destructive" onClick={onDelete}>
+                  <Trash2 />
+                  Delete
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+
+        <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+          <div className="grid min-w-0 gap-1.5">
+            <QuotaSummary
+              accountStatus={account.status}
+              label={quotaLabel}
+              pending={quotaPending}
+              snapshot={quotaSnapshot}
+            />
             {account.status === "AUTHENTICATING" ? (
               <span className="text-xs text-muted-foreground">
-                {pendingAccountAuthMode === "device"
-                  ? "Device login pending"
-                  : "Browser login pending"}
+                {authenticatingLabel}
               </span>
             ) : null}
           </div>
+          {account.status === "AUTHENTICATING" ? (
+            <Button
+              className="min-w-0 sm:w-auto"
+              disabled={cancelPending}
+              size="sm"
+              variant="destructive"
+              onClick={onCancelAuthentication}
+            >
+              {cancelPending ? (
+                <Loader2 className="animate-spin" />
+              ) : (
+                <X />
+              )}
+              Cancel
+            </Button>
+          ) : null}
         </div>
-      </td>
-      <td className="px-3 py-3 align-top">
-        <QuotaSummary
-          accountStatus={account.status}
-          label={quotaLabel}
-          pending={quotaPending}
-          snapshot={quotaSnapshot}
-        />
-      </td>
-      <td className="px-3 py-3 text-right align-top">
-        <DropdownMenu>
-          <DropdownMenuTrigger render={<Button size="icon-sm" variant="ghost" />}>
-            {authPending ? (
-              <Loader2 className="animate-spin" />
-            ) : (
-              <MoreVertical />
-            )}
-            <span className="sr-only">Account actions</span>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-48">
-            <DropdownMenuItem
-              disabled={authPending}
-              onClick={() => onAuthenticate(authMode)}
-            >
-              {browserAuthPending ? (
-                <Loader2 className="animate-spin" />
-              ) : account.status === "AUTHENTICATING" ? (
-                <RotateCw />
-              ) : (
-                <ExternalLink />
-              )}
-              {account.status === "AUTHENTICATING" ? authLabel : "Normal Auth"}
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              disabled={authPending}
-              onClick={() => onAuthenticate("device")}
-            >
-              {deviceAuthPending ? (
-                <Loader2 className="animate-spin" />
-              ) : (
-                <KeyRound />
-              )}
-              Device Auth
-            </DropdownMenuItem>
-            {account.status === "AUTHENTICATING" || account.lastAuthUrl ? (
-              <DropdownMenuItem onClick={onShowAuthentication}>
-                <ExternalLink />
-                Authentication Details
-              </DropdownMenuItem>
-            ) : null}
-            <DropdownMenuSeparator />
-            <DropdownMenuItem onClick={onEdit}>
-              <Pencil />
-              Edit
-            </DropdownMenuItem>
-            <DropdownMenuItem variant="destructive" onClick={onDelete}>
-              <Trash2 />
-              Delete
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </td>
-    </tr>
+      </div>
+    </div>
+  )
+}
+
+function AccountPlanBadge({ planType }: { planType?: string | null }) {
+  if (!planType) {
+    return null
+  }
+
+  return (
+    <Badge
+      className="border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-900/70 dark:bg-emerald-950/35 dark:text-emerald-300"
+      variant="outline"
+    >
+      {formatPlanType(planType)}
+    </Badge>
+  )
+}
+
+function LocalCodexActiveBadge() {
+  return (
+    <Badge
+      className="border-sky-300 bg-sky-50 text-sky-700 dark:border-sky-900/70 dark:bg-sky-950/35 dark:text-sky-300"
+      variant="outline"
+    >
+      <Laptop />
+      local active
+    </Badge>
   )
 }
 
@@ -1249,11 +1434,6 @@ function QuotaSummary({
         {pending ? <Loader2 className="size-3 animate-spin" /> : null}
         <span>{effectiveLabel}</span>
       </div>
-      {snapshot?.planType ? (
-        <div className="text-xs text-muted-foreground">
-          {formatPlanType(snapshot.planType)}
-        </div>
-      ) : null}
     </div>
   )
 }
@@ -1320,6 +1500,10 @@ function formatEnvironment(
   environment: AccountResponse["environment"],
 ): string {
   return environment ? JSON.stringify(environment, null, 2) : ""
+}
+
+function formatAccountCommand(account: AccountResponse): string {
+  return [account.command, ...account.args].filter(Boolean).join(" ")
 }
 
 function filterAccounts(

@@ -20,8 +20,16 @@ export default [
   route("api/accounts/export", "routes/api.accounts.export.ts"),
   route("api/accounts/import", "routes/api.accounts.import.ts"),
   route(
+    "api/accounts/import-local-active",
+    "routes/api.accounts.import-local-active.ts",
+  ),
+  route(
     "api/accounts/login-callback-port",
     "routes/api.accounts.login-callback-port.ts",
+  ),
+  route(
+    "api/accounts/:accountId/local-active",
+    "routes/api.accounts.$accountId.local-active.ts",
   ),
   route("api/accounts/:accountId", "routes/api.accounts.$accountId.ts"),
   route(

@@ -1,5 +1,5 @@
 import { verifyRequest } from "@/server/auth.server"
-import { authenticateAccount } from "@/server/accounts.server"
+import { authenticateAccount, cancelAuthentication } from "@/server/accounts.server"
 import {
   handleRouteError,
   HttpError,
@@ -18,12 +18,16 @@ type RouteArgs = {
 
 export async function action({ request, params }: RouteArgs) {
   try {
-    requireMethod(request, ["POST"])
+    requireMethod(request, ["POST", "DELETE"])
     await verifyRequest(request)
+    const accountId = requireParam(params, "accountId")
+    if (request.method === "DELETE") {
+      return jsonResponse(await cancelAuthentication(accountId))
+    }
     const body = await readJsonBody<AuthenticateAccountRequest>(request)
     return jsonResponse(
       await authenticateAccount(
-        requireParam(params, "accountId"),
+        accountId,
         readAccountAuthMode(body.mode),
       ),
     )

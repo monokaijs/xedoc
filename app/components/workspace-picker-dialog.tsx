@@ -3,6 +3,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   Check,
   ChevronRight,
+  Eye,
+  EyeOff,
   File,
   Folder,
   FolderPlus,
@@ -246,6 +248,10 @@ export function WorkspacePickerDialog({
               </IconButton>
 
               <div className="ml-auto flex min-w-0 items-center gap-2">
+                <PathVisibilityButton
+                  showPath={showPath}
+                  onClick={() => setShowPath((value) => !value)}
+                />
                 <div className="relative hidden min-w-0 sm:block">
                   <Search className="pointer-events-none absolute left-2 top-1.5 size-4 text-muted-foreground" />
                   <Input
@@ -255,15 +261,6 @@ export function WorkspacePickerDialog({
                     onChange={(event) => setFilter(event.target.value)}
                   />
                 </div>
-                <Button
-                  className="h-7 px-2 text-xs"
-                  size="sm"
-                  type="button"
-                  variant="ghost"
-                  onClick={() => setShowPath((value) => !value)}
-                >
-                  {showPath ? "Hide path" : "Show path"}
-                </Button>
               </div>
             </div>
 
@@ -287,14 +284,20 @@ export function WorkspacePickerDialog({
               </div>
             ) : null}
 
-            <div className="relative sm:hidden">
-              <Search className="pointer-events-none absolute left-2 top-1.5 size-4 text-muted-foreground" />
-              <Input
-                className="h-7 border-border/70 bg-muted/40 pl-7 text-xs"
-                placeholder="Filter"
-                value={filter}
-                onChange={(event) => setFilter(event.target.value)}
+            <div className="flex min-w-0 items-center gap-2 sm:hidden">
+              <PathVisibilityButton
+                showPath={showPath}
+                onClick={() => setShowPath((value) => !value)}
               />
+              <div className="relative min-w-0 flex-1">
+                <Search className="pointer-events-none absolute left-2 top-1.5 size-4 text-muted-foreground" />
+                <Input
+                  className="h-7 border-border/70 bg-muted/40 pl-7 text-xs"
+                  placeholder="Filter"
+                  value={filter}
+                  onChange={(event) => setFilter(event.target.value)}
+                />
+              </div>
             </div>
           </div>
 
@@ -677,20 +680,41 @@ function FileRow({
   )
 }
 
+function PathVisibilityButton({
+  onClick,
+  showPath,
+}: {
+  onClick: () => void
+  showPath: boolean
+}) {
+  return (
+    <IconButton
+      label={showPath ? "Hide path" : "Show path"}
+      pressed={showPath}
+      onClick={onClick}
+    >
+      {showPath ? <Eye /> : <EyeOff />}
+    </IconButton>
+  )
+}
+
 function IconButton({
   children,
   disabled,
   label,
   onClick,
+  pressed,
 }: {
   children: ReactNode
   disabled?: boolean
   label: string
   onClick: () => void
+  pressed?: boolean
 }) {
   return (
     <Button
-      className="size-7 p-0"
+      aria-pressed={pressed}
+      className={cn("size-7 p-0", pressed && "bg-muted text-foreground")}
       disabled={disabled}
       size="icon"
       title={label}

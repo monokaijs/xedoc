@@ -32,6 +32,7 @@ export interface AccountResponse {
   id: string;
   displayName: string;
   status: AccountStatus;
+  isLocalCodexActive?: boolean;
   command: string;
   args: string[];
   environment?: Record<string, string> | null;

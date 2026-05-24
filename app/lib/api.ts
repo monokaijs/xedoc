@@ -140,6 +140,16 @@ export async function importAccounts(
   )
 }
 
+export async function importLocalCodexActiveAccount(
+  session: ApiSession,
+): Promise<ImportAccountsResponse> {
+  return fetchJson<ImportAccountsResponse>(
+    session.serverUrl,
+    "/api/accounts/import-local-active",
+    { body: {}, token: session.token },
+  )
+}
+
 export async function readLoginCallbackPortStatus(
   session: ApiSession,
 ): Promise<LoginCallbackPortStatus> {
@@ -252,6 +262,17 @@ export async function deleteAccount(
   )
 }
 
+export async function setLocalCodexActiveAccount(
+  session: ApiSession,
+  accountId: string,
+): Promise<AccountResponse> {
+  return fetchJson<AccountResponse>(
+    session.serverUrl,
+    `/api/accounts/${accountId}/local-active`,
+    { body: {}, token: session.token },
+  )
+}
+
 export async function authenticateAccount(
   session: ApiSession,
   accountId: string,
@@ -261,6 +282,17 @@ export async function authenticateAccount(
     session.serverUrl,
     `/api/accounts/${accountId}/authenticate`,
     { body, token: session.token },
+  )
+}
+
+export async function cancelAccountAuthentication(
+  session: ApiSession,
+  accountId: string,
+): Promise<AccountResponse> {
+  return fetchJson<AccountResponse>(
+    session.serverUrl,
+    `/api/accounts/${accountId}/authenticate`,
+    { method: "DELETE", token: session.token },
   )
 }
 

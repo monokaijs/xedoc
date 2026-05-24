@@ -1,6 +1,8 @@
 import { Prisma, type CodexAccount } from "@prisma/client"
-import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
+import { createHash } from "node:crypto"
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join, resolve } from "node:path"
 import type {
   AccountAuthMode,
   AccountAuthExport,
@@ -48,6 +50,12 @@ type NormalizedImportAccount = Required<
   id?: string
 }
 
+type LocalCodexAuthSnapshot = {
+  authJson: JsonObject
+  email: string | null
+  fingerprint: string
+}
+
 const PERSONALIZATION_FILE_NAME = "AGENTS.md"
 const PERSONALIZATION_MAX_BYTES = 32 * 1024
 const ACCOUNT_AUTH_FILE_NAME = "auth.json"
@@ -75,7 +83,24 @@ export async function listAccounts() {
     orderBy: { createdAt: "asc" },
   })
   prepareAccountCodexHomes(accounts)
-  return accounts
+  return serializeAccountsWithLocalCodexActive(
+    await reconcileAuthenticatingAccounts(accounts),
+  )
+}
+
+async function reconcileAuthenticatingAccounts(accounts: CodexAccount[]) {
+  return Promise.all(
+    accounts.map(async (account) => {
+      if (account.status !== "AUTHENTICATING" || !accountHasAuthFile(account.id)) {
+        return account
+      }
+      codexRuntimeService.stopRuntime(account.id)
+      return prisma.codexAccount.update({
+        where: { id: account.id },
+        data: connectedAccountAuthData(account.id),
+      })
+    }),
+  )
 }
 
 export async function exportAccounts(): Promise<AccountExportDocument> {
@@ -161,6 +186,39 @@ export async function importAccounts(
     ),
     authentications,
   }
+}
+
+export async function importLocalCodexActiveAccount(): Promise<ImportAccountsResponse> {
+  const localAuth = readDefaultLocalCodexAuthSnapshot({ required: true })
+  const existing = await findAccountMatchingLocalCodexAuth(localAuth)
+  const account = existing
+    ? await replaceAccountAuthWithLocalCodexAuth(existing, localAuth)
+    : await createAccountFromLocalCodexAuth(localAuth)
+
+  return {
+    imported: 1,
+    accounts: [serializeAccount(account, true)],
+    authentications: [
+      {
+        accountId: account.id,
+        status: "CONNECTED",
+        authMode: null,
+        authUrl: null,
+        verificationUrl: null,
+        userCode: null,
+        message: "Imported the active local Codex account.",
+      },
+    ],
+  }
+}
+
+export async function setLocalCodexActiveAccount(
+  accountId: string,
+): Promise<AccountResponse> {
+  const account = await getAccount(accountId)
+  const authJson = readRequiredAccountAuthFile(accountId)
+  writeDefaultLocalCodexAuthFile(authJson)
+  return serializeAccount(account, true)
 }
 
 export async function getAccount(accountId: string) {
@@ -440,6 +498,42 @@ export async function authenticateAccount(
   }
 }
 
+export async function cancelAuthentication(
+  accountId: string,
+): Promise<AccountResponse> {
+  const account = await getAccount(accountId)
+  cancelAuthenticationWatch(accountId)
+  codexRuntimeService.stopRuntime(accountId)
+
+  if (accountHasAuthFile(accountId)) {
+    return serializeAccount(
+      await prisma.codexAccount.update({
+        where: { id: accountId },
+        data: connectedAccountAuthData(accountId),
+      }),
+      localCodexActiveAccountIds([account]).has(accountId),
+    )
+  }
+
+  if (account.status !== "AUTHENTICATING") {
+    return serializeAccount(account, localCodexActiveAccountIds([account]).has(accountId))
+  }
+
+  return serializeAccount(
+    await prisma.codexAccount.update({
+      where: { id: accountId },
+      data: {
+        status: "DISCONNECTED",
+        lastAuthUrl: null,
+        lastAuthMode: null,
+        lastAuthLoginId: null,
+        lastAuthUserCode: null,
+        lastError: null,
+      },
+    }),
+  )
+}
+
 export async function completeAuthentication(
   accountId: string,
   redirectUrl: string,
@@ -560,6 +654,7 @@ function watchAuthenticationCompletion(
   accountId: string,
   loginId: string | null,
 ) {
+  cancelAuthenticationWatch(accountId)
   let settled = false
   let unsubscribe = () => {}
   const finish = () => {
@@ -608,7 +703,12 @@ function watchAuthenticationCompletion(
     clearInterval(poll)
     clearTimeout(timeout)
     unsubscribe()
+    if (authenticationWatchCleanups.get(accountId) === cleanup) {
+      authenticationWatchCleanups.delete(accountId)
+    }
   }
+
+  authenticationWatchCleanups.set(accountId, cleanup)
 
   unsubscribe = runtime.onEvent((event) => {
     const params = asJsonObject(event.params)
@@ -628,6 +728,13 @@ function watchAuthenticationCompletion(
       finish()
     }
   })
+}
+
+const authenticationWatchCleanups = new Map<string, () => void>()
+
+function cancelAuthenticationWatch(accountId: string): void {
+  authenticationWatchCleanups.get(accountId)?.()
+  authenticationWatchCleanups.delete(accountId)
 }
 
 function connectedAccountAuthData(
@@ -744,12 +851,37 @@ function parseDefaultCodexArgs(): string[] {
 export function accountHasAuthFile(accountId: string): boolean {
   try {
     const auth = readAccountAuthFile(accountId)
-    return (
-      readString(auth.auth_mode) === "chatgpt" &&
-      (!!asJsonObject(auth.tokens) || !!readString(auth.OPENAI_API_KEY))
-    )
+    return isUsableCodexAuth(auth)
   } catch {
     return false
+  }
+}
+
+function isUsableCodexAuth(auth: JsonObject): boolean {
+  return (
+    readString(auth.auth_mode) === "chatgpt" &&
+    (!!asJsonObject(auth.tokens) || !!readString(auth.OPENAI_API_KEY))
+  )
+}
+
+function readRequiredAccountAuthFile(accountId: string): JsonObject {
+  try {
+    const auth = readAccountAuthFile(accountId)
+    if (!isUsableCodexAuth(auth)) {
+      throw new HttpError(
+        409,
+        "Authenticate this xedoc account before making it the active local Codex account.",
+      )
+    }
+    return auth
+  } catch (error) {
+    if (error instanceof HttpError) {
+      throw error
+    }
+    throw new HttpError(
+      409,
+      "Authenticate this xedoc account before making it the active local Codex account.",
+    )
   }
 }
 
@@ -803,6 +935,206 @@ function writeImportedAccountAuthFile(
     mode: 0o600,
   })
   chmodSync(join(codexHome, ACCOUNT_AUTH_FILE_NAME), 0o600)
+}
+
+function writeDefaultLocalCodexAuthFile(authJson: JsonObject): void {
+  const codexHome = resolveDefaultLocalCodexHome()
+  mkdirSync(codexHome, { recursive: true, mode: 0o700 })
+  chmodSync(codexHome, 0o700)
+  const authPath = join(codexHome, ACCOUNT_AUTH_FILE_NAME)
+  writeFileSync(authPath, `${JSON.stringify(authJson)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  })
+  chmodSync(authPath, 0o600)
+}
+
+function serializeAccountsWithLocalCodexActive(
+  accounts: CodexAccount[],
+): AccountResponse[] {
+  const activeIds = localCodexActiveAccountIds(accounts)
+  return accounts.map((account) =>
+    serializeAccount(account, activeIds.has(account.id)),
+  )
+}
+
+function localCodexActiveAccountIds(accounts: CodexAccount[]): Set<string> {
+  const localAuth = readDefaultLocalCodexAuthSnapshot({ required: false })
+  if (!localAuth) {
+    return new Set()
+  }
+
+  const accountAuths = accounts.flatMap((account) => {
+    const auth = readAccountAuthSnapshot(account.id)
+    return auth ? [{ account, auth }] : []
+  })
+  const exactMatches = accountAuths.filter(
+    (entry) => entry.auth.fingerprint === localAuth.fingerprint,
+  )
+  if (exactMatches.length) {
+    return new Set(exactMatches.map((entry) => entry.account.id))
+  }
+
+  if (!localAuth.email) {
+    return new Set()
+  }
+  return new Set(
+    accountAuths
+      .filter((entry) => entry.auth.email === localAuth.email)
+      .map((entry) => entry.account.id),
+  )
+}
+
+async function findAccountMatchingLocalCodexAuth(
+  localAuth: LocalCodexAuthSnapshot,
+): Promise<CodexAccount | null> {
+  const accounts = await prisma.codexAccount.findMany({
+    orderBy: { createdAt: "asc" },
+  })
+  const accountAuths = accounts.flatMap((account) => {
+    const auth = readAccountAuthSnapshot(account.id)
+    return auth ? [{ account, auth }] : []
+  })
+  const exactMatch = accountAuths.find(
+    (entry) => entry.auth.fingerprint === localAuth.fingerprint,
+  )
+  if (exactMatch) {
+    return exactMatch.account
+  }
+  if (!localAuth.email) {
+    return null
+  }
+  const emailMatches = accountAuths.filter(
+    (entry) => entry.auth.email === localAuth.email,
+  )
+  return emailMatches.length === 1 ? emailMatches[0].account : null
+}
+
+async function replaceAccountAuthWithLocalCodexAuth(
+  account: CodexAccount,
+  localAuth: LocalCodexAuthSnapshot,
+): Promise<CodexAccount> {
+  codexRuntimeService.stopRuntime(account.id)
+  writeImportedAccountAuthFile(account.id, { authJson: localAuth.authJson })
+  return prisma.codexAccount.update({
+    where: { id: account.id },
+    data: connectedAccountAuthData(account.id),
+  })
+}
+
+async function createAccountFromLocalCodexAuth(
+  localAuth: LocalCodexAuthSnapshot,
+): Promise<CodexAccount> {
+  const account = await prisma.codexAccount.create({
+    data: {
+      displayName: localAuth.email ?? "Local Codex account",
+      command: process.env.CODEX_COMMAND ?? "codex",
+      args: toJsonInput(parseDefaultCodexArgs()),
+      environment: toJsonInput(undefined),
+    },
+  })
+  writeImportedAccountAuthFile(account.id, { authJson: localAuth.authJson })
+  return prisma.codexAccount.update({
+    where: { id: account.id },
+    data: connectedAccountAuthData(account.id),
+  })
+}
+
+function readDefaultLocalCodexAuthSnapshot(options: {
+  required: true
+}): LocalCodexAuthSnapshot
+function readDefaultLocalCodexAuthSnapshot(options: {
+  required: false
+}): LocalCodexAuthSnapshot | null
+function readDefaultLocalCodexAuthSnapshot(options: {
+  required: boolean
+}): LocalCodexAuthSnapshot | null {
+  try {
+    const authPath = join(resolveDefaultLocalCodexHome(), ACCOUNT_AUTH_FILE_NAME)
+    const raw = readFileSync(authPath, "utf8")
+    if (Buffer.byteLength(raw, "utf8") > ACCOUNT_AUTH_MAX_BYTES) {
+      throw new HttpError(
+        400,
+        `Local Codex auth.json must be ${ACCOUNT_AUTH_MAX_BYTES} bytes or fewer.`,
+      )
+    }
+    const authJson = asJsonObject(JSON.parse(raw))
+    if (!authJson || !isUsableCodexAuth(authJson)) {
+      throw new HttpError(
+        400,
+        "Local Codex auth.json does not contain an active ChatGPT account.",
+      )
+    }
+    return authSnapshotFromJson(authJson)
+  } catch (error) {
+    if (!options.required) {
+      return null
+    }
+    if (error instanceof HttpError) {
+      throw error
+    }
+    throw new HttpError(
+      404,
+      "No active local Codex auth.json was found. Sign in with the local Codex CLI first.",
+    )
+  }
+}
+
+function readAccountAuthSnapshot(accountId: string): LocalCodexAuthSnapshot | null {
+  try {
+    const authJson = readAccountAuthFile(accountId)
+    if (!isUsableCodexAuth(authJson)) {
+      return null
+    }
+    return authSnapshotFromJson(authJson)
+  } catch {
+    return null
+  }
+}
+
+function authSnapshotFromJson(authJson: JsonObject): LocalCodexAuthSnapshot {
+  return {
+    authJson,
+    email: readAccountEmailFromAuth(authJson),
+    fingerprint: fingerprintJson(authJson),
+  }
+}
+
+function fingerprintJson(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex")
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) =>
+        `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`,
+      )
+      .join(",")}}`
+  }
+  return JSON.stringify(value)
+}
+
+function resolveDefaultLocalCodexHome(): string {
+  return resolveHomePath(
+    process.env.CODEX_LOCAL_HOME?.trim() ||
+      process.env.CODEX_HOME?.trim() ||
+      "~/.codex",
+  )
+}
+
+function resolveHomePath(path: string): string {
+  if (path === "~") {
+    return homedir()
+  }
+  if (path.startsWith("~/")) {
+    return join(homedir(), path.slice(2))
+  }
+  return resolve(path)
 }
 
 function readAccountEmailFromAuth(auth: JsonObject): string | null {
@@ -991,11 +1323,15 @@ function importedAccountData(account: NormalizedImportAccount) {
   }
 }
 
-function serializeAccount(account: CodexAccount): AccountResponse {
+function serializeAccount(
+  account: CodexAccount,
+  isLocalCodexActive = false,
+): AccountResponse {
   return {
     id: account.id,
     displayName: account.displayName,
     status: account.status,
+    isLocalCodexActive,
     command: account.command,
     args: normalizeAccountArgs(account.args),
     environment: normalizeEnvironment(account.environment),
