@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process"
-import { mkdir, readFile } from "node:fs/promises"
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -14,78 +14,54 @@ const packageJson = JSON.parse(
 
 const options = parseArgs(process.argv.slice(2))
 if (options.help) {
-  printHelp()
+  if (options.command === "service") {
+    printServiceHelp()
+  } else {
+    printHelp()
+  }
   process.exit(0)
 }
 if (options.version) {
   console.log(packageJson.version)
   process.exit(0)
 }
-
-const appHome = resolveHomePath(
-  options.home ?? process.env.XEDOC_HOME ?? "~/.xedoc",
-)
-await mkdir(appHome, { recursive: true, mode: 0o700 })
-
-const port = options.port ?? process.env.PORT ?? "6354"
-const host = options.host ?? process.env.HOST ?? "127.0.0.1"
-const accountsHome = resolveHomePath(
-  options.accountsHome ??
-    process.env.CODEX_ACCOUNTS_HOME ??
-    join(appHome, "accounts"),
-)
-const sharedChatHome = resolveHomePath(
-  options.sharedChatHome ??
-    process.env.CODEX_SHARED_CHAT_HOME ??
-    process.env.CODEX_HOME ??
-    "~/.codex",
-)
-const workspaceRoot = resolveHomePath(
-  options.workspaceRoot ?? process.env.CODEX_WORKSPACE_ROOT ?? homedir(),
-)
-const databasePath = join(workspaceRoot, ".xedoc", "xedoc.db")
-await mkdir(dirname(databasePath), { recursive: true, mode: 0o700 })
-const databaseUrl = sqliteDatabaseUrl(databasePath)
-
-const codexBin = require.resolve("@openai/codex/bin/codex.js")
-const env = {
-  ...process.env,
-  CODEX_ACCOUNTS_HOME: accountsHome,
-  CODEX_ARGS: options.codexArgs ?? process.env.CODEX_ARGS ?? `${codexBin} app-server`,
-  CODEX_COMMAND: options.codexCommand ?? process.env.CODEX_COMMAND ?? process.execPath,
-  CODEX_SHARED_CHAT_HOME: sharedChatHome,
-  CODEX_WORKSPACE_ROOT: workspaceRoot,
-  DATABASE_URL: databaseUrl,
-  HOST: host,
-  NODE_ENV: "production",
-  PORT: port,
+if (options.command === "service") {
+  await handleServiceCommand(options)
+  process.exit(0)
 }
 
-await mkdir(accountsHome, { recursive: true, mode: 0o700 })
+const runtime = resolveRuntimeOptions(options)
+await mkdir(runtime.appHome, { recursive: true, mode: 0o700 })
+await mkdir(dirname(runtime.databasePath), { recursive: true, mode: 0o700 })
+await mkdir(runtime.accountsHome, { recursive: true, mode: 0o700 })
+
 if (!options.skipPrismaGenerate) {
-  await runPrisma(["generate"], env)
+  await runPrisma(["generate"], runtime.env)
 }
 if (!options.skipSetup) {
-  await setupSqliteDatabase(env)
+  await setupSqliteDatabase(runtime.env)
 }
 
-const url = `http://${host === "0.0.0.0" ? "localhost" : host}:${port}`
+const url = `http://${runtime.host === "0.0.0.0" ? "localhost" : runtime.host}:${runtime.port}`
 console.log(`xedoc: ${url}`)
 console.log("Set the server password in your browser on first visit.")
-console.log(`Workspace root: ${workspaceRoot}`)
-console.log(`Shared chat store: ${sharedChatHome}`)
+console.log(`Workspace root: ${runtime.workspaceRoot}`)
+console.log(`Shared chat store: ${runtime.sharedChatHome}`)
 console.log("Press Ctrl+C to stop.")
 
-await runServer(env)
+await runServer(runtime.env)
 
 function parseArgs(argv) {
   const parsed = {}
+  const positional = []
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
     if (arg === "--help" || arg === "-h") {
       parsed.help = true
     } else if (arg === "--version" || arg === "-v") {
       parsed.version = true
+    } else if (arg === "--no-start") {
+      parsed.noStart = true
     } else if (arg === "--skip-setup") {
       parsed.skipSetup = true
     } else if (arg === "--skip-prisma-generate") {
@@ -98,8 +74,18 @@ function parseArgs(argv) {
       }
       assignOption(parsed, name, value)
     } else {
-      fail(`Unknown argument: ${arg}`)
+      positional.push(arg)
     }
+  }
+  if (positional.length) {
+    if (positional[0] !== "service") {
+      fail(`Unknown command: ${positional[0]}`)
+    }
+    if (positional.length > 2) {
+      fail(`Unknown service argument: ${positional[2]}`)
+    }
+    parsed.command = "service"
+    parsed.serviceAction = positional[1]
   }
   return parsed
 }
@@ -124,6 +110,9 @@ function assignOption(parsed, name, value) {
     case "--port":
       parsed.port = value
       return
+    case "--service-name":
+      parsed.serviceName = value
+      return
     case "--shared-chat-home":
       parsed.sharedChatHome = value
       return
@@ -133,6 +122,193 @@ function assignOption(parsed, name, value) {
     default:
       fail(`Unknown option: ${name}`)
   }
+}
+
+function resolveRuntimeOptions(options) {
+  const appHome = resolveHomePath(
+    options.home ?? process.env.XEDOC_HOME ?? "~/.xedoc",
+  )
+  const port = String(options.port ?? process.env.PORT ?? "6354")
+  const host = String(options.host ?? process.env.HOST ?? "127.0.0.1")
+  const accountsHome = resolveHomePath(
+    options.accountsHome ??
+      process.env.CODEX_ACCOUNTS_HOME ??
+      join(appHome, "accounts"),
+  )
+  const sharedChatHome = resolveHomePath(
+    options.sharedChatHome ??
+      process.env.CODEX_SHARED_CHAT_HOME ??
+      process.env.CODEX_HOME ??
+      "~/.codex",
+  )
+  const workspaceRoot = resolveHomePath(
+    options.workspaceRoot ?? process.env.CODEX_WORKSPACE_ROOT ?? homedir(),
+  )
+  const databasePath = join(workspaceRoot, ".xedoc", "xedoc.db")
+  const databaseUrl = sqliteDatabaseUrl(databasePath)
+  const codexBin = require.resolve("@openai/codex/bin/codex.js")
+  const codexArgs =
+    options.codexArgs ?? process.env.CODEX_ARGS ?? `${codexBin} app-server`
+  const codexCommand =
+    options.codexCommand ?? process.env.CODEX_COMMAND ?? process.execPath
+  const env = {
+    ...process.env,
+    CODEX_ACCOUNTS_HOME: accountsHome,
+    CODEX_ARGS: codexArgs,
+    CODEX_COMMAND: codexCommand,
+    CODEX_SHARED_CHAT_HOME: sharedChatHome,
+    CODEX_WORKSPACE_ROOT: workspaceRoot,
+    DATABASE_URL: databaseUrl,
+    HOST: host,
+    NODE_ENV: "production",
+    PORT: port,
+  }
+  return {
+    accountsHome,
+    appHome,
+    codexArgs,
+    codexCommand,
+    databasePath,
+    databaseUrl,
+    env,
+    host,
+    port,
+    sharedChatHome,
+    skipPrismaGenerate: !!options.skipPrismaGenerate,
+    skipSetup: !!options.skipSetup,
+    workspaceRoot,
+  }
+}
+
+async function handleServiceCommand(options) {
+  switch (options.serviceAction) {
+    case "install":
+      await installUserSystemdService(options)
+      return
+    case "uninstall":
+      await uninstallUserSystemdService(options)
+      return
+    case undefined:
+      printServiceHelp()
+      fail("Choose a service command: install or uninstall.")
+      return
+    default:
+      fail(`Unknown service command: ${options.serviceAction}`)
+  }
+}
+
+async function installUserSystemdService(options) {
+  requireLinuxSystemd()
+  const runtime = resolveRuntimeOptions(options)
+  const serviceName = normalizeServiceName(options.serviceName)
+  const unitPath = userSystemdUnitPath(serviceName)
+  await mkdir(dirname(unitPath), { recursive: true, mode: 0o700 })
+  await writeFile(unitPath, systemdUnitFile(runtime), { mode: 0o644 })
+  await runSystemctl(["daemon-reload"])
+  await runSystemctl(["enable", ...(options.noStart ? [] : ["--now"]), serviceName])
+
+  const url = `http://${runtime.host === "0.0.0.0" ? "localhost" : runtime.host}:${runtime.port}`
+  console.log(`Installed ${serviceName}.`)
+  console.log(options.noStart ? "Service is enabled but not started." : `Service is running at ${url}.`)
+  console.log(`Logs: systemctl --user status ${serviceName}`)
+  console.log(`Uninstall: xedoc service uninstall --service-name ${serviceName.replace(/\.service$/u, "")}`)
+}
+
+async function uninstallUserSystemdService(options) {
+  requireLinuxSystemd()
+  const serviceName = normalizeServiceName(options.serviceName)
+  const unitPath = userSystemdUnitPath(serviceName)
+  await runSystemctl(["disable", "--now", serviceName]).catch((error) => {
+    console.warn(
+      `Could not stop or disable ${serviceName}: ${error instanceof Error ? error.message : error}`,
+    )
+  })
+  await rm(unitPath, { force: true })
+  await runSystemctl(["daemon-reload"])
+  console.log(`Uninstalled ${serviceName}.`)
+}
+
+function requireLinuxSystemd() {
+  if (process.platform !== "linux") {
+    fail("Service install currently supports Linux user systemd services only.")
+  }
+}
+
+function normalizeServiceName(value) {
+  const name = value?.trim() || "xedoc"
+  if (!/^[A-Za-z0-9_.@-]+$/u.test(name)) {
+    fail("Service name may only contain letters, numbers, dots, underscores, @, and hyphens.")
+  }
+  return name.endsWith(".service") ? name : `${name}.service`
+}
+
+function userSystemdUnitPath(serviceName) {
+  return join(homedir(), ".config", "systemd", "user", serviceName)
+}
+
+function systemdUnitFile(runtime) {
+  const execArgs = [
+    process.execPath,
+    join(packageRoot, "bin", "xedoc.mjs"),
+    ...runtimeServiceArgs(runtime),
+  ]
+  return `[Unit]
+Description=xedoc local Codex web UI
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${execArgs.map(systemdQuoteExecArg).join(" ")}
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target
+`
+}
+
+function runtimeServiceArgs(runtime) {
+  const args = [
+    "--home",
+    runtime.appHome,
+    "--host",
+    runtime.host,
+    "--port",
+    runtime.port,
+    "--workspace-root",
+    runtime.workspaceRoot,
+    "--accounts-home",
+    runtime.accountsHome,
+    "--shared-chat-home",
+    runtime.sharedChatHome,
+    "--codex-command",
+    runtime.codexCommand,
+    "--codex-args",
+    runtime.codexArgs,
+  ]
+  if (runtime.skipSetup) {
+    args.push("--skip-setup")
+  }
+  if (runtime.skipPrismaGenerate) {
+    args.push("--skip-prisma-generate")
+  }
+  return args
+}
+
+function systemdQuoteExecArg(value) {
+  return `"${String(value)
+    .replaceAll("\\", "\\\\")
+    .replaceAll('"', '\\"')
+    .replaceAll("%", "%%")}"`
+}
+
+async function runSystemctl(args) {
+  await run("systemctl", ["--user", ...args], {
+    cwd: packageRoot,
+    env: process.env,
+    stdio: "inherit",
+  })
 }
 
 async function runPrisma(args, env) {
@@ -224,7 +400,9 @@ function printHelp() {
   console.log(`xedoc ${packageJson.version}
 
 Usage:
-  npx xedoc [options]
+  npx xedoc-cli [options]
+  xedoc service install [options]
+  xedoc service uninstall [options]
 
 Options:
   --port <port>                 Web server port. Defaults to 6354.
@@ -233,10 +411,38 @@ Options:
   --accounts-home <path>        Codex account state directory. Defaults to ~/.xedoc/accounts.
   --shared-chat-home <path>     Shared Codex chat store. Defaults to ~/.codex.
   --skip-setup                  Do not create the SQLite database schema.
+  --skip-prisma-generate        Do not regenerate Prisma Client.
   --codex-command <command>     Codex command used for new accounts.
   --codex-args <args>           Codex command arguments used for new accounts.
   --home <path>                 App data directory. Defaults to ~/.xedoc.
+  --service-name <name>         systemd user service name. Defaults to xedoc.
+  --no-start                    Enable service without starting it during install.
   --help                        Show this help.
   --version                     Print the package version.
+`)
+}
+
+function printServiceHelp() {
+  console.log(`xedoc ${packageJson.version}
+
+Usage:
+  xedoc service install [options]
+  xedoc service uninstall [options]
+
+Linux user systemd service commands:
+  install                       Write ~/.config/systemd/user/xedoc.service, reload systemd, and enable --now.
+  uninstall                     Stop, disable, and remove the user service file.
+
+Options:
+  --service-name <name>         systemd user service name. Defaults to xedoc.
+  --no-start                    Enable service without starting it during install.
+  --port <port>                 Web server port. Defaults to 6354.
+  --host <host>                 Web server host. Defaults to 127.0.0.1.
+  --workspace-root <path>       Directory tree visible in the app. Defaults to your home directory.
+  --accounts-home <path>        Codex account state directory. Defaults to ~/.xedoc/accounts.
+  --shared-chat-home <path>     Shared Codex chat store. Defaults to ~/.codex.
+  --home <path>                 App data directory. Defaults to ~/.xedoc.
+  --skip-setup                  Do not create the SQLite database schema.
+  --skip-prisma-generate        Do not regenerate Prisma Client.
 `)
 }

@@ -33,6 +33,26 @@ Common CLI options:
 - `--shared-chat-home <path>` changes where shared Codex chat sessions are stored.
 - `--skip-setup` skips SQLite schema setup.
 
+To run xedoc in the background on Linux with user systemd, install the package
+in a stable location and install the service:
+
+```bash
+npm install -g xedoc-cli
+xedoc service install --port 6354 --workspace-root ~
+```
+
+The install command writes `~/.config/systemd/user/xedoc.service`, runs
+`systemctl --user daemon-reload`, and enables the service immediately. Use
+`systemctl --user status xedoc` or `journalctl --user -u xedoc -f` to inspect
+it. If the service should start before you log in, enable user lingering with
+`loginctl enable-linger "$USER"`.
+
+To remove the background service:
+
+```bash
+xedoc service uninstall
+```
+
 For repository development:
 
 ```bash
