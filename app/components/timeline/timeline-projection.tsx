@@ -50,10 +50,13 @@ export function projectCodexRenderItems(
   const compacted = compactAssistantChatMessages(
     [...messages].sort((a, b) => a.sequence - b.sequence),
   )
-  const collapsed = collapseCompletedTurnActions(compacted)
+  const withCommandOutputs = compactCommandOutputMessages(compacted)
+  const collapsed = collapseCompletedTurnActions(withCommandOutputs)
   const fileCompacted = compactFileChangeBlocks(collapsed)
   return compactToolBursts(fileCompacted)
 }
+
+const TOOL_BURST_COLLAPSE_THRESHOLD = 5
 
 type CodexRenderSourceItem =
   | { message: ChatMessageResponse; sequence: number; type: "message" }
@@ -128,13 +131,14 @@ function compactToolBursts(items: CodexRenderSourceItem[]): CodexRenderItem[] {
     if (!pending.length) {
       return
     }
-    if (pending.length === 1) {
-      const [message] = pending
-      projected.push({
-        id: `message:${message.id}`,
-        message,
-        type: "message",
-      })
+    if (pending.length <= TOOL_BURST_COLLAPSE_THRESHOLD) {
+      projected.push(
+        ...pending.map((message) => ({
+          id: `message:${message.id}`,
+          message,
+          type: "message" as const,
+        })),
+      )
     } else {
       projected.push({
         id: `tool-burst:${pending.map((message) => message.id).join(":")}`,
@@ -393,6 +397,7 @@ function compactAssistantChatMessages(
 ): ChatMessageResponse[] {
   const compacted: ChatMessageResponse[] = []
   let pendingAssistantChat: ChatMessageResponse[] = []
+  let pendingAssistantChatBucket: string | null = null
 
   const flushAssistantChat = () => {
     if (!pendingAssistantChat.length) {
@@ -400,6 +405,7 @@ function compactAssistantChatMessages(
     }
     compacted.push(mergeAssistantChatMessages(pendingAssistantChat))
     pendingAssistantChat = []
+    pendingAssistantChatBucket = null
   }
 
   for (const message of messages) {
@@ -409,6 +415,11 @@ function compactAssistantChatMessages(
         compacted.push(message)
         continue
       }
+      const bucket = assistantChatMergeBucket(message)
+      if (pendingAssistantChatBucket && pendingAssistantChatBucket !== bucket) {
+        flushAssistantChat()
+      }
+      pendingAssistantChatBucket = bucket
       pendingAssistantChat.push(message)
       continue
     }
@@ -418,6 +429,75 @@ function compactAssistantChatMessages(
 
   flushAssistantChat()
   return compacted
+}
+
+function assistantChatMergeBucket(message: ChatMessageResponse): string {
+  const phase = normalizedAssistantPhase(message)
+  if (phase === "final_answer" || phase === "commentary") {
+    return phase
+  }
+  return message.itemId ? `item:${message.itemId}` : "assistant"
+}
+
+function compactCommandOutputMessages(
+  messages: ChatMessageResponse[],
+): ChatMessageResponse[] {
+  const consumedIds = new Set<string>()
+  const outputByCallId = new Map<string, ChatMessageResponse>()
+
+  for (const message of messages) {
+    if (message.kind !== "TOOL_ACTIVITY") {
+      continue
+    }
+    const callId = messageCallId(message)
+    if (callId) {
+      outputByCallId.set(callId, message)
+    }
+  }
+
+  const projected = messages.map((message) => {
+    if (message.kind !== "COMMAND_EXECUTION") {
+      return message
+    }
+    const callId = messageCallId(message)
+    const output = callId ? outputByCallId.get(callId) : undefined
+    if (!output) {
+      return message
+    }
+    consumedIds.add(output.id)
+    const metadata = metadataAs<ChatCommandMetadata>(message.metadata)
+    return {
+      ...message,
+      metadata: {
+        ...metadata,
+        callId,
+        kind: "command" as const,
+        output: output.content,
+      },
+    }
+  })
+
+  return projected.filter((message) => !consumedIds.has(message.id))
+}
+
+function messageCallId(message: ChatMessageResponse): string | null {
+  const metadata =
+    message.metadata && typeof message.metadata === "object"
+      ? (message.metadata as Record<string, unknown>)
+      : null
+  const metadataCallId = readString(metadata?.callId)
+  if (metadataCallId) {
+    return metadataCallId
+  }
+  const rawPayload =
+    message.rawPayload && typeof message.rawPayload === "object"
+      ? (message.rawPayload as Record<string, unknown>)
+      : null
+  const payload =
+    rawPayload?.payload && typeof rawPayload.payload === "object"
+      ? (rawPayload.payload as Record<string, unknown>)
+      : null
+  return readString(payload?.callId)
 }
 
 function mergeAssistantChatMessages(
@@ -541,14 +621,19 @@ export function isEmptyPlanMessage(message: ChatMessageResponse): boolean {
 function findFinalAssistantMessage(
   messages: ChatMessageResponse[],
 ): ChatMessageResponse | undefined {
-  return [...messages]
+  const assistantMessages = [...messages]
     .reverse()
-    .find(
+    .filter(
       (message) =>
         message.role === "ASSISTANT" &&
         message.kind === "CHAT" &&
         message.content.trim().length > 0,
     )
+  return (
+    assistantMessages.find((message) => isFinalAnswerAssistantMessage(message)) ??
+    assistantMessages.find((message) => !isCommentaryAssistantMessage(message)) ??
+    assistantMessages[0]
+  )
 }
 
 function isPreviousActionCandidate(
@@ -578,12 +663,45 @@ function isPreviousActionCandidate(
     return message.status !== "FAILED"
   }
   if (message.role === "ASSISTANT" && message.kind === "CHAT") {
+    if (!!finalAssistant && isCommentaryAssistantMessage(message)) {
+      return true
+    }
     return (
       !!finalAssistant &&
       finalAssistant.content.includes(message.content.trim())
     )
   }
   return false
+}
+
+function isFinalAnswerAssistantMessage(message: ChatMessageResponse): boolean {
+  return normalizedAssistantPhase(message) === "final_answer"
+}
+
+function isCommentaryAssistantMessage(message: ChatMessageResponse): boolean {
+  return normalizedAssistantPhase(message) === "commentary"
+}
+
+function normalizedAssistantPhase(
+  message: ChatMessageResponse,
+): string | null {
+  const metadata =
+    message.metadata && typeof message.metadata === "object"
+      ? (message.metadata as Record<string, unknown>)
+      : null
+  const phase = readString(metadata?.phase)
+  if (!phase) {
+    return null
+  }
+  return phase
+    .trim()
+    .replace(/([a-z])([A-Z])/g, "$1_$2")
+    .replace(/[\s-]+/g, "_")
+    .toLowerCase()
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null
 }
 
 function isToolBurstCandidate(message: ChatMessageResponse): boolean {
@@ -640,7 +758,7 @@ export function compactActionLabel(
     return "Input request"
   }
   if (message.kind === "CHAT") {
-    return "Assistant draft"
+    return "Assistant message"
   }
   return message.kind.toLowerCase().replaceAll("_", " ")
 }

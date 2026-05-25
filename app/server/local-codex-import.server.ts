@@ -17,6 +17,7 @@ import type {
   ContextWindowUsagePayload,
   JsonObject,
   MessageKind,
+  MessageStatus,
 } from "@/types"
 import {
   ensureAccountCodexHome,
@@ -28,23 +29,29 @@ import { asJsonObject, readString } from "./json.server"
 import { prisma } from "./prisma.server"
 
 export type ImportedLocalMessage = {
+  completedAt?: Date | null
   content: string
   createdAt: Date
   itemId?: string
   kind?: MessageKind
   metadata: JsonObject
   rawPayload: JsonObject
+  requestId?: string
   role: "ASSISTANT" | "SYSTEM" | "USER"
+  status?: MessageStatus
   turnId?: string
 }
 
 export type ParsedLocalCodexSession = {
+  activeStartedAt?: Date
+  activeTurnId?: string
   createdAt: Date
   externalThreadId: string
   messages: ImportedLocalMessage[]
   originator?: string
   path: string
   source?: string
+  status: "IDLE" | "RUNNING"
   title: string
   updatedAt: Date
   workingDirectory?: string
@@ -87,10 +94,16 @@ type LocalSessionMessageContext = {
   path: string
   sessionId?: string
   source?: string
+  suppressedToolOutputCallIds?: Set<string>
   turnId?: string
 }
 
 type OrderedImportedLocalMessage = ImportedLocalMessage & { order: number }
+
+type LocalFunctionCallOutput = {
+  output: string
+  timestamp: Date
+}
 
 type CodexStateThreadRow = {
   archived: number | null
@@ -255,6 +268,22 @@ export async function readLocalCodexSessionTranscript(
     : null
 }
 
+export async function readLocalCodexSessionActivity(
+  threadId: string,
+): Promise<Pick<
+  ParsedLocalCodexSession,
+  "activeStartedAt" | "activeTurnId" | "status"
+> | null> {
+  const session = await readLocalCodexSessionTranscript(threadId)
+  return session
+    ? {
+        activeStartedAt: session.activeStartedAt,
+        activeTurnId: session.activeTurnId,
+        status: session.status,
+      }
+    : null
+}
+
 export async function readLatestLocalCodexContextUsage(
   threadId: string,
 ): Promise<ContextWindowUsagePayload | null> {
@@ -391,11 +420,15 @@ function parseLocalCodexSessionJsonl(
   let workingDirectory: string | undefined
   let createdAt: Date | undefined
   let updatedAt: Date | undefined
+  let activeStartedAt: Date | undefined
+  let activeTurnId: string | undefined
   let currentTurnId: string | undefined
   let lineIndex = 0
   let turnIndex = 0
+  const functionCallOutputs = new Map<string, LocalFunctionCallOutput>()
   const responseMessages: OrderedImportedLocalMessage[] = []
   const eventMessages: OrderedImportedLocalMessage[] = []
+  const suppressedToolOutputCallIds = new Set<string>()
 
   for (const line of content.split(/\r?\n/)) {
     if (!line.trim()) {
@@ -425,6 +458,20 @@ function parseLocalCodexSessionJsonl(
       turnIndex += 1
       currentTurnId =
         readTurnIdFromPayload(payload) ?? localTurnId(sessionId, path, turnIndex)
+      activeTurnId = currentTurnId
+      activeStartedAt =
+        readDate(payload?.started_at) ??
+        readDate(payload?.startedAt) ??
+        timestamp
+    }
+    if (record.type === "response_item" && payloadType === "function_call_output") {
+      const callId = readCallId(payload ?? {})
+      if (callId) {
+        functionCallOutputs.set(callId, {
+          output: outputPayloadText(payload?.output),
+          timestamp,
+        })
+      }
     }
 
     if (record.type === "turn_context" && payload) {
@@ -437,6 +484,7 @@ function parseLocalCodexSessionJsonl(
       path,
       sessionId,
       source,
+      suppressedToolOutputCallIds,
       turnId: readTurnIdFromPayload(payload) ?? currentTurnId,
     }
 
@@ -452,13 +500,21 @@ function parseLocalCodexSessionJsonl(
     }
 
     if (record.type === "event_msg" && payloadType === "task_complete") {
+      const completedTurnId = readTurnIdFromPayload(payload)
+      if (!completedTurnId || completedTurnId === activeTurnId) {
+        activeStartedAt = undefined
+        activeTurnId = undefined
+      }
       currentTurnId = undefined
     }
   }
 
-  const messages = reconcileImportedMessages(responseMessages, eventMessages)
+  const messages = reconcileImportedMessages(
+    resolveImportedUserInputMessages(responseMessages, functionCallOutputs),
+    eventMessages,
+  )
   const externalThreadId = sessionId ?? extractSessionIdFromPath(path)
-  if (!externalThreadId || !messages.length) {
+  if (!externalThreadId || (!messages.length && !activeTurnId)) {
     return null
   }
 
@@ -469,12 +525,15 @@ function parseLocalCodexSessionJsonl(
     "Imported Codex chat"
 
   return {
+    activeStartedAt,
+    activeTurnId,
     createdAt: createdAt ?? fallbackTimestamp,
     externalThreadId,
     messages,
     originator,
     path,
     source,
+    status: activeTurnId ? "RUNNING" : "IDLE",
     title,
     updatedAt: updatedAt ?? fallbackTimestamp,
     workingDirectory,
@@ -692,6 +751,13 @@ function importedToolCallResponseMessage(
   session: LocalSessionMessageContext,
 ): ImportedLocalMessage | null {
   const payloadType = readString(payload.type) ?? "tool_call"
+  const toolName = readString(payload.name) ?? payloadType.replaceAll("_", " ")
+  if (payloadType === "function_call" && toolName === "update_plan") {
+    return importedUpdatePlanMessage(record, payload, timestamp, session)
+  }
+  if (payloadType === "function_call" && toolName === "request_user_input") {
+    return importedUserInputRequestMessage(record, payload, timestamp, session)
+  }
   if (payloadType === "web_search_call") {
     return importedSystemActivityMessage(
       record,
@@ -715,7 +781,6 @@ function importedToolCallResponseMessage(
 
   const argumentsObject = readArgumentsObject(payload.arguments)
   const command = commandLabelFromToolCall(payload, argumentsObject)
-  const toolName = readString(payload.name) ?? payloadType.replaceAll("_", " ")
   const isCommand = commandLikeToolCall(payloadType, toolName)
   if (isCommand) {
     return {
@@ -725,6 +790,7 @@ function importedToolCallResponseMessage(
       kind: "COMMAND_EXECUTION",
       metadata: {
         ...importedMessageMetadata(payload, session),
+        callId: readCallId(payload),
         command: command ?? toolName,
         cwd:
           readString(argumentsObject?.cwd) ??
@@ -755,6 +821,10 @@ function importedToolOutputResponseMessage(
   timestamp: Date,
   session: LocalSessionMessageContext,
 ): ImportedLocalMessage | null {
+  const callId = readCallId(payload)
+  if (callId && session.suppressedToolOutputCallIds?.has(callId)) {
+    return null
+  }
   const output = outputPayloadText(payload.output)
   if (!output.trim()) {
     return null
@@ -774,6 +844,94 @@ function importedToolOutputResponseMessage(
     },
     rawPayload: compactRawPayload(record, payload),
     role: "SYSTEM",
+    turnId: session.turnId,
+  }
+}
+
+function importedUpdatePlanMessage(
+  record: JsonObject,
+  payload: JsonObject,
+  timestamp: Date,
+  session: LocalSessionMessageContext,
+): ImportedLocalMessage | null {
+  const callId = readCallId(payload)
+  if (callId) {
+    session.suppressedToolOutputCallIds?.add(callId)
+  }
+  const argumentsObject = readArgumentsObject(payload.arguments) ?? {}
+  const plan = Array.isArray(argumentsObject.plan) ? argumentsObject.plan : []
+  const steps = plan
+    .map((entry) => asJsonObject(entry))
+    .filter((entry): entry is JsonObject => !!entry)
+    .map((entry) => ({
+      status: readString(entry.status) ?? "pending",
+      step: readString(entry.step) ?? "",
+    }))
+    .filter((entry) => entry.step)
+  const explanation = readString(argumentsObject.explanation)
+  const content = explanation ?? steps.map((step) => step.step).join("\n")
+  if (!content.trim() && !steps.length) {
+    return null
+  }
+  return {
+    completedAt: timestamp,
+    content,
+    createdAt: timestamp,
+    itemId: responseItemId(payload) ?? `plan:${session.turnId ?? timestamp.getTime()}`,
+    kind: "PLAN",
+    metadata: {
+      ...importedMessageMetadata(payload, session),
+      explanation,
+      kind: "plan",
+      presentation: "progress",
+      responseItemType: readString(payload.type),
+      status: readString(payload.status) ?? "completed",
+      steps,
+      toolName: "update_plan",
+    },
+    rawPayload: compactRawPayload(record, payload),
+    role: "SYSTEM",
+    status: "COMPLETED",
+    turnId: session.turnId,
+  }
+}
+
+function importedUserInputRequestMessage(
+  record: JsonObject,
+  payload: JsonObject,
+  timestamp: Date,
+  session: LocalSessionMessageContext,
+): ImportedLocalMessage | null {
+  const requestId = readCallId(payload)
+  if (!requestId) {
+    return null
+  }
+  session.suppressedToolOutputCallIds?.add(requestId)
+  const argumentsObject = readArgumentsObject(payload.arguments) ?? {}
+  const message =
+    readString(argumentsObject.message) ??
+    "Codex needs more information before it can continue."
+  return {
+    completedAt: null,
+    content: message,
+    createdAt: timestamp,
+    itemId: responseItemId(payload),
+    kind: "USER_INPUT_PROMPT",
+    metadata: {
+      ...importedMessageMetadata(payload, session),
+      kind: "userInput",
+      message,
+      method: "request_user_input",
+      mode: readString(argumentsObject.mode),
+      questions: decodeImportedUserInputQuestions(argumentsObject.questions),
+      requestId,
+      status: "pending",
+      toolName: "request_user_input",
+    },
+    rawPayload: compactRawPayload(record, payload),
+    requestId,
+    role: "SYSTEM",
+    status: "PENDING",
     turnId: session.turnId,
   }
 }
@@ -933,6 +1091,92 @@ function importedPatchApplyEventMessage(
     role: "SYSTEM",
     turnId: session.turnId,
   }
+}
+
+function resolveImportedUserInputMessages(
+  messages: OrderedImportedLocalMessage[],
+  functionCallOutputs: Map<string, LocalFunctionCallOutput>,
+): OrderedImportedLocalMessage[] {
+  return messages.map((message) => {
+    if (
+      message.kind !== "USER_INPUT_PROMPT" ||
+      !message.requestId ||
+      message.status !== "PENDING"
+    ) {
+      return message
+    }
+    const output = functionCallOutputs.get(message.requestId)
+    if (!output) {
+      return message
+    }
+    return {
+      ...message,
+      completedAt: output.timestamp,
+      metadata: {
+        ...message.metadata,
+        resolvedAt: output.timestamp.toISOString(),
+        result: parseFunctionCallOutputResult(output.output),
+        status: "resolved",
+      },
+      status: "COMPLETED",
+    }
+  })
+}
+
+function parseFunctionCallOutputResult(output: string): unknown {
+  const trimmed = output.trim()
+  if (!trimmed) {
+    return null
+  }
+  try {
+    return JSON.parse(trimmed)
+  } catch {
+    return trimmed
+  }
+}
+
+function readNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : undefined
+  }
+  return undefined
+}
+
+function decodeImportedUserInputQuestions(value: unknown) {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  return value
+    .map((entry) => asJsonObject(entry))
+    .filter((entry): entry is JsonObject => !!entry)
+    .map((entry, index) => ({
+      header: readString(entry.header),
+      id: readString(entry.id) ?? `question-${index + 1}`,
+      isOther: typeof entry.isOther === "boolean" ? entry.isOther : undefined,
+      isSecret: typeof entry.isSecret === "boolean" ? entry.isSecret : undefined,
+      options: decodeImportedUserInputOptions(entry.options),
+      question: readString(entry.question) ?? readString(entry.header) ?? "Answer",
+      selectionLimit:
+        readNumber(entry.selectionLimit) ?? readNumber(entry.selection_limit),
+    }))
+}
+
+function decodeImportedUserInputOptions(value: unknown) {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  return value
+    .map((entry) => asJsonObject(entry))
+    .filter((entry): entry is JsonObject => !!entry)
+    .map((entry) => ({
+      description: readString(entry.description),
+      label: readString(entry.label) ?? readString(entry.value) ?? "",
+    }))
+    .filter((entry) => entry.label)
 }
 
 function importedRole(value: unknown): "ASSISTANT" | "USER" | null {

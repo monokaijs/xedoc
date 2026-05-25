@@ -485,6 +485,7 @@ function CodexTurnRow({
     () => projectCodexRenderItems(messages),
     [messages],
   )
+  const turnSummary = useMemo(() => codexTurnSummary(messages), [messages])
   const status = messages.reduce<ChatMessageResponse["status"] | null>(
     (current, message) => {
       if (message.status === "FAILED") {
@@ -530,10 +531,104 @@ function CodexTurnRow({
               session={session}
             />
           ))}
+          {turnSummary ? <CodexTurnSummaryDivider summary={turnSummary} /> : null}
         </div>
       </div>
     </article>
   )
+}
+
+type CodexTurnSummary = {
+  actionCount: number
+  durationLabel: string | null
+}
+
+function codexTurnSummary(
+  messages: ChatMessageResponse[],
+): CodexTurnSummary | null {
+  if (messages.some(isActiveMessage)) {
+    return null
+  }
+  if (!messages.some((message) => message.role === "ASSISTANT" && message.kind === "CHAT")) {
+    return null
+  }
+  const actionMessages = messages.filter(isConcreteWorkMessage)
+  if (!actionMessages.length) {
+    return null
+  }
+  const startedAt = minMessageTime(actionMessages, "createdAt")
+  const finishedAt = maxMessageTime(messages, "completedAt") ?? maxMessageTime(messages, "createdAt")
+  const durationLabel =
+    startedAt && finishedAt && finishedAt > startedAt
+      ? formatDurationCompact(finishedAt - startedAt)
+      : null
+  return {
+    actionCount: actionMessages.length,
+    durationLabel,
+  }
+}
+
+function CodexTurnSummaryDivider({ summary }: { summary: CodexTurnSummary }) {
+  const label = summary.durationLabel
+    ? `Worked for ${summary.durationLabel}`
+    : `${summary.actionCount} ${summary.actionCount === 1 ? "action" : "actions"}`
+  return (
+    <div className="flex min-w-0 items-center gap-2 py-1 text-xs text-muted-foreground">
+      <div className="h-px min-w-4 flex-1 bg-border" />
+      <span className="shrink-0">{label}</span>
+      <div className="h-px min-w-4 flex-1 bg-border" />
+    </div>
+  )
+}
+
+function isConcreteWorkMessage(message: ChatMessageResponse): boolean {
+  return (
+    message.kind === "COMMAND_EXECUTION" ||
+    message.kind === "TOOL_ACTIVITY" ||
+    message.kind === "FILE_CHANGE"
+  )
+}
+
+function minMessageTime(
+  messages: ChatMessageResponse[],
+  field: "createdAt" | "completedAt",
+): number | null {
+  const values = messages
+    .map((message) => parseMessageTime(message[field]))
+    .filter((value): value is number => value !== null)
+  return values.length ? Math.min(...values) : null
+}
+
+function maxMessageTime(
+  messages: ChatMessageResponse[],
+  field: "createdAt" | "completedAt",
+): number | null {
+  const values = messages
+    .map((message) => parseMessageTime(message[field]))
+    .filter((value): value is number => value !== null)
+  return values.length ? Math.max(...values) : null
+}
+
+function parseMessageTime(value: Date | string | null | undefined): number | null {
+  if (!value) {
+    return null
+  }
+  const parsed = value instanceof Date ? value.getTime() : Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function formatDurationCompact(durationMs: number): string {
+  const totalSeconds = Math.max(1, Math.round(durationMs / 1000))
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  if (hours > 0) {
+    return `${hours}h ${minutes.toString().padStart(2, "0")}m`
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${seconds.toString().padStart(2, "0")}s`
+  }
+  return `${seconds}s`
 }
 
 function CodexRenderItemContent({
@@ -905,6 +1000,7 @@ function TimelineContent({
     case "COMMAND_EXECUTION":
       return (
         <CommandBlock
+          message={message}
           metadata={metadataAs<ChatCommandMetadata>(message.metadata)}
         />
       )
@@ -969,22 +1065,56 @@ function ProcessingDots() {
 }
 
 function ThinkingBlock({ message }: { message: ChatMessageResponse }) {
+  const text = normalizedThinkingText(message.content)
+  const preview = firstNonEmptyLine(text)
+  const isStreaming = message.status === "STREAMING" || message.status === "PENDING"
+  const title = isStreaming ? "Thinking" : "Reasoned"
   return (
     <details
-      className="group min-w-0 max-w-full overflow-hidden rounded-lg border border-dashed bg-muted/20 text-sm"
-      open={message.status === "STREAMING"}
+      className="group min-w-0 max-w-full overflow-hidden text-sm"
+      open={isStreaming}
     >
-      <summary className="flex min-w-0 cursor-pointer list-none items-center gap-2 px-3 py-2 text-muted-foreground">
-        <ChevronDown className="size-4 transition-transform group-open:rotate-180" />
-        <span>Reasoning</span>
+      <summary className="flex min-w-0 cursor-pointer list-none items-start gap-2 px-1 py-1.5 text-muted-foreground">
+        <ChevronDown className="mt-0.5 size-4 shrink-0 transition-transform group-open:rotate-180" />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="size-1.5 shrink-0 rounded-full bg-muted-foreground/60" />
+            <span className="shrink-0 font-medium">{title}</span>
+            {preview ? (
+              <span className="min-w-0 truncate text-xs">{preview}</span>
+            ) : null}
+          </div>
+        </div>
       </summary>
-      {message.content ? (
-        <div className="min-w-0 whitespace-pre-wrap break-words border-t px-3 py-2 text-muted-foreground">
-          {message.content}
+      {text ? (
+        <div className="min-w-0 whitespace-pre-wrap break-words px-7 pb-2 text-muted-foreground">
+          {text}
         </div>
       ) : null}
     </details>
   )
+}
+
+function normalizedThinkingText(content: string): string {
+  const trimmed = content.trim()
+  if (trimmed.toLowerCase().startsWith("thinking...")) {
+    return trimmed.slice("thinking...".length).trim()
+  }
+  if (trimmed.toLowerCase() === "thinking") {
+    return ""
+  }
+  return trimmed
+}
+
+function firstNonEmptyLine(content: string): string | null {
+  const line = content
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .find(Boolean)
+  if (!line) {
+    return null
+  }
+  return line.length > 96 ? `${line.slice(0, 96)}...` : line
 }
 
 function AssistantChatContent({
@@ -1450,46 +1580,94 @@ function proposedPlanFromMessage(
   }
 }
 
-function CommandBlock({ metadata }: { metadata?: ChatCommandMetadata }) {
+function CommandBlock({
+  message,
+  metadata,
+}: {
+  message: ChatMessageResponse
+  metadata?: ChatCommandMetadata
+}) {
   const status = metadata?.status ?? "running"
-  const openByDefault = status !== "completed" && status !== "success"
+  const isRunning = message.status === "STREAMING" || message.status === "PENDING"
+  const failed =
+    message.status === "FAILED" ||
+    status.toLowerCase().includes("fail") ||
+    (typeof metadata?.exitCode === "number" && metadata.exitCode !== 0)
+  const command = (metadata?.command ?? message.content.trim()) || "command"
+  const output = metadata?.output?.trim() ?? ""
+  const outputLines = output ? output.split(/\r?\n/) : []
+  const [expanded, setExpanded] = useState(false)
+  const visibleOutputLines = expanded
+    ? outputLines
+    : outputLines.slice(0, COMMAND_OUTPUT_VISIBLE_LINES)
+  const hiddenOutputLineCount = Math.max(
+    0,
+    outputLines.length - visibleOutputLines.length,
+  )
+
   return (
-    <details
-      className="group min-w-0 max-w-full overflow-hidden rounded-lg border bg-background text-sm"
-      open={openByDefault}
-    >
-      <summary className="grid min-w-0 cursor-pointer list-none grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 px-3 py-2">
-        <ChevronDown className="size-4 text-muted-foreground transition-transform group-open:rotate-180" />
-        <div className="flex min-w-0 items-center gap-2">
-          <Terminal className="size-4 shrink-0" />
-          <code className="min-w-0 truncate rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
-            {metadata?.command ?? "command"}
-          </code>
-        </div>
-        <div className="flex shrink-0 items-center gap-1">
-          <Badge variant={commandBadgeVariant(metadata)}>
-            {commandStatusLabel(metadata)}
-          </Badge>
-          {typeof metadata?.exitCode === "number" ? (
-            <Badge
-              variant={metadata.exitCode === 0 ? "secondary" : "destructive"}
+    <div className="min-w-0 max-w-full overflow-hidden py-1 text-sm">
+      <div className="flex min-w-0 items-start gap-2">
+        <span
+          className={cn(
+            "mt-2 size-1.5 shrink-0 rounded-full",
+            failed
+              ? "bg-destructive"
+              : isRunning
+                ? "animate-pulse bg-primary"
+                : "bg-muted-foreground/70",
+          )}
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+            <span className="shrink-0 font-medium">
+              {commandActionLabel(message, metadata)}
+            </span>
+            <code className="min-w-0 max-w-full break-words rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
+              {command}
+            </code>
+            {metadata?.durationMs ? (
+              <span className="text-xs text-muted-foreground">
+                {formatDurationCompact(metadata.durationMs)}
+              </span>
+            ) : null}
+            {typeof metadata?.exitCode === "number" ? (
+              <Badge
+                variant={metadata.exitCode === 0 ? "secondary" : "destructive"}
+              >
+                {metadata.exitCode === 0 ? "ok" : metadata.exitCode}
+              </Badge>
+            ) : null}
+          </div>
+          {metadata?.cwd ? (
+            <div className="mt-1 truncate text-xs text-muted-foreground">
+              {metadata.cwd}
+            </div>
+          ) : null}
+          {visibleOutputLines.length ? (
+            <pre className="mt-2 min-w-0 max-w-full overflow-x-auto rounded-md bg-muted/70 px-3 py-2 font-mono text-xs leading-5 text-muted-foreground">
+              {visibleOutputLines.join("\n")}
+            </pre>
+          ) : !isRunning ? (
+            <div className="mt-1 text-xs text-muted-foreground">
+              (no output)
+            </div>
+          ) : null}
+          {hiddenOutputLineCount > 0 ? (
+            <Button
+              className="mt-1 h-7 px-2 text-xs text-muted-foreground"
+              size="sm"
+              type="button"
+              variant="ghost"
+              onClick={() => setExpanded(true)}
             >
-              {metadata.exitCode}
-            </Badge>
+              Show {hiddenOutputLineCount} more{" "}
+              {hiddenOutputLineCount === 1 ? "line" : "lines"}
+            </Button>
           ) : null}
         </div>
-      </summary>
-      <div className="min-w-0 max-w-full overflow-hidden border-t px-3 py-2">
-        {metadata?.cwd ? (
-          <div className="mb-2 truncate text-xs text-muted-foreground">
-            {metadata.cwd}
-          </div>
-        ) : null}
-        <pre className="max-h-64 min-w-0 max-w-full overflow-x-auto rounded-md bg-muted p-3 font-mono text-xs leading-5">
-          {metadata?.output || "(no output)"}
-        </pre>
       </div>
-    </details>
+    </div>
   )
 }
 
@@ -1510,40 +1688,32 @@ function ToolBurstBlock({ messages }: { messages: ChatMessageResponse[] }) {
   const hiddenCount = Math.max(0, messages.length - visibleMessages.length)
   const status = mergeMessageStatus(messages)
   return (
-    <details
-      className="group min-w-0 max-w-full overflow-hidden rounded-lg border bg-background text-sm"
-      open={status === "STREAMING" || status === "PENDING"}
-    >
-      <summary className="grid min-w-0 cursor-pointer list-none grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 px-3 py-2">
-        <ChevronDown className="size-4 text-muted-foreground transition-transform group-open:rotate-180" />
-        <div className="flex min-w-0 items-center gap-2">
-          <Terminal className="size-4 shrink-0" />
-          <span className="truncate font-medium">
-            {messages.length} {messages.length === 1 ? "action" : "actions"}
-          </span>
-        </div>
-        <Badge variant="secondary">{status.toLowerCase()}</Badge>
-      </summary>
-      <div className="grid min-w-0 gap-1.5 border-t px-3 py-2">
-        {visibleMessages.map((message) => (
-          <CompactActionRow key={message.id} message={message} />
-        ))}
-        {hiddenCount > 0 ? (
-          <Button
-            className="mt-1 justify-start px-2 text-muted-foreground"
-            size="sm"
-            type="button"
-            variant="ghost"
-            onClick={(event) => {
-              event.preventDefault()
-              setExpanded(true)
-            }}
-          >
-            +{hiddenCount} commands/actions
-          </Button>
-        ) : null}
+    <div className="grid min-w-0 gap-1.5 py-1 text-sm">
+      <div className="flex min-w-0 items-center gap-2 px-1 text-xs text-muted-foreground">
+        <Terminal className="size-3.5 shrink-0" />
+        <span className="min-w-0 truncate">
+          {messages.length} {messages.length === 1 ? "tool call" : "tool calls"}
+        </span>
+        <Badge className="shrink-0" variant="secondary">
+          {status.toLowerCase()}
+        </Badge>
       </div>
-    </details>
+      {visibleMessages.map((message) => (
+        <CompactActionRow key={message.id} message={message} />
+      ))}
+      {hiddenCount > 0 ? (
+        <Button
+          className="h-7 justify-start px-2 text-xs text-muted-foreground"
+          size="sm"
+          type="button"
+          variant="ghost"
+          onClick={() => setExpanded(true)}
+        >
+          Show {hiddenCount} more{" "}
+          {hiddenCount === 1 ? "tool call" : "tool calls"}
+        </Button>
+      ) : null}
+    </div>
   )
 }
 
@@ -1552,25 +1722,35 @@ function PreviousActionsBlock({
 }: {
   messages: ChatMessageResponse[]
 }) {
+  const [expanded, setExpanded] = useState(false)
+  const title =
+    messages.length === 1
+      ? "1 previous message"
+      : `${messages.length} previous messages`
   return (
-    <details className="group min-w-0 max-w-full overflow-hidden rounded-lg border bg-muted/20 text-sm">
-      <summary className="grid min-w-0 cursor-pointer list-none grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 px-3 py-2 text-muted-foreground">
-        <ChevronDown className="size-4 transition-transform group-open:rotate-180" />
-        <div className="flex min-w-0 items-center gap-2">
-          <Terminal className="size-4 shrink-0" />
-          <span className="truncate">
-            {messages.length} previous{" "}
-            {messages.length === 1 ? "action" : "actions"}
-          </span>
-        </div>
-        <Badge variant="secondary">collapsed</Badge>
-      </summary>
-      <div className="grid min-w-0 gap-1.5 border-t px-3 py-2">
+    <div className="grid min-w-0 gap-2 py-1 text-sm">
+      <button
+        className="flex min-w-0 items-center gap-2 text-left text-muted-foreground"
+        type="button"
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <ChevronDown
+          className={cn(
+            "size-4 shrink-0 transition-transform",
+            expanded ? "rotate-0" : "-rotate-90",
+          )}
+        />
+        <span className="shrink-0 text-xs">{title}</span>
+        <span className="h-px min-w-4 flex-1 bg-border" />
+      </button>
+      {expanded ? (
+        <div className="grid min-w-0 gap-1.5 pl-6">
         {messages.map((message) => (
           <CompactActionRow key={message.id} message={message} />
         ))}
-      </div>
-    </details>
+        </div>
+      ) : null}
+    </div>
   )
 }
 
@@ -1610,18 +1790,23 @@ function commandStatusLabel(metadata?: ChatCommandMetadata): string {
   return "running"
 }
 
-function commandBadgeVariant(
+function commandActionLabel(
+  message: ChatMessageResponse,
   metadata?: ChatCommandMetadata,
-): "secondary" | "destructive" {
-  const status = metadata?.status?.toLowerCase() ?? ""
+): string {
+  if (message.status === "STREAMING" || message.status === "PENDING") {
+    return "Running"
+  }
+  const status = commandStatusLabel(metadata).toLowerCase()
   if (
+    message.status === "FAILED" ||
     status.includes("fail") ||
     status.includes("error") ||
     (typeof metadata?.exitCode === "number" && metadata.exitCode !== 0)
   ) {
-    return "destructive"
+    return "Failed"
   }
-  return "secondary"
+  return "Ran"
 }
 
 function ApprovalBlock({
@@ -1776,6 +1961,7 @@ function UserInputBlock({
     : [{ id: "answer", question: metadata?.message ?? "Answer" }]
   const resolved =
     metadata?.status === "resolved" || message.status === "COMPLETED"
+  const externalRequest = isImportedUserInputRequest(metadata)
   const activeQuestionIndex = Math.min(
     questionIndex,
     Math.max(questions.length - 1, 0),
@@ -1854,7 +2040,7 @@ function UserInputBlock({
               resolved ||
               respond.isPending ||
               isLastQuestion ||
-              !currentAnswered
+              (!externalRequest && !currentAnswered)
             }
             size="icon-xs"
             variant="ghost"
@@ -1868,7 +2054,7 @@ function UserInputBlock({
       {currentQuestion ? (
         <QuestionField
           compact={compact}
-          disabled={resolved || respond.isPending}
+          disabled={resolved || respond.isPending || externalRequest}
           question={currentQuestion}
           value={answers[currentQuestion.id] ?? EMPTY_USER_INPUT_ANSWER}
           onChange={(value) =>
@@ -1880,7 +2066,16 @@ function UserInputBlock({
           onAutoAdvance={isLastQuestion ? undefined : goToNextQuestion}
         />
       ) : null}
-      {isLastQuestion ? (
+      {externalRequest ? (
+        <div
+          className={cn(
+            "text-xs leading-4 text-muted-foreground",
+            compact ? "mt-2" : "mt-4",
+          )}
+        >
+          Answer this in the Codex client that started the turn.
+        </div>
+      ) : isLastQuestion ? (
         <div className={cn("flex justify-end", compact ? "mt-2" : "mt-4")}>
           <Button
             disabled={resolved || respond.isPending || !allAnswered}
@@ -1897,6 +2092,19 @@ function UserInputBlock({
         </div>
       ) : null}
     </div>
+  )
+}
+
+function isImportedUserInputRequest(metadata?: ChatUserInputMetadata): boolean {
+  const value = metadata as
+    | (ChatUserInputMetadata & {
+        sourcePayloadType?: unknown
+        toolName?: unknown
+      })
+    | undefined
+  return (
+    value?.toolName === "request_user_input" ||
+    value?.sourcePayloadType === "function_call"
   )
 }
 
@@ -2237,6 +2445,7 @@ function useServerRequestMutation(
 }
 
 const TOOL_BURST_VISIBLE_COUNT = 5
+const COMMAND_OUTPUT_VISIBLE_LINES = 5
 
 function readError(caught: unknown): string {
   return caught instanceof Error ? caught.message : "Request failed."

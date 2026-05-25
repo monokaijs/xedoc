@@ -226,6 +226,7 @@ export interface ChatGenericMetadata {
 
 export interface ChatCommandMetadata {
   kind: 'command';
+  callId?: string;
   command?: string;
   cwd?: string;
   status?: string;

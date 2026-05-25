@@ -37,6 +37,7 @@ import {
   listLocalCodexSessionSummaries,
   mirrorCodexSessionForAccount,
   readLatestLocalCodexContextUsage,
+  readLocalCodexSessionActivity,
   readLocalCodexSessionMetadata,
   readLocalCodexSessionTranscript,
   type ImportedLocalMessage,
@@ -62,8 +63,10 @@ type SourceTranscriptMessage = {
   kind?: ChatMessageResponse["kind"]
   metadata?: JsonObject
   rawPayload?: unknown
+  requestId?: string | null
   role: Extract<ChatMessageResponse["role"], "ASSISTANT" | "SYSTEM" | "USER">
   source: "runtime" | "session"
+  status?: ChatMessageResponse["status"]
   turnId?: string | null
 }
 
@@ -134,6 +137,7 @@ type ThreadSnapshot = {
   createdAt: Date
   firstUserMessage?: string | null
   preview?: string | null
+  status?: ChatResponse["status"]
   threadId: string
   title?: string | null
   updatedAt: Date
@@ -231,7 +235,9 @@ export async function getChat(threadId: string): Promise<ChatResponse> {
   if (!snapshot && !runtimeStates.has(threadId)) {
     throw new HttpError(404, "Chat not found.")
   }
-  return buildChatResponse(threadId, preference, snapshot)
+  return buildChatResponse(threadId, preference, snapshot, {
+    includeExternalActivity: true,
+  })
 }
 
 export async function updateChat(
@@ -437,6 +443,17 @@ export async function executeMessage(
   const startedAt = new Date()
   const state = await ensureRuntimeState(threadId)
 
+  if (
+    chat.status === "RUNNING" &&
+    state.status !== "RUNNING" &&
+    state.status !== "QUEUED"
+  ) {
+    throw new HttpError(
+      409,
+      "This Codex thread is active in another client. Wait for that turn to finish before sending from the web UI.",
+    )
+  }
+
   if (state.status === "RUNNING" || state.status === "QUEUED") {
     if (dto.delivery === "steer") {
       return steerActiveRunMessage({
@@ -623,6 +640,15 @@ async function readThreadSnapshots(): Promise<Map<string, ThreadSnapshot>> {
   for (const session of sessions) {
     snapshots.set(session.externalThreadId, snapshotFromSession(session))
   }
+  await Promise.all(
+    sessions.slice(0, 8).map(async (session) => {
+      const activity = await readLocalCodexSessionActivity(session.externalThreadId)
+      const snapshot = snapshots.get(session.externalThreadId)
+      if (snapshot && activity?.status === "RUNNING") {
+        snapshot.status = "RUNNING"
+      }
+    }),
+  )
   return snapshots
 }
 
@@ -660,9 +686,18 @@ async function buildChatResponse(
   threadId: string,
   preference: ThreadPreference | null,
   snapshot?: ThreadSnapshot | null,
+  options: { includeExternalActivity?: boolean } = {},
 ): Promise<ChatResponse> {
   const resolvedSnapshot = snapshot === undefined ? await readThreadSnapshot(threadId) : snapshot
   const state = runtimeStates.get(threadId)
+  const externalActivity = options.includeExternalActivity
+    ? await readLocalCodexSessionActivity(threadId)
+    : null
+  const running =
+    state?.status === "RUNNING" ||
+    state?.status === "QUEUED" ||
+    resolvedSnapshot?.status === "RUNNING" ||
+    externalActivity?.status === "RUNNING"
   const preferenceFields = preferenceToChatFields(preference)
   const createdAt =
     preference?.createdAt ??
@@ -690,7 +725,7 @@ async function buildChatResponse(
     lastActivityAt: updatedAt,
     status: preference?.archivedAt
       ? "ARCHIVED"
-      : state?.status === "RUNNING" || state?.status === "QUEUED"
+      : running
         ? "RUNNING"
         : "IDLE",
     title,
@@ -718,7 +753,8 @@ function sourceTranscriptResponse(
   sequence: number,
 ): ChatMessageResponse {
   const createdAt = source.createdAt ?? chat.createdAt
-  const completedAt = source.completedAt ?? source.createdAt ?? createdAt
+  const completedAt =
+    source.completedAt === undefined ? source.createdAt ?? createdAt : source.completedAt
   return {
     chatId: threadId,
     completedAt,
@@ -731,11 +767,11 @@ function sourceTranscriptResponse(
       ? (toSerializable(source.metadata) as ChatMessageResponse["metadata"])
       : sourceTranscriptMetadata(source),
     rawPayload: toSerializable(source.rawPayload ?? null),
-    requestId: null,
+    requestId: source.requestId ?? null,
     role: source.role,
     runId: null,
     sequence,
-    status: "COMPLETED",
+    status: source.status ?? "COMPLETED",
     turnId: source.turnId ?? null,
   }
 }
@@ -767,15 +803,18 @@ function sourceMessageFromLocalSession(
   message: ImportedLocalMessage,
 ): SourceTranscriptMessage {
   return {
-    completedAt: message.createdAt,
+    completedAt:
+      message.completedAt === undefined ? message.createdAt : message.completedAt,
     content: message.content,
     createdAt: message.createdAt,
     itemId: message.itemId,
     kind: message.kind,
     metadata: message.metadata,
     rawPayload: message.rawPayload,
+    requestId: message.requestId,
     role: message.role,
     source: "session",
+    status: message.status,
     turnId: message.turnId,
   }
 }

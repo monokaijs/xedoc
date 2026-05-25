@@ -137,12 +137,14 @@ export function ChatDetailPane() {
     enabled: !!chatId,
     queryKey: chatQueryKey,
     queryFn: () => getChat(session, chatId!),
+    refetchInterval: 2_500,
   })
 
   const messagesQuery = useQuery({
     enabled: !!chatId,
     queryKey: messagesQueryKey,
     queryFn: () => getChatMessages(session, chatId!, 0),
+    refetchInterval: 2_500,
     structuralSharing: (previous, next) =>
       mergeMessagePage(
         previous as MessagePageResponse | undefined,
@@ -167,6 +169,14 @@ export function ChatDetailPane() {
     [messagesQuery.data],
   )
   const loadedChat = chatQuery.data
+  useEffect(() => {
+    if (!loadedChat) {
+      return
+    }
+    queryClient.setQueryData<ChatResponse[] | undefined>(["chats"], (chats) =>
+      chats?.map((chat) => (chat.id === loadedChat.id ? loadedChat : chat)),
+    )
+  }, [loadedChat, queryClient])
   const loadedAccount = accounts.find(
     (entry) => entry.id === loadedChat?.accountId,
   )
