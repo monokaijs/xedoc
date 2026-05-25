@@ -297,16 +297,27 @@ export async function readLocalCodexSessionMetadata(
   threadId: string,
 ): Promise<LocalCodexSessionSummary | null> {
   const row = await readCodexStateThread(threadId)
-  return row ? summaryFromCodexStateThread(row) : null
+  if (!row) {
+    return null
+  }
+  const indexedMetadata = await readSharedCodexSessionIndexMetadata(threadId)
+  return summaryFromCodexStateThread(row, indexedMetadata?.title ?? null)
 }
 
 export async function listLocalCodexSessionSummaries(): Promise<
   LocalCodexSessionSummary[]
 > {
-  const rows = await readCodexStateThreads(localImportMaxFiles())
-  return rows.map(summaryFromCodexStateThread).sort(
-    (left, right) => right.updatedAt.getTime() - left.updatedAt.getTime(),
-  )
+  const [rows, indexedMetadata] = await Promise.all([
+    readCodexStateThreads(localImportMaxFiles()),
+    readSharedCodexSessionIndex(),
+  ])
+  return rows
+    .map((row) =>
+      summaryFromCodexStateThread(row, indexedMetadata.get(row.id)?.title ?? null),
+    )
+    .sort(
+      (left, right) => right.updatedAt.getTime() - left.updatedAt.getTime(),
+    )
 }
 
 async function scanAndImportLocalCodexChats(): Promise<void> {
@@ -1554,6 +1565,18 @@ export async function readCodexSessionIndexFile(
   }
 }
 
+async function readSharedCodexSessionIndex(): Promise<
+  Map<string, LocalCodexSessionIndexMetadata>
+> {
+  return readCodexSessionIndexFile(resolveCodexSharedSessionIndexPath())
+}
+
+async function readSharedCodexSessionIndexMetadata(
+  threadId: string,
+): Promise<LocalCodexSessionIndexMetadata | null> {
+  return (await readSharedCodexSessionIndex()).get(threadId) ?? null
+}
+
 function localSessionIndexPath(sessionPath: string): string | null {
   const marker = `${sep}sessions${sep}`
   const resolvedPath = resolve(sessionPath)
@@ -1777,6 +1800,7 @@ async function codexStateClient(): Promise<PrismaClient | null> {
 
 function summaryFromCodexStateThread(
   row: CodexStateThreadRow,
+  indexedTitle?: string | null,
 ): LocalCodexSessionSummary {
   const fallbackTimestamp = new Date(0)
   const updatedAt = dateFromCodexTimestamp(row.updatedAt, fallbackTimestamp)
@@ -1792,14 +1816,40 @@ function summaryFromCodexStateThread(
     firstUserMessage,
     path,
     preview,
-    title:
-      normalizeImportedTitle(row.title, { allowGeneric: false }) ??
-      fallbackChatTitle(firstUserMessage ?? "") ??
-      fallbackChatTitle(preview ?? "") ??
-      null,
+    title: codexStateThreadDisplayTitle(row, firstUserMessage, preview, indexedTitle),
     updatedAt,
     workingDirectory: row.cwd ?? undefined,
   }
+}
+
+function codexStateThreadDisplayTitle(
+  row: CodexStateThreadRow,
+  firstUserMessage: string | null,
+  preview: string | null,
+  indexedTitle?: string | null,
+): string | null {
+  const stateTitle = normalizeImportedTitle(row.title, { allowGeneric: false })
+  const explicitStateTitle =
+    stateTitle && !sameImportedTitle(stateTitle, firstUserMessage)
+      ? stateTitle
+      : null
+  return (
+    explicitStateTitle ??
+    normalizeImportedTitle(indexedTitle, { allowGeneric: false }) ??
+    fallbackChatTitle(firstUserMessage ?? "") ??
+    fallbackChatTitle(preview ?? "") ??
+    null
+  )
+}
+
+function sameImportedTitle(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): boolean {
+  if (!left || !right) {
+    return false
+  }
+  return normalizeTitleComparisonValue(left) === normalizeTitleComparisonValue(right)
 }
 
 function dateFromCodexTimestamp(
