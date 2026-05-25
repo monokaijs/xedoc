@@ -101,6 +101,9 @@ function assignOption(parsed, name, value) {
     case "--codex-command":
       parsed.codexCommand = value
       return
+    case "--forever-command":
+      parsed.foreverCommand = value
+      return
     case "--home":
       parsed.home = value
       return
@@ -112,6 +115,9 @@ function assignOption(parsed, name, value) {
       return
     case "--service-name":
       parsed.serviceName = value
+      return
+    case "--service-driver":
+      parsed.serviceDriver = value
       return
     case "--shared-chat-home":
       parsed.sharedChatHome = value
@@ -181,12 +187,13 @@ function resolveRuntimeOptions(options) {
 }
 
 async function handleServiceCommand(options) {
+  const driver = resolveServiceDriver(options.serviceDriver)
   switch (options.serviceAction) {
     case "install":
-      await installUserSystemdService(options)
+      await installBackgroundService(options, driver)
       return
     case "uninstall":
-      await uninstallUserSystemdService(options)
+      await uninstallBackgroundService(options, driver)
       return
     case undefined:
       printServiceHelp()
@@ -197,10 +204,78 @@ async function handleServiceCommand(options) {
   }
 }
 
-async function installUserSystemdService(options) {
+async function installBackgroundService(options, driver) {
+  switch (driver) {
+    case "systemd":
+      await installSystemdService(options)
+      return
+    case "launchd":
+      await installLaunchdService(options)
+      return
+    case "windows-task":
+      await installWindowsTaskService(options)
+      return
+    case "forever":
+      await installForeverService(options)
+      return
+    default:
+      fail(`Unsupported service driver: ${driver}`)
+  }
+}
+
+async function uninstallBackgroundService(options, driver) {
+  switch (driver) {
+    case "systemd":
+      await uninstallSystemdService(options)
+      return
+    case "launchd":
+      await uninstallLaunchdService(options)
+      return
+    case "windows-task":
+      await uninstallWindowsTaskService(options)
+      return
+    case "forever":
+      await uninstallForeverService(options)
+      return
+    default:
+      fail(`Unsupported service driver: ${driver}`)
+  }
+}
+
+function resolveServiceDriver(value) {
+  const driver = value?.trim() || "auto"
+  if (driver === "auto") {
+    if (process.platform === "linux") {
+      return "systemd"
+    }
+    if (process.platform === "darwin") {
+      return "launchd"
+    }
+    if (process.platform === "win32") {
+      return "windows-task"
+    }
+    fail(
+      `No native service driver is available for ${process.platform}. Try --service-driver forever.`,
+    )
+  }
+  if (
+    driver === "systemd" ||
+    driver === "launchd" ||
+    driver === "windows-task" ||
+    driver === "forever"
+  ) {
+    return driver
+  }
+  fail(
+    `Unknown service driver: ${driver}. Use auto, systemd, launchd, windows-task, or forever.`,
+  )
+}
+
+async function installSystemdService(options) {
   requireLinuxSystemd()
   const runtime = resolveRuntimeOptions(options)
-  const serviceName = normalizeServiceName(options.serviceName)
+  const serviceBaseName = normalizeServiceBaseName(options.serviceName)
+  const serviceName = `${serviceBaseName}.service`
   const unitPath = userSystemdUnitPath(serviceName)
   await mkdir(dirname(unitPath), { recursive: true, mode: 0o700 })
   await writeFile(unitPath, systemdUnitFile(runtime), { mode: 0o644 })
@@ -211,12 +286,13 @@ async function installUserSystemdService(options) {
   console.log(`Installed ${serviceName}.`)
   console.log(options.noStart ? "Service is enabled but not started." : `Service is running at ${url}.`)
   console.log(`Logs: systemctl --user status ${serviceName}`)
-  console.log(`Uninstall: xedoc service uninstall --service-name ${serviceName.replace(/\.service$/u, "")}`)
+  console.log(`Uninstall: xedoc service uninstall --service-name ${serviceBaseName}`)
 }
 
-async function uninstallUserSystemdService(options) {
+async function uninstallSystemdService(options) {
   requireLinuxSystemd()
-  const serviceName = normalizeServiceName(options.serviceName)
+  const serviceBaseName = normalizeServiceBaseName(options.serviceName)
+  const serviceName = `${serviceBaseName}.service`
   const unitPath = userSystemdUnitPath(serviceName)
   await runSystemctl(["disable", "--now", serviceName]).catch((error) => {
     console.warn(
@@ -228,22 +304,203 @@ async function uninstallUserSystemdService(options) {
   console.log(`Uninstalled ${serviceName}.`)
 }
 
+async function installLaunchdService(options) {
+  requireDarwinLaunchd()
+  const runtime = resolveRuntimeOptions(options)
+  const label = normalizeServiceBaseName(options.serviceName)
+  const plistPath = launchdPlistPath(label)
+  await mkdir(dirname(plistPath), { recursive: true, mode: 0o700 })
+  await mkdir(serviceLogDirectory(runtime), { recursive: true, mode: 0o700 })
+  await writeFile(plistPath, launchdPlistFile(runtime, label), { mode: 0o644 })
+  const domain = launchdDomain()
+  if (!options.noStart) {
+    await runLaunchctl(["bootout", domain, plistPath]).catch(() => undefined)
+    await runLaunchctl(["bootstrap", domain, plistPath])
+    await runLaunchctl(["enable", `${domain}/${label}`]).catch(() => undefined)
+    await runLaunchctl(["kickstart", "-k", `${domain}/${label}`])
+  }
+  const url = `http://${runtime.host === "0.0.0.0" ? "localhost" : runtime.host}:${runtime.port}`
+  console.log(`Installed ${label}.`)
+  console.log(options.noStart ? "LaunchAgent is installed and will start at next login." : `Service is running at ${url}.`)
+  console.log(`Logs: tail -f ${join(serviceLogDirectory(runtime), `${label}.out.log`)}`)
+  console.log(`Uninstall: xedoc service uninstall --service-name ${label}`)
+}
+
+async function uninstallLaunchdService(options) {
+  requireDarwinLaunchd()
+  const label = normalizeServiceBaseName(options.serviceName)
+  const plistPath = launchdPlistPath(label)
+  await runLaunchctl(["bootout", launchdDomain(), plistPath]).catch((error) => {
+    console.warn(
+      `Could not stop ${label}: ${error instanceof Error ? error.message : error}`,
+    )
+  })
+  await rm(plistPath, { force: true })
+  console.log(`Uninstalled ${label}.`)
+}
+
+async function installWindowsTaskService(options) {
+  requireWindowsTaskScheduler()
+  const runtime = resolveRuntimeOptions(options)
+  const taskName = normalizeServiceBaseName(options.serviceName)
+  const commandPath = await writeWindowsServiceCommand(runtime, taskName)
+  await runSchtasks([
+    "/Create",
+    "/TN",
+    taskName,
+    "/SC",
+    "ONLOGON",
+    "/TR",
+    `cmd.exe /d /c ${windowsBatchQuote(commandPath)}`,
+    "/F",
+  ])
+  if (!options.noStart) {
+    await runSchtasks(["/Run", "/TN", taskName])
+  }
+  const url = `http://${runtime.host === "0.0.0.0" ? "localhost" : runtime.host}:${runtime.port}`
+  console.log(`Installed ${taskName}.`)
+  console.log(options.noStart ? "Task is installed but not started." : `Task is running at ${url}.`)
+  console.log(`Status: schtasks /Query /TN ${taskName}`)
+  console.log(`Uninstall: xedoc service uninstall --service-name ${taskName}`)
+}
+
+async function uninstallWindowsTaskService(options) {
+  requireWindowsTaskScheduler()
+  const runtime = resolveRuntimeOptions(options)
+  const taskName = normalizeServiceBaseName(options.serviceName)
+  await runSchtasks(["/End", "/TN", taskName]).catch(() => undefined)
+  await runSchtasks(["/Delete", "/TN", taskName, "/F"]).catch((error) => {
+    console.warn(
+      `Could not delete ${taskName}: ${error instanceof Error ? error.message : error}`,
+    )
+  })
+  await rm(windowsServiceCommandPath(runtime, taskName), { force: true })
+  console.log(`Uninstalled ${taskName}.`)
+}
+
+async function installForeverService(options) {
+  if (options.noStart) {
+    fail("--no-start is not supported with --service-driver forever.")
+  }
+  const runtime = resolveRuntimeOptions(options)
+  const serviceName = normalizeServiceBaseName(options.serviceName)
+  const logDirectory = serviceLogDirectory(runtime)
+  await mkdir(logDirectory, { recursive: true, mode: 0o700 })
+  await runForever(["stop", serviceName], options).catch(() => undefined)
+  await runForever([
+    "start",
+    "--uid",
+    serviceName,
+    "--append",
+    "--workingDir",
+    packageRoot,
+    "-l",
+    join(logDirectory, `${serviceName}.forever.log`),
+    "-o",
+    join(logDirectory, `${serviceName}.out.log`),
+    "-e",
+    join(logDirectory, `${serviceName}.err.log`),
+    "-c",
+    process.execPath,
+    join(packageRoot, "bin", "xedoc.mjs"),
+    ...runtimeServiceArgs(runtime),
+  ], options)
+  const url = `http://${runtime.host === "0.0.0.0" ? "localhost" : runtime.host}:${runtime.port}`
+  console.log(`Started ${serviceName} with forever at ${url}.`)
+  console.log("Note: forever keeps the process alive, but does not install OS boot integration.")
+  console.log(`Logs: forever logs ${serviceName}`)
+  console.log(`Uninstall: xedoc service uninstall --service-driver forever --service-name ${serviceName}`)
+}
+
+async function uninstallForeverService(options) {
+  const serviceName = normalizeServiceBaseName(options.serviceName)
+  await runForever(["stop", serviceName], options).catch((error) => {
+    console.warn(
+      `Could not stop ${serviceName}: ${error instanceof Error ? error.message : error}`,
+    )
+  })
+  console.log(`Stopped ${serviceName} in forever.`)
+}
+
 function requireLinuxSystemd() {
   if (process.platform !== "linux") {
-    fail("Service install currently supports Linux user systemd services only.")
+    fail("The systemd service driver only supports Linux.")
   }
 }
 
-function normalizeServiceName(value) {
+function requireDarwinLaunchd() {
+  if (process.platform !== "darwin") {
+    fail("The launchd service driver only supports macOS.")
+  }
+  if (typeof process.getuid !== "function") {
+    fail("Could not determine the current macOS user id.")
+  }
+}
+
+function requireWindowsTaskScheduler() {
+  if (process.platform !== "win32") {
+    fail("The windows-task service driver only supports Windows.")
+  }
+}
+
+function normalizeServiceBaseName(value) {
   const name = value?.trim() || "xedoc"
+  const normalized = name.endsWith(".service") ? name.slice(0, -".service".length) : name
   if (!/^[A-Za-z0-9_.@-]+$/u.test(name)) {
     fail("Service name may only contain letters, numbers, dots, underscores, @, and hyphens.")
   }
-  return name.endsWith(".service") ? name : `${name}.service`
+  if (!normalized) {
+    fail("Service name must not be empty.")
+  }
+  return normalized
 }
 
 function userSystemdUnitPath(serviceName) {
   return join(homedir(), ".config", "systemd", "user", serviceName)
+}
+
+function launchdPlistPath(label) {
+  return join(homedir(), "Library", "LaunchAgents", `${label}.plist`)
+}
+
+function launchdDomain() {
+  return `gui/${process.getuid()}`
+}
+
+function serviceLogDirectory(runtime) {
+  return join(runtime.appHome, "logs")
+}
+
+function launchdPlistFile(runtime, label) {
+  const execArgs = [
+    process.execPath,
+    join(packageRoot, "bin", "xedoc.mjs"),
+    ...runtimeServiceArgs(runtime),
+  ]
+  const logDirectory = serviceLogDirectory(runtime)
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${xmlEscape(label)}</string>
+  <key>ProgramArguments</key>
+  <array>
+${execArgs.map((arg) => `    <string>${xmlEscape(arg)}</string>`).join("\n")}
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${xmlEscape(packageRoot)}</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${xmlEscape(join(logDirectory, `${label}.out.log`))}</string>
+  <key>StandardErrorPath</key>
+  <string>${xmlEscape(join(logDirectory, `${label}.err.log`))}</string>
+</dict>
+</plist>
+`
 }
 
 function systemdUnitFile(runtime) {
@@ -303,8 +560,69 @@ function systemdQuoteExecArg(value) {
     .replaceAll("%", "%%")}"`
 }
 
+function xmlEscape(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;")
+}
+
+async function writeWindowsServiceCommand(runtime, taskName) {
+  const commandPath = windowsServiceCommandPath(runtime, taskName)
+  await mkdir(dirname(commandPath), { recursive: true, mode: 0o700 })
+  const command = [
+    "@echo off",
+    `cd /d ${windowsBatchQuote(packageRoot)}`,
+    [
+      windowsBatchQuote(process.execPath),
+      windowsBatchQuote(join(packageRoot, "bin", "xedoc.mjs")),
+      ...runtimeServiceArgs(runtime).map(windowsBatchQuote),
+    ].join(" "),
+    "",
+  ].join("\r\n")
+  await writeFile(commandPath, command, { mode: 0o700 })
+  return commandPath
+}
+
+function windowsServiceCommandPath(runtime, taskName) {
+  return join(runtime.appHome, "service", `${taskName}.cmd`)
+}
+
+function windowsBatchQuote(value) {
+  return `"${String(value)
+    .replaceAll("%", "%%")
+    .replaceAll("^", "^^")
+    .replaceAll('"', '""')}"`
+}
+
 async function runSystemctl(args) {
   await run("systemctl", ["--user", ...args], {
+    cwd: packageRoot,
+    env: process.env,
+    stdio: "inherit",
+  })
+}
+
+async function runLaunchctl(args) {
+  await run("launchctl", args, {
+    cwd: packageRoot,
+    env: process.env,
+    stdio: "inherit",
+  })
+}
+
+async function runSchtasks(args) {
+  await run("schtasks.exe", args, {
+    cwd: packageRoot,
+    env: process.env,
+    stdio: "inherit",
+  })
+}
+
+async function runForever(args, options) {
+  await run(options.foreverCommand ?? process.env.FOREVER_COMMAND ?? "forever", args, {
     cwd: packageRoot,
     env: process.env,
     stdio: "inherit",
@@ -415,7 +733,9 @@ Options:
   --codex-command <command>     Codex command used for new accounts.
   --codex-args <args>           Codex command arguments used for new accounts.
   --home <path>                 App data directory. Defaults to ~/.xedoc.
-  --service-name <name>         systemd user service name. Defaults to xedoc.
+  --service-driver <driver>     auto, systemd, launchd, windows-task, or forever. Defaults to auto.
+  --service-name <name>         Service name. Defaults to xedoc.
+  --forever-command <command>   forever executable for --service-driver forever. Defaults to forever.
   --no-start                    Enable service without starting it during install.
   --help                        Show this help.
   --version                     Print the package version.
@@ -429,12 +749,14 @@ Usage:
   xedoc service install [options]
   xedoc service uninstall [options]
 
-Linux user systemd service commands:
-  install                       Write ~/.config/systemd/user/xedoc.service, reload systemd, and enable --now.
-  uninstall                     Stop, disable, and remove the user service file.
+Service commands:
+  install                       Install the background service and start it unless --no-start is set.
+  uninstall                     Stop and remove the background service.
 
 Options:
-  --service-name <name>         systemd user service name. Defaults to xedoc.
+  --service-driver <driver>     auto, systemd, launchd, windows-task, or forever. Defaults to auto.
+  --service-name <name>         Service name. Defaults to xedoc.
+  --forever-command <command>   forever executable for --service-driver forever. Defaults to forever.
   --no-start                    Enable service without starting it during install.
   --port <port>                 Web server port. Defaults to 6354.
   --host <host>                 Web server host. Defaults to 127.0.0.1.

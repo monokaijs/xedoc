@@ -33,19 +33,41 @@ Common CLI options:
 - `--shared-chat-home <path>` changes where shared Codex chat sessions are stored.
 - `--skip-setup` skips SQLite schema setup.
 
-To run xedoc in the background on Linux with user systemd, install the package
-in a stable location and install the service:
+To run xedoc in the background, install the package in a stable location and
+install the service:
 
 ```bash
 npm install -g xedoc-cli
 xedoc service install --port 6354 --workspace-root ~
 ```
 
-The install command writes `~/.config/systemd/user/xedoc.service`, runs
-`systemctl --user daemon-reload`, and enables the service immediately. Use
-`systemctl --user status xedoc` or `journalctl --user -u xedoc -f` to inspect
-it. If the service should start before you log in, enable user lingering with
-`loginctl enable-linger "$USER"`.
+The default service driver is OS-native:
+
+- Linux: user systemd unit at `~/.config/systemd/user/xedoc.service`
+- macOS: launchd agent at `~/Library/LaunchAgents/xedoc.plist`
+- Windows: Task Scheduler task named `xedoc`
+
+Inspect the service with the native tool for your OS:
+
+```bash
+systemctl --user status xedoc
+journalctl --user -u xedoc -f
+launchctl print gui/$(id -u)/xedoc
+schtasks /Query /TN xedoc
+```
+
+On Linux, if the service should start before you log in, enable user lingering
+with `loginctl enable-linger "$USER"`.
+
+`forever` is also available as an explicit fallback:
+
+```bash
+npm install -g forever
+xedoc service install --service-driver forever
+```
+
+The `forever` driver keeps xedoc alive in the current user session, but it does
+not install OS boot integration by itself.
 
 To remove the background service:
 
