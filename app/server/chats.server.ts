@@ -3351,11 +3351,12 @@ function serverRequestBelongsToTurn(
   turnId?: string,
 ): boolean {
   const params = asJsonObject(request.params)
-  const requestThreadId = readString(params?.threadId)
+  const requestThreadId =
+    readString(params?.threadId) ?? readString(params?.thread_id)
   if (threadId && requestThreadId && requestThreadId !== threadId) {
     return false
   }
-  const requestTurnId = readString(params?.turnId)
+  const requestTurnId = readString(params?.turnId) ?? readString(params?.turn_id)
   if (turnId && requestTurnId && requestTurnId !== turnId) {
     return false
   }
@@ -3811,13 +3812,17 @@ function readPositiveInteger(value: unknown): number | undefined {
 function requestMethodKind(
   method: string,
 ): "approval" | "permissions" | "userInput" | null {
-  if (method === "tool/requestUserInput" || method === "item/tool/requestUserInput") {
+  const normalized = normalizedType(method)
+  if (
+    normalized === "toolrequestuserinput" ||
+    normalized === "itemtoolrequestuserinput"
+  ) {
     return "userInput"
   }
-  if (method.includes("requestApproval")) {
-    return normalizedType(method).includes("permissions") ? "permissions" : "approval"
+  if (normalized.includes("requestapproval")) {
+    return normalized.includes("permissions") ? "permissions" : "approval"
   }
-  if (normalizedType(method).includes("elicitation")) {
+  if (normalized.includes("elicitation")) {
     return "userInput"
   }
   return null
@@ -3843,7 +3848,7 @@ function approvalMetadata(
     requestId,
     requestKind,
     status: "pending",
-    turnId: readString(params.turnId),
+    turnId: readString(params.turnId) ?? readString(params.turn_id),
   }
 }
 
