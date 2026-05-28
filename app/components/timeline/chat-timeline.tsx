@@ -24,6 +24,7 @@ import {
   Loader2,
   LockKeyhole,
   PencilLine,
+  Search,
   Terminal,
   UserRound,
 } from "lucide-react"
@@ -31,7 +32,6 @@ import type { ReactNode } from "react"
 import { useMemo, useState } from "react"
 import "highlight.js/styles/github.css"
 import { toast } from "sonner"
-import { StatusBadge } from "@/components/status-badge"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -489,35 +489,13 @@ function CodexTurnRow({
     [messages],
   )
   const turnSummary = useMemo(() => codexTurnSummary(messages), [messages])
-  const status = messages.reduce<ChatMessageResponse["status"] | null>(
-    (current, message) => {
-      if (message.status === "FAILED") {
-        return "FAILED"
-      }
-      if (message.status === "STREAMING") {
-        return current === "FAILED" ? current : "STREAMING"
-      }
-      if (message.status === "PENDING") {
-        return current === "FAILED" || current === "STREAMING"
-          ? current
-          : "PENDING"
-      }
-      return current
-    },
-    null,
-  )
   const turnActive = messages.some(isActiveMessage)
 
   return (
-    <article className="mx-auto flex w-full min-w-0 max-w-full justify-start overflow-hidden">
+    <article className="mx-auto flex w-full min-w-0 max-w-full justify-start overflow-hidden py-1">
       <div className="min-w-0 flex-1 overflow-hidden">
-        <div className="mb-1 flex items-center gap-2 pl-1">
-          <span className="text-xs font-medium text-muted-foreground">
-            Codex
-          </span>
-          {status ? <StatusBadge status={status} /> : null}
-        </div>
-        <div className="grid min-w-0 gap-2">
+        <div className="grid min-w-0 gap-4">
+          {turnSummary ? <CodexTurnSummaryDivider summary={turnSummary} /> : null}
           {displayItems.map((item) => (
             <CodexRenderItemContent
               chatId={chatId}
@@ -536,7 +514,6 @@ function CodexTurnRow({
               turnActive={turnActive}
             />
           ))}
-          {turnSummary ? <CodexTurnSummaryDivider summary={turnSummary} /> : null}
         </div>
       </div>
     </article>
@@ -578,10 +555,9 @@ function CodexTurnSummaryDivider({ summary }: { summary: CodexTurnSummary }) {
     ? `Worked for ${summary.durationLabel}`
     : `${summary.actionCount} ${summary.actionCount === 1 ? "action" : "actions"}`
   return (
-    <div className="flex min-w-0 items-center gap-2 py-1 text-xs text-muted-foreground">
-      <div className="h-px min-w-4 flex-1 bg-border" />
+    <div className="flex min-w-0 items-center gap-1 border-b pb-3 text-xs text-muted-foreground">
       <span className="shrink-0">{label}</span>
-      <div className="h-px min-w-4 flex-1 bg-border" />
+      <ChevronDown className="-rotate-90 size-3.5 shrink-0" />
     </div>
   )
 }
@@ -665,13 +641,7 @@ function CodexRenderItemContent({
   }
   if (item.type === "fileChanges") {
     if (turnActive) {
-      return (
-        <div className="grid min-w-0 gap-1.5">
-          {item.messages.map((message) => (
-            <ActiveFileChangeInlineRow key={message.id} message={message} />
-          ))}
-        </div>
-      )
+      return <PreviousActionsBlock messages={item.messages} />
     }
     return (
       <FileChangeBlock
@@ -1627,6 +1597,18 @@ function CommandBlock({
     outputLines.length - visibleOutputLines.length,
   )
 
+  if (isRunning) {
+    return (
+      <div className="flex min-w-0 items-center gap-2 px-1 py-1 text-xs text-muted-foreground/80">
+        <Terminal className="size-3.5 shrink-0" />
+        <span className="shrink-0">Running</span>
+        <code className="min-w-0 truncate rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground/80">
+          {command}
+        </code>
+      </div>
+    )
+  }
+
   return (
     <div className="min-w-0 max-w-full overflow-hidden py-1 text-sm">
       <div className="flex min-w-0 items-start gap-2">
@@ -1710,16 +1692,8 @@ function ToolBurstBlock({ messages }: { messages: ChatMessageResponse[] }) {
   const hiddenCount = Math.max(0, messages.length - visibleMessages.length)
   const status = mergeMessageStatus(messages)
   return (
-    <div className="grid min-w-0 gap-1.5 py-1 text-sm">
-      <div className="flex min-w-0 items-center gap-2 px-1 text-xs text-muted-foreground">
-        <Terminal className="size-3.5 shrink-0" />
-        <span className="min-w-0 truncate">
-          {messages.length} {messages.length === 1 ? "tool call" : "tool calls"}
-        </span>
-        <Badge className="shrink-0" variant="secondary">
-          {status.toLowerCase()}
-        </Badge>
-      </div>
+    <div className="grid min-w-0 gap-2 py-1 text-sm">
+      <ActionSummaryRow messages={messages} status={status} />
       {visibleMessages.map((message) => (
         <CompactActionRow key={message.id} message={message} />
       ))}
@@ -1746,24 +1720,25 @@ function PreviousActionsBlock({
 }) {
   const [expanded, setExpanded] = useState(false)
   const title =
-    messages.length === 1
-      ? "1 previous message"
-      : `${messages.length} previous messages`
+    actionSummaryLabel(messages) ??
+    (messages.length === 1
+      ? "1 previous action"
+      : `${messages.length} previous actions`)
   return (
     <div className="grid min-w-0 gap-2 py-1 text-sm">
       <button
-        className="flex min-w-0 items-center gap-2 text-left text-muted-foreground"
+        className="flex min-w-0 items-center gap-2 text-left text-xs text-muted-foreground/80"
         type="button"
         onClick={() => setExpanded((current) => !current)}
       >
         <ChevronDown
           className={cn(
-            "size-4 shrink-0 transition-transform",
+            "size-3.5 shrink-0 transition-transform",
             expanded ? "rotate-0" : "-rotate-90",
           )}
         />
-        <span className="shrink-0 text-xs">{title}</span>
-        <span className="h-px min-w-4 flex-1 bg-border" />
+        <ActionSummaryIcon messages={messages} />
+        <span className="min-w-0 truncate">{title}</span>
       </button>
       {expanded ? (
         <div className="grid min-w-0 gap-1.5 pl-6">
@@ -1787,7 +1762,7 @@ function CompactActionRow({ message }: { message: ChatMessageResponse }) {
       ? commandMetadata?.output || commandMetadata?.cwd
       : message.content.trim()
   return (
-    <div className="grid min-w-0 max-w-full grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 overflow-hidden rounded-md bg-muted/45 px-2 py-1.5">
+    <div className="grid min-w-0 max-w-full grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 overflow-hidden rounded-md bg-muted/35 px-2 py-1.5">
       {compactActionIcon(message)}
       <div className="min-w-0">
         <div className="truncate text-xs font-medium">{label}</div>
@@ -1800,6 +1775,137 @@ function CompactActionRow({ message }: { message: ChatMessageResponse }) {
       <Badge variant="secondary">{message.status.toLowerCase()}</Badge>
     </div>
   )
+}
+
+function ActionSummaryRow({
+  messages,
+  status,
+}: {
+  messages: ChatMessageResponse[]
+  status?: ChatMessageResponse["status"]
+}) {
+  return (
+    <div className="flex min-w-0 items-center gap-2 px-1 text-xs text-muted-foreground/80">
+      <ActionSummaryIcon messages={messages} />
+      <span className="min-w-0 truncate">
+        {actionSummaryLabel(messages) ??
+          `${messages.length} ${messages.length === 1 ? "tool call" : "tool calls"}`}
+      </span>
+      {status && status !== "COMPLETED" ? (
+        <Badge className="shrink-0" variant="secondary">
+          {status.toLowerCase()}
+        </Badge>
+      ) : null}
+    </div>
+  )
+}
+
+function ActionSummaryIcon({
+  messages,
+}: {
+  messages: ChatMessageResponse[]
+}) {
+  const kind = actionSummaryKind(messages)
+  if (kind === "search") {
+    return <Search className="size-3.5 shrink-0" />
+  }
+  if (kind === "edit") {
+    return <PencilLine className="size-3.5 shrink-0" />
+  }
+  return <Terminal className="size-3.5 shrink-0" />
+}
+
+function actionSummaryLabel(messages: ChatMessageResponse[]): string | null {
+  const fileChanges = messages.filter((message) => message.kind === "FILE_CHANGE")
+  if (fileChanges.length) {
+    return `Edited ${fileChanges.length} ${fileChanges.length === 1 ? "file" : "files"}`
+  }
+
+  const commands = messages.filter(
+    (message) => message.kind === "COMMAND_EXECUTION",
+  )
+  const searchCount = commands.filter(isSearchCommandMessage).length
+  const listCount = commands.filter(isListCommandMessage).length
+  const fileReadCount = commands.filter(isFileReadCommandMessage).length
+  const otherCommandCount =
+    commands.length - searchCount - listCount - fileReadCount
+  const parts: string[] = []
+  if (fileReadCount) {
+    parts.push(
+      `explored ${fileReadCount} ${fileReadCount === 1 ? "file" : "files"}`,
+    )
+  }
+  if (listCount) {
+    parts.push(`${listCount} ${listCount === 1 ? "list" : "lists"}`)
+  }
+  if (searchCount) {
+    parts.push(
+      `explored ${searchCount} ${searchCount === 1 ? "search" : "searches"}`,
+    )
+  }
+  if (otherCommandCount) {
+    parts.push(
+      `ran ${otherCommandCount} ${otherCommandCount === 1 ? "command" : "commands"}`,
+    )
+  }
+  if (parts.length) {
+    return sentenceCase(joinSummaryParts(parts))
+  }
+
+  const toolCount = messages.filter(
+    (message) => message.kind === "TOOL_ACTIVITY",
+  ).length
+  if (toolCount) {
+    return `Explored ${toolCount} ${toolCount === 1 ? "result" : "results"}`
+  }
+  return null
+}
+
+function actionSummaryKind(messages: ChatMessageResponse[]): "edit" | "run" | "search" {
+  if (messages.some((message) => message.kind === "FILE_CHANGE")) {
+    return "edit"
+  }
+  if (
+    messages.some(
+      (message) =>
+        message.kind === "COMMAND_EXECUTION" &&
+        (isSearchCommandMessage(message) || isFileReadCommandMessage(message)),
+    )
+  ) {
+    return "search"
+  }
+  return "run"
+}
+
+function isSearchCommandMessage(message: ChatMessageResponse): boolean {
+  const command = commandText(message)
+  return /(^|\s)(rg|grep|find)\b/.test(command)
+}
+
+function isFileReadCommandMessage(message: ChatMessageResponse): boolean {
+  const command = commandText(message)
+  return /(^|\s)(cat|sed|nl|head|tail|wc)\b/.test(command)
+}
+
+function isListCommandMessage(message: ChatMessageResponse): boolean {
+  const command = commandText(message)
+  return /(^|\s)ls\b/.test(command)
+}
+
+function commandText(message: ChatMessageResponse): string {
+  const metadata = metadataAs<ChatCommandMetadata>(message.metadata)
+  return (metadata?.command ?? message.content).trim()
+}
+
+function joinSummaryParts(parts: string[]): string {
+  if (parts.length <= 1) {
+    return parts[0] ?? ""
+  }
+  return `${parts.slice(0, -1).join(", ")}, ${parts.at(-1)}`
+}
+
+function sentenceCase(value: string): string {
+  return value ? `${value[0].toUpperCase()}${value.slice(1)}` : value
 }
 
 function commandStatusLabel(metadata?: ChatCommandMetadata): string {

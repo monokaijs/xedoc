@@ -98,6 +98,16 @@ function collapseCompletedTurnActions(
       type: "message" as const,
     }),
   )
+  if (previousActions.length <= TOOL_BURST_COLLAPSE_THRESHOLD) {
+    return mergeSourceItems(
+      sourceItems,
+      previousActions.map((message) => ({
+        message,
+        sequence: message.sequence,
+        type: "message" as const,
+      })),
+    )
+  }
   if (!previousActions.length) {
     return sourceItems
   }
@@ -123,12 +133,16 @@ function collapseCompletedTurnActions(
   ]
 }
 
+function mergeSourceItems(
+  left: CodexRenderSourceItem[],
+  right: CodexRenderSourceItem[],
+): CodexRenderSourceItem[] {
+  return [...left, ...right].sort((a, b) => a.sequence - b.sequence)
+}
+
 function compactToolBursts(items: CodexRenderSourceItem[]): CodexRenderItem[] {
   const projected: CodexRenderItem[] = []
   let pending: ChatMessageResponse[] = []
-  const turnActive = items.some(
-    (item) => item.type === "message" && isActiveMessage(item.message),
-  )
 
   const flushPending = () => {
     if (!pending.length) {
@@ -164,7 +178,7 @@ function compactToolBursts(items: CodexRenderSourceItem[]): CodexRenderItem[] {
     }
 
     if (isToolBurstCandidate(item.message)) {
-      if (turnActive || isActiveMessage(item.message)) {
+      if (isActiveMessage(item.message)) {
         flushPending()
         projected.push({
           id: `message:${item.message.id}`,
@@ -199,14 +213,6 @@ function compactToolBursts(items: CodexRenderSourceItem[]): CodexRenderItem[] {
 function compactFileChangeBlocks(
   items: CodexRenderSourceItem[],
 ): CodexRenderSourceItem[] {
-  if (
-    items.some(
-      (item) => item.type === "message" && isActiveMessage(item.message),
-    )
-  ) {
-    return items
-  }
-
   const projected: CodexRenderSourceItem[] = []
   let pending: ChatMessageResponse[] = []
 
@@ -226,9 +232,14 @@ function compactFileChangeBlocks(
   for (const item of items) {
     if (
       item.type !== "message" ||
-      item.message.kind !== "FILE_CHANGE" ||
-      isActiveMessage(item.message)
+      item.message.kind !== "FILE_CHANGE"
     ) {
+      flushPending()
+      projected.push(item)
+      continue
+    }
+
+    if (isActiveMessage(item.message)) {
       flushPending()
       projected.push(item)
       continue
@@ -678,9 +689,6 @@ function isPreviousActionCandidate(
     return message.status !== "FAILED"
   }
   if (message.role === "ASSISTANT" && message.kind === "CHAT") {
-    if (!!finalAssistant && isCommentaryAssistantMessage(message)) {
-      return true
-    }
     return (
       !!finalAssistant &&
       finalAssistant.content.includes(message.content.trim())

@@ -3,9 +3,9 @@ import { useMutation, useQueryClient } from "@tanstack/react-query"
 import {
   Archive,
   ChevronDown,
-  Circle,
   Folder,
   Loader2,
+  MessageSquare,
   MoreHorizontal,
   Pencil,
   Plus,
@@ -411,14 +411,9 @@ function ChatStatusIcon({ status }: { status: ChatStatus }) {
     )
   }
   return (
-    <Circle
+    <MessageSquare
       aria-label={chatStatusLabel(status)}
-      className={cn(
-        "size-3.5 shrink-0",
-        status === "ARCHIVED"
-          ? "fill-muted-foreground/20 text-muted-foreground/70"
-          : "fill-emerald-500/20 text-emerald-500",
-      )}
+      className="size-3.5 shrink-0 text-muted-foreground"
     />
   )
 }
