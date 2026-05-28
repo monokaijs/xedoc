@@ -118,9 +118,11 @@ Each Codex account runs as its own local `codex app-server` process. The server 
 ~/.xedoc/accounts/<accountId>
 ```
 
-Codex chat data is centralized separately. By default,
-each account home gets symlinks for `sessions/`, `session_index.jsonl`, Codex
-`state_*.sqlite` chat state files pointing at the system Codex chat store:
+Codex chat data is centralized separately. By default, each account home points
+`sessions/`, `session_index.jsonl`, and Codex `state_*.sqlite` chat state files
+at the system Codex chat store. Windows uses a directory junction for
+`sessions/` and hard links for shared files so admin symlink permission is not
+required:
 
 ```text
 ~/.codex
@@ -128,7 +130,7 @@ each account home gets symlinks for `sessions/`, `session_index.jsonl`, Codex
 
 Set `CODEX_SHARED_CHAT_HOME` to change the shared chat store. Existing
 per-account chat storage is copied into the shared store when safe, then kept
-as timestamped `.pre-shared-*` backups before the symlinks are created.
+as timestamped `.pre-shared-*` backups before the shared links are created.
 
 For existing installations, saved account homes are prepared when the app lists
 accounts after upgrade. This migrates old per-account chat storage into the

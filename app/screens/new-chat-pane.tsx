@@ -84,9 +84,7 @@ export function NewChatPane() {
   const [autoRotateAccount, setAutoRotateAccount] = useState(
     lastOpenedChat?.autoRotateAccount ?? false,
   )
-  const [newChatAccountId, setNewChatAccountId] = useState<string | null>(
-    lastOpenedChat?.accountId ?? null,
-  )
+  const [newChatAccountId, setNewChatAccountId] = useState<string | null>(null)
   const [permissionMode, setPermissionMode] =
     useState<CodexPermissionMode>("default")
   const [reasoningEffort, setReasoningEffort] =
@@ -136,10 +134,6 @@ export function NewChatPane() {
       setWorkingDirectory((current) =>
         current.trim() ? current : nextWorkingDirectory,
       )
-    }
-    const nextAccountId = lastOpenedChat.accountId
-    if (nextAccountId) {
-      setNewChatAccountId((current) => current ?? nextAccountId)
     }
   }, [lastOpenedChat])
 

@@ -6,6 +6,7 @@ import {
   chmodSync,
   closeSync,
   copyFileSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -493,7 +494,7 @@ function ensureSharedSessionsLink(
   const link = join(codexHome, "sessions")
   mkdirSync(target, { recursive: true, mode: 0o700 })
 
-  if (isSymlinkTo(link, target)) {
+  if (isSharedFileLink(link, target)) {
     return
   }
 
@@ -505,7 +506,7 @@ function ensureSharedSessionsLink(
     renameSync(link, nextBackupPath(link))
   }
 
-  symlinkSync(target, link, "dir")
+  createSharedDirectoryLink(target, link)
 }
 
 function ensureSharedSessionIndexLink(
@@ -516,7 +517,7 @@ function ensureSharedSessionIndexLink(
   const link = join(codexHome, "session_index.jsonl")
   ensureFile(target, 0o600)
 
-  if (isSymlinkTo(link, target)) {
+  if (isSharedFileLink(link, target)) {
     return
   }
 
@@ -527,7 +528,7 @@ function ensureSharedSessionIndexLink(
     renameSync(link, nextBackupPath(link))
   }
 
-  symlinkSync(target, link, "file")
+  createSharedFileLink(target, link)
 }
 
 function ensureSharedStateDatabaseLinks(
@@ -561,7 +562,7 @@ function ensureSharedStateFileLink(
 ): void {
   const target = join(sharedChatHome, name)
   const link = join(codexHome, name)
-  if (isSymlinkTo(link, target)) {
+  if (isSharedFileLink(link, target)) {
     return
   }
 
@@ -574,6 +575,21 @@ function ensureSharedStateFileLink(
   }
   if (pathExists(link)) {
     renameSync(link, nextBackupPath(link))
+  }
+  createSharedFileLink(target, link)
+}
+
+function createSharedDirectoryLink(target: string, link: string): void {
+  symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir")
+}
+
+function createSharedFileLink(target: string, link: string): void {
+  if (process.platform === "win32") {
+    if (!pathExists(target)) {
+      return
+    }
+    linkSync(target, link)
+    return
   }
   symlinkSync(target, link, "file")
 }
@@ -639,7 +655,28 @@ function isSymlinkTo(path: string, target: string): boolean {
     if (!info.isSymbolicLink()) {
       return false
     }
-    return resolve(dirname(path), readlinkSync(path)) === resolve(target)
+    return (
+      normalizedResolvedPath(resolve(dirname(path), readlinkSync(path))) ===
+      normalizedResolvedPath(resolve(target))
+    )
+  } catch {
+    return false
+  }
+}
+
+function normalizedResolvedPath(path: string): string {
+  const normalized = path.replace(/^\\\\\?\\/, "")
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized
+}
+
+function isSharedFileLink(path: string, target: string): boolean {
+  if (isSymlinkTo(path, target)) {
+    return true
+  }
+  try {
+    const pathInfo = statSync(path)
+    const targetInfo = statSync(target)
+    return pathInfo.dev === targetInfo.dev && pathInfo.ino === targetInfo.ino
   } catch {
     return false
   }
