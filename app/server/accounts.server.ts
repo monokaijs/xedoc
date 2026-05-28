@@ -1149,12 +1149,6 @@ function prepareAccountCodexHomes(accounts: Pick<CodexAccount, "id">[]) {
   }
 }
 
-async function prepareAllAccountCodexHomes() {
-  prepareAccountCodexHomes(
-    await prisma.codexAccount.findMany({ select: { id: true } }),
-  )
-}
-
 function prepareAccountCodexHome(accountId: string): void {
   try {
     ensureAccountCodexHome(accountId)

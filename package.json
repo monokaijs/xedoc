@@ -35,7 +35,7 @@
     "start": "node ./server/index.mjs",
     "typecheck": "tsc --noEmit",
     "clean:build": "node -e \"import('node:fs/promises').then(({ rm }) => rm('build', { recursive: true, force: true }))\"",
-    "prepublishOnly": "pnpm typecheck",
+    "prepublishOnly": "pnpm prisma:generate && pnpm typecheck",
     "prepack": "pnpm clean:build && pnpm build",
     "publish:npm": "npm publish --access public",
     "publish:dry-run": "npm publish --access public --dry-run",
