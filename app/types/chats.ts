@@ -115,7 +115,7 @@ export type ChatDeliveryMode = 'queue' | 'steer';
 
 export interface InterruptChatRunResponse {
   chatId: string;
-  runId: string;
+  runId: string | null;
   status: Extract<RunStatus, 'QUEUED' | 'RUNNING' | 'CANCELLED'>;
   message: string;
 }

@@ -416,16 +416,6 @@ export function ensureCodexSharedChatHome(): string {
   return sharedChatHome
 }
 
-export function ensureCodexSharedPersonalizationFile(): {
-  codexHome: string
-  instructionsPath: string
-} {
-  const codexHome = ensureCodexSharedChatHome()
-  const instructionsPath = join(codexHome, "AGENTS.md")
-  ensureFile(instructionsPath, 0o600)
-  return { codexHome, instructionsPath }
-}
-
 export function resolveCodexSharedSessionIndexPath(): string {
   return join(resolveCodexSharedChatHome(), "session_index.jsonl")
 }
@@ -493,7 +483,6 @@ function ensureSharedCodexChatStorage(codexHome: string): void {
   ensureSharedSessionsLink(codexHome, sharedChatHome)
   ensureSharedSessionIndexLink(codexHome, sharedChatHome)
   ensureSharedStateDatabaseLinks(codexHome, sharedChatHome)
-  ensureSharedPersonalizationLinks(codexHome, sharedChatHome)
 }
 
 function ensureSharedSessionsLink(
@@ -589,43 +578,6 @@ function ensureSharedStateFileLink(
   symlinkSync(target, link, "file")
 }
 
-function ensureSharedPersonalizationLinks(
-  codexHome: string,
-  sharedChatHome: string,
-): void {
-  ensureSharedTextFileLink(codexHome, sharedChatHome, "AGENTS.md", true)
-  ensureSharedTextFileLink(codexHome, sharedChatHome, "AGENTS.override.md", false)
-}
-
-function ensureSharedTextFileLink(
-  codexHome: string,
-  sharedChatHome: string,
-  name: string,
-  createWhenMissing: boolean,
-): void {
-  const target = join(sharedChatHome, name)
-  const link = join(codexHome, name)
-
-  if (!createWhenMissing && !pathExists(target) && !pathExists(link)) {
-    return
-  }
-
-  ensureFile(target, 0o600)
-
-  if (isSymlinkTo(link, target)) {
-    return
-  }
-
-  const linkInfo = statIfExists(link)
-  if (linkInfo?.isFile()) {
-    mergeTextFile(link, target)
-  }
-  if (pathExists(link)) {
-    renameSync(link, nextBackupPath(link))
-  }
-  symlinkSync(target, link, "file")
-}
-
 function readDirectoryNames(path: string): string[] {
   try {
     return readdirSync(path)
@@ -678,30 +630,6 @@ function appendIndexFile(source: string, destination: string): void {
   appendFileSync(
     destination,
     `${prefix}${content.endsWith("\n") ? content : `${content}\n`}`,
-  )
-}
-
-function mergeTextFile(source: string, destination: string): void {
-  const content = readFileSync(source, "utf8")
-  if (!content.trim()) {
-    return
-  }
-
-  const destinationContent = readFileSync(destination, "utf8")
-  if (!destinationContent.trim()) {
-    copyFileSync(source, destination)
-    chmodSync(destination, 0o600)
-    return
-  }
-  if (destinationContent === content || destinationContent.includes(content)) {
-    return
-  }
-
-  const prefix = destinationContent.endsWith("\n") ? "" : "\n"
-  const suffix = content.endsWith("\n") ? content : `${content}\n`
-  appendFileSync(
-    destination,
-    `${prefix}\n<!-- Imported from ${basename(dirname(source))}/${basename(source)} during xedoc sharing. -->\n${suffix}`,
   )
 }
 

@@ -97,10 +97,10 @@ function messagesRepresentSameEntry(
   }
 
   if (next.requestId && previous.requestId) {
-    return next.requestId === previous.requestId
+    return next.requestId === previous.requestId && sameMessageScope(next, previous)
   }
   if (next.itemId && previous.itemId) {
-    return next.itemId === previous.itemId
+    return next.itemId === previous.itemId && sameMessageScope(next, previous)
   }
 
   if (next.kind !== "CHAT") {
@@ -116,6 +116,25 @@ function messagesRepresentSameEntry(
     return true
   }
   return isActive(previous) && nextContent.includes(previousContent)
+}
+
+function sameMessageScope(
+  next: ChatMessageResponse,
+  previous: ChatMessageResponse,
+): boolean {
+  if (next.runId && previous.runId && next.runId !== previous.runId) {
+    return false
+  }
+  if (next.runId && previous.runId) {
+    return true
+  }
+  if (next.turnId && previous.turnId && next.turnId !== previous.turnId) {
+    return false
+  }
+  if ((next.runId || previous.runId) && !(next.turnId && previous.turnId)) {
+    return false
+  }
+  return true
 }
 
 function normalizedContent(value: string): string {

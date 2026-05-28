@@ -199,7 +199,10 @@ export async function mirrorCodexSessionForAccount(
     "sessions",
     sessionRelativePath(sessionPath),
   )
-  if (resolve(sessionPath) === resolve(destination)) {
+  if (
+    resolve(sessionPath) === resolve(destination) ||
+    (await sameRealPath(sessionPath, destination))
+  ) {
     return
   }
   await mirrorSessionIndex(sessionPath)
@@ -217,7 +220,11 @@ export async function mirrorCodexSessionForAccount(
 async function mirrorSessionIndex(sessionPath: string): Promise<void> {
   const indexPath = localSessionIndexPath(sessionPath)
   const destination = resolveCodexSharedSessionIndexPath()
-  if (!indexPath || resolve(indexPath) === resolve(destination)) {
+  if (
+    !indexPath ||
+    resolve(indexPath) === resolve(destination) ||
+    (await sameRealPath(indexPath, destination))
+  ) {
     return
   }
   try {
@@ -234,6 +241,14 @@ async function mirrorSessionIndex(sessionPath: string): Promise<void> {
     )
   } catch {
     // The session file itself is enough for transcript import; index mirroring is best effort.
+  }
+}
+
+async function sameRealPath(left: string, right: string): Promise<boolean> {
+  try {
+    return (await realpath(left)) === (await realpath(right))
+  } catch {
+    return false
   }
 }
 

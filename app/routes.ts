@@ -19,7 +19,6 @@ export default [
   route("api/accounts", "routes/api.accounts.ts"),
   route("api/accounts/export", "routes/api.accounts.export.ts"),
   route("api/accounts/import", "routes/api.accounts.import.ts"),
-  route("api/accounts/personalization", "routes/api.accounts.personalization.ts"),
   route(
     "api/accounts/import-local-active",
     "routes/api.accounts.import-local-active.ts",
@@ -36,10 +35,6 @@ export default [
   route(
     "api/accounts/:accountId/runtime-settings",
     "routes/api.accounts.$accountId.runtime-settings.ts",
-  ),
-  route(
-    "api/accounts/:accountId/personalization",
-    "routes/api.accounts.$accountId.personalization.ts",
   ),
   route("api/accounts/:accountId/models", "routes/api.accounts.$accountId.models.ts"),
   route(

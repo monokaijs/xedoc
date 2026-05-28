@@ -1,7 +1,6 @@
 import type {
   AccountResponse,
   AccountRuntimeSettingsRequest,
-  AccountPersonalizationResponse,
   AccountExportDocument,
   AuthenticateAccountRequest,
   AuthenticateAccountResponse,
@@ -27,7 +26,6 @@ import type {
   AuthStatusResponse,
   ChatContextResponse,
   UpdateAccountRequest,
-  UpdateAccountPersonalizationRequest,
   UpdateChatRequest,
   GitActionRequest,
   GitActionResponse,
@@ -213,58 +211,6 @@ export async function updateAccountRuntimeSettings(
   return fetchJson<AccountResponse>(
     session.serverUrl,
     `/api/accounts/${accountId}/runtime-settings`,
-    {
-      body,
-      method: "PATCH",
-      token: session.token,
-    },
-  )
-}
-
-export async function getPersonalization(
-  session: ApiSession,
-): Promise<AccountPersonalizationResponse> {
-  return fetchJson<AccountPersonalizationResponse>(
-    session.serverUrl,
-    "/api/accounts/personalization",
-    { token: session.token },
-  )
-}
-
-export async function updatePersonalization(
-  session: ApiSession,
-  body: UpdateAccountPersonalizationRequest,
-): Promise<AccountPersonalizationResponse> {
-  return fetchJson<AccountPersonalizationResponse>(
-    session.serverUrl,
-    "/api/accounts/personalization",
-    {
-      body,
-      method: "PATCH",
-      token: session.token,
-    },
-  )
-}
-
-export async function getAccountPersonalization(
-  session: ApiSession,
-  accountId: string,
-): Promise<AccountPersonalizationResponse> {
-  return fetchJson<AccountPersonalizationResponse>(
-    session.serverUrl,
-    `/api/accounts/${accountId}/personalization`,
-    { token: session.token },
-  )
-}
-
-export async function updateAccountPersonalization(
-  session: ApiSession,
-  accountId: string,
-  body: UpdateAccountPersonalizationRequest,
-): Promise<AccountPersonalizationResponse> {
-  return fetchJson<AccountPersonalizationResponse>(
-    session.serverUrl,
-    `/api/accounts/${accountId}/personalization`,
     {
       body,
       method: "PATCH",

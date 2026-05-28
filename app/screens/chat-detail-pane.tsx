@@ -4,6 +4,7 @@ import type {
   ChatAttachmentInput,
   ChatEventPayloads,
   ChatEventType,
+  ChatMessageResponse,
   ChatResponse,
   CodexCollaborationMode,
   CodexPermissionMode,
@@ -19,6 +20,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Navigate, useParams } from "react-router"
 import { toast } from "sonner"
 import { TerminalDock } from "@/components/terminal-dock"
+import { ActiveFileChangesPanel } from "@/components/timeline/file-change-block"
 import {
   ChatComposerContextPanel,
   ChatTimeline,
@@ -193,6 +195,10 @@ export function ChatDetailPane() {
     () => findPendingQueuedMessages(messages),
     [messages],
   )
+  const activeFileChangeMessages = useMemo(
+    () => findActiveFileChangeMessages(messages, isRunning),
+    [isRunning, messages],
+  )
   const composerAccessoryVisible = !(
     terminalOpen && loadedChat?.workingDirectory
   )
@@ -204,8 +210,12 @@ export function ChatDetailPane() {
         ...(composerAccessoryVisible
           ? pendingQueuedMessages.map((message) => message.id)
           : []),
+        ...(composerAccessoryVisible
+          ? activeFileChangeMessages.map((message) => message.id)
+          : []),
       ].filter((id): id is string => !!id),
     [
+      activeFileChangeMessages,
       composerAccessoryVisible,
       pendingQueuedMessages,
       pinnedPlanMessage?.id,
@@ -344,7 +354,10 @@ export function ChatDetailPane() {
     mutationFn: () => interruptChatRun(session, chatId!),
     onError: (caught) => toast.error(readError(caught)),
     onSuccess: () => {
-      toast.message("Stop requested.")
+      void queryClient.invalidateQueries({ queryKey: chatQueryKey })
+      void queryClient.invalidateQueries({ queryKey: messagesQueryKey })
+      void queryClient.invalidateQueries({ queryKey: ["chats"] })
+      toast.message("Task cancelled.")
     },
   })
 
@@ -691,6 +704,7 @@ export function ChatDetailPane() {
                   steerQueuedMessageMutation.mutate(action)
                 }
               />
+              <ActiveFileChangesPanel messages={activeFileChangeMessages} />
               <ChatComposerContextPanel
                 chatId={chatId}
                 messages={messages}
@@ -770,7 +784,7 @@ export function ChatDetailPane() {
                         account={account}
                         autoRotate={chat?.autoRotateAccount ?? false}
                         autoRotateDisabled={
-                          !chat || updateRuntimeMutation.isPending
+                          !chat || isRunning || updateRuntimeMutation.isPending
                         }
                         connectedAccounts={connectedAccounts}
                         disabled={!chat || !connectedAccounts.length}
@@ -938,4 +952,29 @@ export function ChatDetailPane() {
       ) : null}
     </main>
   )
+}
+
+function findActiveFileChangeMessages(
+  messages: ChatMessageResponse[],
+  isRunning: boolean,
+): ChatMessageResponse[] {
+  if (!isRunning) {
+    return []
+  }
+  const activeRunId = [...messages]
+    .reverse()
+    .find(
+      (message) =>
+        message.runId &&
+        (message.status === "PENDING" || message.status === "STREAMING"),
+    )?.runId
+  if (!activeRunId) {
+    return []
+  }
+  return messages
+    .filter(
+      (message) =>
+        message.runId === activeRunId && message.kind === "FILE_CHANGE",
+    )
+    .sort((left, right) => left.sequence - right.sequence)
 }

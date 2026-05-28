@@ -150,7 +150,9 @@ const accountRunLocks = new Map<string, Promise<void>>()
 const queueFlushLocks = new Map<string, Promise<void>>()
 const runProjectionQueues = new Map<string, Promise<void>>()
 const timelineMessageLocks = new Map<string, Promise<void>>()
+const cancelledThreadActivity = new Map<string, number>()
 const DEFAULT_CHAT_TITLE = "New Thread"
+const CANCELLED_ACTIVITY_IGNORE_MS = 10 * 60 * 1000
 
 export async function createChat(dto: CreateChatRequest): Promise<ChatResponse> {
   const account = await readConnectedAccount(dto.accountId)
@@ -526,20 +528,102 @@ export async function interruptChatRun(threadId: string) {
   }
   const state = runtimeStates.get(threadId)
   if (!state?.runId) {
-    throw new HttpError(409, "There is no active run to stop.")
+    cancelledThreadActivity.set(threadId, Date.now())
+    emit(threadId, "chat.updated", await getChat(threadId))
+    return {
+      chatId: threadId,
+      runId: null,
+      status: "CANCELLED" as const,
+      message: "Marked the stale running task as cancelled.",
+    }
   }
+  const runId = state.runId
   state.interruptRequested = true
   if (state.runtime && state.turnId) {
-    await sendTurnInterrupt(state.runtime, state.turnId, threadId)
+    await sendTurnInterrupt(state.runtime, state.turnId, threadId).catch((error) => {
+      console.warn(
+        "Failed to send Codex interrupt; cancelling local run.",
+        error instanceof Error ? error.message : error,
+      )
+    })
   }
+  await cancelRuntimeRun(threadId, state, "Stop requested by user.")
   return {
     chatId: threadId,
-    runId: state.runId,
-    status: state.status === "RUNNING" ? "RUNNING" : "QUEUED",
-    message: state.turnId
-      ? "Stop signal sent to Codex."
-      : "Stop requested. Codex will be interrupted as soon as the turn starts.",
+    runId,
+    status: "CANCELLED" as const,
+    message: "Task cancelled.",
   }
+}
+
+async function cancelRuntimeRun(
+  threadId: string,
+  state: RuntimeThreadState,
+  reason: string,
+): Promise<void> {
+  const runId = state.runId
+  if (!runId) {
+    cancelledThreadActivity.set(threadId, Date.now())
+    emit(threadId, "chat.updated", await getChat(threadId))
+    return
+  }
+
+  cancelledThreadActivity.set(threadId, Date.now())
+  expirePendingServerRequests(threadId, runId, reason)
+  settleOpenRunTimelineMessages(threadId, runId, "COMPLETED")
+
+  const cancelledAt = new Date()
+  const assistant = [...state.messages]
+    .reverse()
+    .find(
+      (message) =>
+        message.runId === runId &&
+        message.role === "ASSISTANT" &&
+        message.kind === "CHAT",
+    )
+  if (assistant) {
+    const updated = updateRuntimeMessage(threadId, assistant.id, {
+      completedAt: cancelledAt,
+      metadataPatch: { interrupted: true, kind: "assistant" },
+      status: "COMPLETED",
+      touch: true,
+    })
+    if (updated) {
+      emit(threadId, "message.completed", updated)
+    }
+  }
+
+  for (const queuedTurn of state.queuedTurns) {
+    const updated = updateRuntimeMessage(threadId, queuedTurn.messageId, {
+      completedAt: cancelledAt,
+      metadataPatch: {
+        cancelledAt: cancelledAt.toISOString(),
+        queueStatus: "cancelled",
+      },
+      status: "COMPLETED",
+    })
+    if (updated) {
+      emit(threadId, "message.updated", updated)
+    }
+  }
+
+  if (state.accountId) {
+    codexRuntimeService.stopRuntime(state.accountId)
+  }
+  state.interruptRequested = false
+  state.queuedTurns = []
+  state.runId = null
+  state.runtime = undefined
+  state.status = "IDLE"
+  state.turnId = null
+  state.updatedAt = cancelledAt
+
+  emit(threadId, "chat.updated", await getChat(threadId))
+  emit(threadId, "run.status", {
+    error: reason,
+    runId,
+    status: "CANCELLED",
+  })
 }
 
 export async function steerQueuedMessage(
@@ -644,7 +728,11 @@ async function readThreadSnapshots(): Promise<Map<string, ThreadSnapshot>> {
     sessions.slice(0, 8).map(async (session) => {
       const activity = await readLocalCodexSessionActivity(session.externalThreadId)
       const snapshot = snapshots.get(session.externalThreadId)
-      if (snapshot && activity?.status === "RUNNING") {
+      if (
+        snapshot &&
+        activity?.status === "RUNNING" &&
+        !recentlyCancelledThreadActivity(session.externalThreadId)
+      ) {
         snapshot.status = "RUNNING"
       }
     }),
@@ -697,7 +785,8 @@ async function buildChatResponse(
     state?.status === "RUNNING" ||
     state?.status === "QUEUED" ||
     resolvedSnapshot?.status === "RUNNING" ||
-    externalActivity?.status === "RUNNING"
+    (externalActivity?.status === "RUNNING" &&
+      !recentlyCancelledThreadActivity(threadId))
   const preferenceFields = preferenceToChatFields(preference)
   const createdAt =
     preference?.createdAt ??
@@ -734,6 +823,18 @@ async function buildChatResponse(
     createdAt,
     updatedAt,
   }
+}
+
+function recentlyCancelledThreadActivity(threadId: string): boolean {
+  const cancelledAt = cancelledThreadActivity.get(threadId)
+  if (!cancelledAt) {
+    return false
+  }
+  if (Date.now() - cancelledAt <= CANCELLED_ACTIVITY_IGNORE_MS) {
+    return true
+  }
+  cancelledThreadActivity.delete(threadId)
+  return false
 }
 
 async function readCodexTranscriptMessages(
@@ -945,6 +1046,7 @@ function updateRuntimeMessage(
     metadataPatch?: JsonObject
     rawPayload?: unknown
     status?: ChatMessageResponse["status"]
+    touch?: boolean
     turnId?: string | null
   },
 ): ChatMessageResponse | null {
@@ -972,7 +1074,11 @@ function updateRuntimeMessage(
         ? toSerializable(patch.rawPayload)
         : existing.rawPayload,
     status: patch.status ?? existing.status,
+    sequence: patch.touch ? state.nextSequence : existing.sequence,
     turnId: patch.turnId === undefined ? existing.turnId : patch.turnId,
+  }
+  if (patch.touch) {
+    state.nextSequence += 1
   }
   state.messages[index] = updated
   state.updatedAt = new Date()
@@ -1279,7 +1385,13 @@ async function runCodexWithAccountLock(
   automaticTitleSeed: string | null,
 ): Promise<void> {
   const state = getRuntimeState(threadId)
+  if (state.runId !== runId) {
+    return
+  }
   const preference = await getThreadPreference(threadId)
+  if (state.runId !== runId) {
+    return
+  }
   const permissionMode = normalizeStoredPermissionMode(preference?.permissionMode)
   const runtime = runtimeForAccount(account)
   const usePrimedThread =
@@ -1297,6 +1409,9 @@ async function runCodexWithAccountLock(
   emit(threadId, "chat.updated", await getChat(threadId))
   emit(threadId, "run.status", { runId, status: "RUNNING" })
   await mirrorCodexSessionForAccount(threadId, account.id)
+  if (state.runId !== runId || !state.runtime) {
+    return
+  }
 
   let streamedContent = ""
   const streamBuffers = new Map<string, string>()
@@ -1354,6 +1469,9 @@ async function runCodexWithAccountLock(
         throw new Error("Codex returned a different thread id while resuming.")
       }
     }
+    if (state.runId !== runId) {
+      return
+    }
     scheduleAutomaticChatTitleIfNeeded({
       cwd: workingDirectory,
       runtime: state.runtime,
@@ -1365,6 +1483,9 @@ async function runCodexWithAccountLock(
       preference?.model ?? null,
       (preference?.reasoningEffort as CodexReasoningEffort | null) ?? null,
     )
+    if (state.runId !== runId) {
+      return
+    }
     terminalWaitAbort = new AbortController()
     terminalEventPromise = state.runtime.waitForEvent(
       (event) =>
@@ -1423,6 +1544,7 @@ async function runCodexWithAccountLock(
       content: finalContent,
       rawPayload: completedEvent,
       status: "COMPLETED",
+      touch: true,
       turnId: turnId ?? null,
     })
     settleOpenRunTimelineMessages(threadId, runId, "COMPLETED")
@@ -1445,6 +1567,9 @@ async function runCodexWithAccountLock(
   } catch (error) {
     terminalWaitAbort?.abort()
     await terminalEventPromise?.catch(() => undefined)
+    if (state.runId !== runId && state.status === "IDLE") {
+      return
+    }
     const message = error instanceof Error ? error.message : "Codex run failed."
     const keepPrimedRuntime = usePrimedThread && !turnStarted
     expirePendingServerRequests(threadId, runId, message)
@@ -1456,6 +1581,7 @@ async function runCodexWithAccountLock(
         content: streamedContent,
         metadataPatch: { interrupted: true, kind: "assistant" },
         status: "COMPLETED",
+        touch: true,
       })
       state.status = "IDLE"
       state.runtime = keepPrimedRuntime ? runtime : undefined
@@ -1476,6 +1602,7 @@ async function runCodexWithAccountLock(
       completedAt: failedAt,
       content: streamedContent,
       status: "FAILED",
+      touch: true,
     })
     state.status = "IDLE"
     state.runtime = keepPrimedRuntime ? runtime : undefined
@@ -2367,7 +2494,6 @@ function collaborationModePayload(
     ...(settings?.model
       ? {
           settings: {
-            developer_instructions: null,
             model: settings.model,
             reasoning_effort: settings.reasoningEffort ?? null,
           },
@@ -2880,6 +3006,7 @@ async function upsertTimelineMessage(input: {
           metadata: input.metadata,
           rawPayload: input.rawPayload,
           status: input.status,
+          touch: true,
           turnId: input.turnId ?? existing.turnId,
         })!
       : appendRuntimeMessage(input.threadId, {
@@ -2909,13 +3036,14 @@ function timelineMessageLockKey(input: {
   itemId?: string | null
   kind: ChatMessageResponse["kind"]
   requestId?: string | null
+  runId?: string | null
   threadId: string
 }): string | null {
   if (input.requestId) {
-    return `${input.threadId}:request:${input.requestId}`
+    return `${input.threadId}:${input.runId ?? "unknown-run"}:request:${input.requestId}`
   }
   if (input.itemId) {
-    return `${input.threadId}:item:${input.kind}:${input.itemId}`
+    return `${input.threadId}:${input.runId ?? "unknown-run"}:item:${input.kind}:${input.itemId}`
   }
   if (input.fallbackMessageId) {
     return `${input.threadId}:fallback:${input.fallbackMessageId}`
@@ -2930,6 +3058,7 @@ function findTimelineMessage(
     itemId?: string | null
     kind: ChatMessageResponse["kind"]
     requestId?: string | null
+    runId?: string | null
     threadId: string
   },
 ): ChatMessageResponse | null {
@@ -2940,15 +3069,20 @@ function findTimelineMessage(
   }
   if (input.requestId) {
     return (
-      state.messages.find((message) => message.requestId === input.requestId) ??
-      null
+      state.messages.find(
+        (message) =>
+          message.requestId === input.requestId &&
+          message.runId === input.runId,
+      ) ?? null
     )
   }
   if (input.itemId) {
     return (
       state.messages.find(
         (message) =>
-          message.itemId === input.itemId && message.kind === input.kind,
+          message.itemId === input.itemId &&
+          message.kind === input.kind &&
+          message.runId === input.runId,
       ) ?? null
     )
   }

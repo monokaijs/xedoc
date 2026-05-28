@@ -10,14 +10,12 @@ import type {
   CodexJsonRpcResponse,
   AccountExportDocument,
   AccountImportEntry,
-  AccountPersonalizationResponse,
   AccountRuntimeSettingsRequest,
   AccountResponse,
   ImportAccountsRequest,
   ImportAccountsResponse,
   CreateAccountRequest,
   JsonObject,
-  UpdateAccountPersonalizationRequest,
   UpdateAccountRequest,
 } from "@/types"
 import { normalizeEnvironment } from "./env.server"
@@ -27,7 +25,6 @@ import {
   clearCodexAccountInvalidated,
   codexRuntimeService,
   ensureAccountCodexHome,
-  ensureCodexSharedPersonalizationFile,
   resolveAccountCodexHome,
 } from "./codex-runtime.server"
 import { prisma } from "./prisma.server"
@@ -57,7 +54,6 @@ type LocalCodexAuthSnapshot = {
   fingerprint: string
 }
 
-const PERSONALIZATION_MAX_BYTES = 32 * 1024
 const ACCOUNT_AUTH_FILE_NAME = "auth.json"
 const ACCOUNT_AUTH_MAX_BYTES = 256 * 1024
 
@@ -283,73 +279,6 @@ export async function updateAccountRuntimeSettings(
       },
     }),
   )
-}
-
-export async function getSharedAccountPersonalization(): Promise<AccountPersonalizationResponse> {
-  const { codexHome, instructionsPath } = ensureCodexSharedPersonalizationFile()
-  await prepareAllAccountCodexHomes()
-
-  let instructions = ""
-  try {
-    instructions = readFileSync(instructionsPath, "utf8")
-  } catch (error) {
-    if (!isMissingFileError(error)) {
-      throw error
-    }
-  }
-
-  return {
-    accountId: null,
-    codexHome,
-    instructionsPath,
-    instructions,
-    maxBytes: PERSONALIZATION_MAX_BYTES,
-    shared: true,
-  }
-}
-
-export async function getAccountPersonalization(
-  accountId: string,
-): Promise<AccountPersonalizationResponse> {
-  await getAccount(accountId)
-  return {
-    ...(await getSharedAccountPersonalization()),
-    accountId,
-  }
-}
-
-export async function updateSharedAccountPersonalization(
-  dto: UpdateAccountPersonalizationRequest,
-): Promise<AccountPersonalizationResponse> {
-  const instructions = normalizePersonalizationInstructions(dto.instructions)
-  const { codexHome, instructionsPath } = ensureCodexSharedPersonalizationFile()
-  await prepareAllAccountCodexHomes()
-
-  writeFileSync(instructionsPath, instructions, {
-    encoding: "utf8",
-    mode: 0o600,
-  })
-  chmodSync(instructionsPath, 0o600)
-
-  return {
-    accountId: null,
-    codexHome,
-    instructionsPath,
-    instructions,
-    maxBytes: PERSONALIZATION_MAX_BYTES,
-    shared: true,
-  }
-}
-
-export async function updateAccountPersonalization(
-  accountId: string,
-  dto: UpdateAccountPersonalizationRequest,
-): Promise<AccountPersonalizationResponse> {
-  await getAccount(accountId)
-  return {
-    ...(await updateSharedAccountPersonalization(dto)),
-    accountId,
-  }
 }
 
 export async function deleteAccount(accountId: string) {
@@ -1235,29 +1164,6 @@ function prepareAccountCodexHome(accountId: string): void {
       error instanceof Error ? error.message : error,
     )
   }
-}
-
-function normalizePersonalizationInstructions(value: unknown): string {
-  if (typeof value !== "string") {
-    throw new HttpError(400, "instructions must be a string.")
-  }
-  const normalized = value.replace(/\r\n?/g, "\n")
-  if (Buffer.byteLength(normalized, "utf8") > PERSONALIZATION_MAX_BYTES) {
-    throw new HttpError(
-      400,
-      `instructions must be ${PERSONALIZATION_MAX_BYTES} bytes or fewer.`,
-    )
-  }
-  return normalized
-}
-
-function isMissingFileError(error: unknown): boolean {
-  return (
-    !!error &&
-    typeof error === "object" &&
-    "code" in error &&
-    (error as NodeJS.ErrnoException).code === "ENOENT"
-  )
 }
 
 function parseLoopbackCallbackUrl(value: string): URL {

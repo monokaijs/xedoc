@@ -94,19 +94,6 @@ export interface AccountRuntimeSettingsRequest {
   defaultServiceTier?: CodexServiceTier | null;
 }
 
-export interface AccountPersonalizationResponse {
-  accountId: string | null;
-  codexHome: string;
-  instructionsPath: string;
-  instructions: string;
-  maxBytes: number;
-  shared: boolean;
-}
-
-export interface UpdateAccountPersonalizationRequest {
-  instructions: string;
-}
-
 export interface LoginCallbackPortProcess {
   pid: number;
   command?: string;

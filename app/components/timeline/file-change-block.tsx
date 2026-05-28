@@ -151,6 +151,54 @@ export function FileChangeBlock({
   )
 }
 
+export function ActiveFileChangesPanel({
+  messages,
+}: {
+  messages: ChatMessageResponse[]
+}) {
+  const summary = useMemo(
+    () => (messages.length ? summarizeFileChanges(messages) : null),
+    [messages],
+  )
+  if (!summary) {
+    return null
+  }
+  const latestPath = summary.entries.at(-1)?.path
+
+  return (
+    <section
+      aria-label="Latest file changes"
+      aria-live="polite"
+      className="border-b bg-background px-3 py-2"
+    >
+      <div className="mx-auto w-full min-w-0 max-w-3xl">
+        <div className="flex min-w-0 items-center gap-2 overflow-hidden rounded-lg border bg-muted/20 px-3 py-2 text-sm shadow-sm">
+          <FileDiff className="size-4 shrink-0 text-muted-foreground" />
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="shrink-0 font-medium">Latest changes</span>
+              <DiffCountText
+                additions={summary.additions}
+                deletions={summary.deletions}
+              />
+            </div>
+            <div className="min-w-0 truncate text-xs text-muted-foreground">
+              {summary.entries.length
+                ? `${summary.entries.length} ${summary.entries.length === 1 ? "file" : "files"} changed${latestPath ? `: ${latestPath}` : ""}`
+                : "File changes detected"}
+            </div>
+          </div>
+          {summary.statuses.at(-1) ? (
+            <Badge className="shrink-0" variant="secondary">
+              {summary.statuses.at(-1)}
+            </Badge>
+          ) : null}
+        </div>
+      </div>
+    </section>
+  )
+}
+
 type FileChangeEntry = {
   action?: string
   additions: number
