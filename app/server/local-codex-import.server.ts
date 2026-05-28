@@ -521,11 +521,6 @@ function parseLocalCodexSessionJsonl(
       continue
     }
 
-    const eventMessage = importedEventMessage(record, timestamp, context)
-    if (eventMessage) {
-      eventMessages.push({ ...eventMessage, order: lineIndex })
-    }
-
     if (record.type === "event_msg" && payloadType === "task_complete") {
       const completedTurnId = readTurnIdFromPayload(payload)
       if (!completedTurnId || completedTurnId === activeTurnId) {
@@ -533,6 +528,11 @@ function parseLocalCodexSessionJsonl(
         activeTurnId = undefined
       }
       currentTurnId = undefined
+    }
+
+    const eventMessage = importedEventMessage(record, timestamp, context)
+    if (eventMessage) {
+      eventMessages.push({ ...eventMessage, order: lineIndex })
     }
   }
 

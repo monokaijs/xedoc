@@ -273,11 +273,15 @@ export function ChatDetailPane() {
     : false
 
   const updateAccountMutation = useMutation({
-    mutationFn: (input: { accountId: string; notify?: boolean }) =>
-      updateChat(session, chatId!, { accountId: input.accountId }),
+    mutationFn: async (input: { accountId: string; notify?: boolean }) => {
+      if (!chatId) {
+        throw new Error("Chat is not available.")
+      }
+      return updateChat(session, chatId, { accountId: input.accountId })
+    },
     onError: (caught) => toast.error(readError(caught)),
     onSuccess: (chat, input) => {
-      queryClient.setQueryData(chatQueryKey, chat)
+      queryClient.setQueryData(["chat", chat.id], chat)
       void queryClient.invalidateQueries({ queryKey: ["chats"] })
       if (input.notify !== false) {
         toast.success("Chat account updated.")
@@ -293,10 +297,15 @@ export function ChatDetailPane() {
       permissionMode?: CodexPermissionMode | null
       reasoningEffort?: CodexReasoningEffort | null
       serviceTier?: CodexServiceTier | null
-    }) => updateChat(session, chatId!, patch),
+    }) => {
+      if (!chatId) {
+        throw new Error("Chat is not available.")
+      }
+      return updateChat(session, chatId, patch)
+    },
     onError: (caught) => toast.error(readError(caught)),
     onSuccess: (chat) => {
-      queryClient.setQueryData(chatQueryKey, chat)
+      queryClient.setQueryData(["chat", chat.id], chat)
       void queryClient.invalidateQueries({ queryKey: ["chats"] })
     },
   })
@@ -326,51 +335,74 @@ export function ChatDetailPane() {
       content?: string
       delivery?: ExecuteChatRequest["delivery"]
       metadata?: Record<string, unknown>
-    }) =>
-      executeChatMessage(session, chatId!, {
+    }) => {
+      if (!chatId) {
+        throw new Error("Chat is not available.")
+      }
+      const targetChatId = chatId
+      return executeChatMessage(session, targetChatId, {
         attachments: input?.attachments,
         collaborationMode: input?.collaborationMode,
         content: (input?.content ?? content).trim(),
         delivery: input?.delivery,
         metadata: input?.metadata,
-      }),
+      }).then((response) => ({ chatId: targetChatId, response }))
+    },
     onError: (caught) => toast.error(readError(caught)),
-    onSuccess: (response, input) => {
-      stickToBottomRef.current = true
-      if (input?.clearComposer ?? true) {
+    onSuccess: ({ chatId: targetChatId, response }, input) => {
+      if (targetChatId === chatId) {
+        stickToBottomRef.current = true
+      }
+      if (targetChatId === chatId && (input?.clearComposer ?? true)) {
         setContent("")
         setAttachments([])
       }
       queryClient.setQueryData<MessagePageResponse | undefined>(
-        messagesQueryKey,
+        ["messages", targetChatId],
         (page) => appendMessages(page, executeResponseMessages(response)),
       )
-      void queryClient.invalidateQueries({ queryKey: chatQueryKey })
+      void queryClient.invalidateQueries({ queryKey: ["chat", targetChatId] })
       void queryClient.invalidateQueries({ queryKey: ["chats"] })
     },
   })
 
   const interruptMutation = useMutation({
-    mutationFn: () => interruptChatRun(session, chatId!),
+    mutationFn: async () => {
+      if (!chatId) {
+        throw new Error("Chat is not available.")
+      }
+      const targetChatId = chatId
+      return interruptChatRun(session, targetChatId).then((response) => ({
+        chatId: targetChatId,
+        response,
+      }))
+    },
     onError: (caught) => toast.error(readError(caught)),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: chatQueryKey })
-      void queryClient.invalidateQueries({ queryKey: messagesQueryKey })
+    onSuccess: ({ chatId: targetChatId }) => {
+      void queryClient.invalidateQueries({ queryKey: ["chat", targetChatId] })
+      void queryClient.invalidateQueries({ queryKey: ["messages", targetChatId] })
       void queryClient.invalidateQueries({ queryKey: ["chats"] })
       toast.message("Task cancelled.")
     },
   })
 
   const steerQueuedMessageMutation = useMutation({
-    mutationFn: (action: QueuedMessageAction) =>
-      steerQueuedChatMessage(session, chatId!, action.queueId),
+    mutationFn: async (action: QueuedMessageAction) => {
+      if (!chatId) {
+        throw new Error("Chat is not available.")
+      }
+      const targetChatId = chatId
+      return steerQueuedChatMessage(session, targetChatId, action.queueId).then(
+        (message) => ({ chatId: targetChatId, message }),
+      )
+    },
     onError: (caught) => toast.error(readError(caught)),
-    onSuccess: (message) => {
+    onSuccess: ({ chatId: targetChatId, message }) => {
       queryClient.setQueryData<MessagePageResponse | undefined>(
-        messagesQueryKey,
+        ["messages", targetChatId],
         (page) => appendMessage(page, message),
       )
-      void queryClient.invalidateQueries({ queryKey: chatQueryKey })
+      void queryClient.invalidateQueries({ queryKey: ["chat", targetChatId] })
       void queryClient.invalidateQueries({ queryKey: ["chats"] })
     },
   })

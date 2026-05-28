@@ -1,10 +1,11 @@
-import type { ChatResponse } from "@/types"
+import type { ChatResponse, ChatStatus } from "@/types"
 import { useMutation, useQueryClient } from "@tanstack/react-query"
 import {
   Archive,
   ChevronDown,
+  Circle,
   Folder,
-  MessageSquare,
+  Loader2,
   MoreHorizontal,
   Pencil,
   Plus,
@@ -235,10 +236,10 @@ export function ChatSidebar({
                           className="h-7 min-w-0 flex-1 px-2 pr-2! text-xs"
                           isActive={chat.id === chatId}
                           size="sm"
-                          tooltip={`${chat.title} · ${dateLabel} · ${folderName}`}
+                          tooltip={`${chat.title} · ${chatStatusLabel(chat.status)} · ${dateLabel} · ${folderName}`}
                           onClick={() => navigate(`/chat/${chat.id}`)}
                         >
-                          <MessageSquare className="size-3.5 text-muted-foreground" />
+                          <ChatStatusIcon status={chat.status} />
                           <span className="min-w-0 flex-1 truncate">
                             {chat.title}
                           </span>
@@ -398,4 +399,37 @@ export function ChatSidebar({
       </Dialog>
     </>
   )
+}
+
+function ChatStatusIcon({ status }: { status: ChatStatus }) {
+  if (status === "RUNNING") {
+    return (
+      <Loader2
+        aria-label="Running"
+        className="size-3.5 shrink-0 animate-spin text-cyan-500"
+      />
+    )
+  }
+  return (
+    <Circle
+      aria-label={chatStatusLabel(status)}
+      className={cn(
+        "size-3.5 shrink-0",
+        status === "ARCHIVED"
+          ? "fill-muted-foreground/20 text-muted-foreground/70"
+          : "fill-emerald-500/20 text-emerald-500",
+      )}
+    />
+  )
+}
+
+function chatStatusLabel(status: ChatStatus): string {
+  switch (status) {
+    case "RUNNING":
+      return "running"
+    case "ARCHIVED":
+      return "archived"
+    case "IDLE":
+      return "idle"
+  }
 }

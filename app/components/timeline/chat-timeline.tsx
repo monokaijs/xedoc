@@ -47,7 +47,10 @@ import { Textarea } from "@/components/ui/textarea"
 import { appendMessage, respondToServerRequest } from "@/lib/api"
 import type { WebSession } from "@/lib/session-storage"
 import { cn } from "@/lib/utils"
-import { FileChangeBlock } from "@/components/timeline/file-change-block"
+import {
+  ActiveFileChangeInlineRow,
+  FileChangeBlock,
+} from "@/components/timeline/file-change-block"
 import {
   compactActionIcon,
   compactActionLabel,
@@ -503,6 +506,7 @@ function CodexTurnRow({
     },
     null,
   )
+  const turnActive = messages.some(isActiveMessage)
 
   return (
     <article className="mx-auto flex w-full min-w-0 max-w-full justify-start overflow-hidden">
@@ -529,6 +533,7 @@ function CodexTurnRow({
               planActionDisabled={planActionDisabled}
               planActionPending={planActionPending}
               session={session}
+              turnActive={turnActive}
             />
           ))}
           {turnSummary ? <CodexTurnSummaryDivider summary={turnSummary} /> : null}
@@ -644,10 +649,12 @@ function CodexRenderItemContent({
   planActionDisabled,
   planActionPending,
   session,
+  turnActive,
 }: {
   chatId: string
   item: CodexRenderItem
   session: WebSession
+  turnActive?: boolean
 } & PlanActionHandlers &
   FileChangeActionHandlers) {
   if (item.type === "toolBurst") {
@@ -657,6 +664,15 @@ function CodexRenderItemContent({
     return <PreviousActionsBlock messages={item.messages} />
   }
   if (item.type === "fileChanges") {
+    if (turnActive) {
+      return (
+        <div className="grid min-w-0 gap-1.5">
+          {item.messages.map((message) => (
+            <ActiveFileChangeInlineRow key={message.id} message={message} />
+          ))}
+        </div>
+      )
+    }
     return (
       <FileChangeBlock
         disabled={fileChangeActionDisabled}
@@ -666,6 +682,9 @@ function CodexRenderItemContent({
         onUndo={onUndoFileChanges}
       />
     )
+  }
+  if (item.message.kind === "FILE_CHANGE" && turnActive) {
+    return <ActiveFileChangeInlineRow message={item.message} />
   }
   return (
     <TimelineContent
@@ -1005,6 +1024,9 @@ function TimelineContent({
         />
       )
     case "FILE_CHANGE":
+      if (isActiveMessage(message)) {
+        return <ActiveFileChangeInlineRow message={message} />
+      }
       return (
         <FileChangeBlock
           disabled={fileChangeActionDisabled}

@@ -18,6 +18,9 @@ import {
 } from "@/components/ui/dialog"
 import { FileViewerContext } from "@/components/timeline/file-viewer-context"
 import type { FileChangePromptAction } from "@/components/timeline/chat-timeline"
+import { cn } from "@/lib/utils"
+
+const ACTIVE_FILE_CHANGE_VISIBLE_COUNT = 4
 
 export function FileChangeBlock({
   disabled,
@@ -156,14 +159,12 @@ export function ActiveFileChangesPanel({
 }: {
   messages: ChatMessageResponse[]
 }) {
-  const summary = useMemo(
-    () => (messages.length ? summarizeFileChanges(messages) : null),
-    [messages],
-  )
-  if (!summary) {
+  const rows = useMemo(() => activeFileChangeRows(messages), [messages])
+  if (!rows.length) {
     return null
   }
-  const latestPath = summary.entries.at(-1)?.path
+  const visibleRows = rows.slice(-ACTIVE_FILE_CHANGE_VISIBLE_COUNT)
+  const hiddenCount = Math.max(0, rows.length - visibleRows.length)
 
   return (
     <section
@@ -172,31 +173,43 @@ export function ActiveFileChangesPanel({
       className="border-b bg-background px-3 py-2"
     >
       <div className="mx-auto w-full min-w-0 max-w-3xl">
-        <div className="flex min-w-0 items-center gap-2 overflow-hidden rounded-lg border bg-muted/20 px-3 py-2 text-sm shadow-sm">
-          <FileDiff className="size-4 shrink-0 text-muted-foreground" />
-          <div className="min-w-0 flex-1">
+        <div className="grid min-w-0 gap-1.5 overflow-hidden rounded-lg border bg-muted/20 p-2 text-sm shadow-sm">
+          <div className="flex min-w-0 items-center justify-between gap-2 px-1">
             <div className="flex min-w-0 items-center gap-2">
-              <span className="shrink-0 font-medium">Latest changes</span>
-              <DiffCountText
-                additions={summary.additions}
-                deletions={summary.deletions}
-              />
+              <FileDiff className="size-4 shrink-0 text-muted-foreground" />
+              <span className="min-w-0 truncate font-medium">
+                File changes
+              </span>
             </div>
-            <div className="min-w-0 truncate text-xs text-muted-foreground">
-              {summary.entries.length
-                ? `${summary.entries.length} ${summary.entries.length === 1 ? "file" : "files"} changed${latestPath ? `: ${latestPath}` : ""}`
-                : "File changes detected"}
+            <div className="flex shrink-0 items-center gap-1">
+              {hiddenCount > 0 ? (
+                <Badge variant="outline">+{hiddenCount} earlier</Badge>
+              ) : null}
+              <Badge variant="secondary">running</Badge>
             </div>
           </div>
-          {summary.statuses.at(-1) ? (
-            <Badge className="shrink-0" variant="secondary">
-              {summary.statuses.at(-1)}
-            </Badge>
-          ) : null}
+          <div className="grid min-w-0 gap-1">
+            {visibleRows.map((row) => (
+              <FileChangeActivityRow key={row.id} row={row} />
+            ))}
+          </div>
         </div>
       </div>
     </section>
   )
+}
+
+export function ActiveFileChangeInlineRow({
+  message,
+}: {
+  message: ChatMessageResponse
+}) {
+  const rows = useMemo(() => activeFileChangeRows([message]), [message])
+  const row = rows.at(-1)
+  if (!row) {
+    return null
+  }
+  return <FileChangeActivityRow inline row={row} />
 }
 
 type FileChangeEntry = {
@@ -214,6 +227,124 @@ type FileChangeSummary = {
   entries: FileChangeEntry[]
   message: ChatMessageResponse
   statuses: string[]
+}
+
+type ActiveFileChangeActivity = FileChangeEntry & {
+  id: string
+  messageStatus: ChatMessageResponse["status"]
+  sequence: number
+  statusLabel: string
+}
+
+function FileChangeActivityRow({
+  inline,
+  row,
+}: {
+  inline?: boolean
+  row: ActiveFileChangeActivity
+}) {
+  const openFile = useContext(FileViewerContext)
+  const active =
+    row.messageStatus === "STREAMING" || row.messageStatus === "PENDING"
+  return (
+    <div
+      className={cn(
+        "grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 overflow-hidden rounded-md",
+        inline
+          ? "border bg-background px-3 py-2 text-sm"
+          : "bg-background px-2 py-1.5 text-xs",
+      )}
+    >
+      {active ? (
+        <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
+      ) : (
+        <FileDiff className="size-3.5 shrink-0 text-muted-foreground" />
+      )}
+      <button
+        className="grid min-w-0 gap-0.5 text-left"
+        type="button"
+        onClick={() => openFile?.({ path: row.path })}
+      >
+        <span className="truncate font-medium">
+          {activeFileChangeActionLabel(row.action)}
+        </span>
+        <span className="truncate font-mono text-xs text-muted-foreground">
+          {row.path}
+        </span>
+      </button>
+      <div className="flex shrink-0 items-center gap-1">
+        <DiffCountText additions={row.additions} deletions={row.deletions} />
+        <Badge variant="secondary">{row.statusLabel}</Badge>
+      </div>
+    </div>
+  )
+}
+
+function activeFileChangeRows(
+  messages: ChatMessageResponse[],
+): ActiveFileChangeActivity[] {
+  const ordered = [...messages].sort(
+    (left, right) => left.sequence - right.sequence,
+  )
+  return ordered.flatMap((message) => {
+    const metadata = metadataAs<ChatFileChangeMetadata>(message.metadata)
+    const entries = fileChangeEntriesFromMetadata(metadata)
+    const statusLabel = fileChangeStatusLabel(message, metadata)
+    if (entries.length) {
+      return entries.map((entry, index) => ({
+        ...entry,
+        id: `${message.id}:${entry.path}:${index}`,
+        messageStatus: message.status,
+        sequence: message.sequence,
+        statusLabel,
+      }))
+    }
+    const fallbackPath = metadata?.paths?.[0] ?? "File change in progress"
+    return [
+      {
+        action: "Changing",
+        additions: metadata?.additions ?? 0,
+        deletions: metadata?.deletions ?? 0,
+        id: `${message.id}:fallback`,
+        messageStatus: message.status,
+        path: fallbackPath,
+        sequence: message.sequence,
+        statusLabel,
+      },
+    ]
+  })
+}
+
+function fileChangeStatusLabel(
+  message: ChatMessageResponse,
+  metadata?: ChatFileChangeMetadata,
+): string {
+  if (metadata?.status?.trim()) {
+    return metadata.status.trim().toLowerCase()
+  }
+  if (message.status === "STREAMING" || message.status === "PENDING") {
+    return "running"
+  }
+  return message.status.toLowerCase()
+}
+
+function activeFileChangeActionLabel(action?: string): string {
+  switch (action?.trim().toLowerCase()) {
+    case "created":
+    case "create":
+      return "Creating"
+    case "deleted":
+    case "delete":
+      return "Deleting"
+    case "renamed":
+    case "rename":
+      return "Renaming"
+    case "edited":
+    case "edit":
+      return "Editing"
+    default:
+      return "Changing"
+  }
 }
 
 function summarizeFileChanges(

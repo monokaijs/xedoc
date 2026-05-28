@@ -126,6 +126,9 @@ function collapseCompletedTurnActions(
 function compactToolBursts(items: CodexRenderSourceItem[]): CodexRenderItem[] {
   const projected: CodexRenderItem[] = []
   let pending: ChatMessageResponse[] = []
+  const turnActive = items.some(
+    (item) => item.type === "message" && isActiveMessage(item.message),
+  )
 
   const flushPending = () => {
     if (!pending.length) {
@@ -161,7 +164,7 @@ function compactToolBursts(items: CodexRenderSourceItem[]): CodexRenderItem[] {
     }
 
     if (isToolBurstCandidate(item.message)) {
-      if (isActiveMessage(item.message)) {
+      if (turnActive || isActiveMessage(item.message)) {
         flushPending()
         projected.push({
           id: `message:${item.message.id}`,
@@ -196,6 +199,14 @@ function compactToolBursts(items: CodexRenderSourceItem[]): CodexRenderItem[] {
 function compactFileChangeBlocks(
   items: CodexRenderSourceItem[],
 ): CodexRenderSourceItem[] {
+  if (
+    items.some(
+      (item) => item.type === "message" && isActiveMessage(item.message),
+    )
+  ) {
+    return items
+  }
+
   const projected: CodexRenderSourceItem[] = []
   let pending: ChatMessageResponse[] = []
 
@@ -213,7 +224,11 @@ function compactFileChangeBlocks(
   }
 
   for (const item of items) {
-    if (item.type !== "message" || item.message.kind !== "FILE_CHANGE") {
+    if (
+      item.type !== "message" ||
+      item.message.kind !== "FILE_CHANGE" ||
+      isActiveMessage(item.message)
+    ) {
       flushPending()
       projected.push(item)
       continue
