@@ -5,4 +5,5 @@ export type * from './codex';
 export type * from './json';
 export type * from './realtime';
 export type * from './terminals';
+export type * from './workflow';
 export type * from './workspaces';

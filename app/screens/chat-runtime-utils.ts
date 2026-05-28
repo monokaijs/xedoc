@@ -56,11 +56,28 @@ export function selectBestAvailableAccount(
   return accounts
     .map((account, index) => ({
       account,
+      hasSnapshot: !!snapshots[account.id],
       index,
       score: accountAvailabilityScore(snapshots[account.id]),
     }))
-    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .filter((entry) => entry.score >= 0)
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        Number(right.hasSnapshot) - Number(left.hasSnapshot) ||
+        left.index - right.index,
+    )
     .at(0)?.account
+}
+
+export function hasAvailableAccountSnapshot(
+  accounts: AccountResponse[],
+  snapshots: Record<string, CodexRateLimitSnapshot>,
+): boolean {
+  return accounts.some((account) => {
+    const snapshot = snapshots[account.id]
+    return !!snapshot && accountAvailabilityScore(snapshot) >= 0
+  })
 }
 
 export function accountAvailabilityScore(

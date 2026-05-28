@@ -1797,10 +1797,17 @@ function selectBestAvailableAccount(
   return accounts
     .map((account, index) => ({
       account,
+      hasSnapshot: !!snapshots.get(account.id),
       index,
       score: accountAvailabilityScore(snapshots.get(account.id)),
     }))
-    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .filter((entry) => entry.score >= 0)
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        Number(right.hasSnapshot) - Number(left.hasSnapshot) ||
+        left.index - right.index,
+    )
     .at(0)?.account
 }
 

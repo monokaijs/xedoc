@@ -47,6 +47,7 @@ import {
   appendMessages,
   canSend,
   executeResponseMessages,
+  hasAvailableAccountSnapshot,
   isAccountTokenInvalidatedError,
   readError,
   routeWorkingDirectoryFromState,
@@ -81,9 +82,7 @@ export function NewChatPane() {
   const [collaborationMode, setCollaborationMode] =
     useState<CodexCollaborationMode>("default")
   const [model, setModel] = useState<string | null>(null)
-  const [autoRotateAccount, setAutoRotateAccount] = useState(
-    lastOpenedChat?.autoRotateAccount ?? false,
-  )
+  const [autoRotateAccount, setAutoRotateAccount] = useState(true)
   const [newChatAccountId, setNewChatAccountId] = useState<string | null>(null)
   const [permissionMode, setPermissionMode] =
     useState<CodexPermissionMode>("default")
@@ -137,10 +136,18 @@ export function NewChatPane() {
     }
   }, [lastOpenedChat])
 
+  const quotaSelectionPending = useMemo(
+    () =>
+      connectedAccounts.some((account) => accountRateLimitFetching[account.id]) &&
+      !hasAvailableAccountSnapshot(connectedAccounts, accountRateLimitSnapshots),
+    [accountRateLimitFetching, accountRateLimitSnapshots, connectedAccounts],
+  )
   const bestAvailableAccount = useMemo(
     () =>
-      selectBestAvailableAccount(connectedAccounts, accountRateLimitSnapshots),
-    [accountRateLimitSnapshots, connectedAccounts],
+      quotaSelectionPending
+        ? undefined
+        : selectBestAvailableAccount(connectedAccounts, accountRateLimitSnapshots),
+    [accountRateLimitSnapshots, connectedAccounts, quotaSelectionPending],
   )
   const manuallySelectedAccount = connectedAccounts.find(
     (account) => account.id === newChatAccountId,
@@ -153,8 +160,7 @@ export function NewChatPane() {
     ) < 0
       ? undefined
       : manuallySelectedAccount) ??
-    bestAvailableAccount ??
-    connectedAccounts[0]
+    bestAvailableAccount
 
   useEffect(() => {
     if (!selectedConnectedAccount?.id) {
@@ -259,7 +265,7 @@ export function NewChatPane() {
     onSuccess: ({ chat, response }) => {
       setContent("")
       setAttachments([])
-      setAutoRotateAccount(false)
+      setAutoRotateAccount(true)
       setCollaborationMode("default")
       setPermissionMode(
         selectedConnectedAccount?.defaultPermissionMode ?? "default",

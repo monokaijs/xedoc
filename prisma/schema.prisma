@@ -55,6 +55,13 @@ enum RunStatus {
   CANCELLED
 }
 
+enum WorkflowTaskStatus {
+  pending
+  in_progress
+  finished
+  failed
+}
+
 model ServerAuth {
   id           String   @id @default("server")
   passwordHash String
@@ -178,4 +185,18 @@ model ChatRun {
   @@index([chatId, createdAt])
   @@index([accountId])
   @@index([externalTurnId])
+}
+
+model WorkflowTask {
+  id          String             @id @default(uuid())
+  projectPath String
+  title       String
+  description String             @default("")
+  status      WorkflowTaskStatus @default(pending)
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  @@index([projectPath])
+  @@index([status])
+  @@index([updatedAt])
 }

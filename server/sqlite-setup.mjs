@@ -334,6 +334,15 @@ const schemaStatements = [
         CONSTRAINT "ChatRun_chatId_fkey" FOREIGN KEY ("chatId") REFERENCES "Chat" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
         CONSTRAINT "ChatRun_accountId_fkey" FOREIGN KEY ("accountId") REFERENCES "CodexAccount" ("id") ON DELETE RESTRICT ON UPDATE CASCADE
       )`,
+  `CREATE TABLE IF NOT EXISTS "WorkflowTask" (
+        "id" TEXT NOT NULL PRIMARY KEY,
+        "projectPath" TEXT NOT NULL,
+        "title" TEXT NOT NULL,
+        "description" TEXT NOT NULL DEFAULT '',
+        "status" TEXT NOT NULL DEFAULT 'pending',
+        "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        "updatedAt" DATETIME NOT NULL
+      )`,
   'ALTER TABLE "CodexAccount" ADD COLUMN "defaultModel" TEXT',
   'ALTER TABLE "CodexAccount" ADD COLUMN "defaultPermissionMode" TEXT',
   'ALTER TABLE "CodexAccount" ADD COLUMN "defaultReasoningEffort" TEXT',
@@ -356,4 +365,7 @@ const schemaStatements = [
   'CREATE INDEX IF NOT EXISTS "ChatRun_externalTurnId_idx" ON "ChatRun"("externalTurnId")',
   'CREATE INDEX IF NOT EXISTS "ThreadPreference_accountId_idx" ON "ThreadPreference"("accountId")',
   'CREATE INDEX IF NOT EXISTS "ThreadPreference_archivedAt_idx" ON "ThreadPreference"("archivedAt")',
+  'CREATE INDEX IF NOT EXISTS "WorkflowTask_projectPath_idx" ON "WorkflowTask"("projectPath")',
+  'CREATE INDEX IF NOT EXISTS "WorkflowTask_status_idx" ON "WorkflowTask"("status")',
+  'CREATE INDEX IF NOT EXISTS "WorkflowTask_updatedAt_idx" ON "WorkflowTask"("updatedAt")',
 ]

@@ -128,6 +128,7 @@ const globalForCodexState = globalThis as typeof globalThis & {
 }
 
 const DEFAULT_SCAN_INTERVAL_MS = 30_000
+const STALE_ACTIVE_SESSION_MS = 10 * 60 * 1000
 const DEFAULT_MAX_FILES = 1_000
 const DEFAULT_MAX_FILE_BYTES = 25 * 1024 * 1024
 const FILE_CACHE_MAX_ENTRIES = 100
@@ -559,7 +560,10 @@ function parseLocalCodexSessionJsonl(
     originator,
     path,
     source,
-    status: activeTurnId ? "RUNNING" : "IDLE",
+    status:
+      activeTurnId && !activeSessionLooksStale(updatedAt ?? fallbackTimestamp)
+        ? "RUNNING"
+        : "IDLE",
     title,
     updatedAt: updatedAt ?? fallbackTimestamp,
     workingDirectory,
@@ -1237,10 +1241,15 @@ export function isInternalEnvironmentContext(content: string): boolean {
     .toLowerCase()
     .replace(/[_\s]+/g, " ")
   return (
+    normalized.startsWith("# agents.md instructions for ") ||
     normalized.startsWith("<environment context>") ||
     normalized.startsWith("environment context") ||
     normalized.startsWith("environmentcontext")
   )
+}
+
+function activeSessionLooksStale(updatedAt: Date): boolean {
+  return Date.now() - updatedAt.getTime() > STALE_ACTIVE_SESSION_MS
 }
 
 function importedMessageMetadata(

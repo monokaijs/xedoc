@@ -21,6 +21,7 @@
     "server/index.mjs",
     "server/terminal-socket.mjs",
     "server/sqlite-setup.mjs",
+    "server/workflow-mcp.mjs",
     "README.md"
   ],
   "engines": {
