@@ -9,7 +9,7 @@ import type {
   MessagePageResponse,
 } from "@/types"
 import { ApiError, appendMessage } from "@/lib/api"
-import { clampPercent, usageCapacitySeverity } from "@/lib/rate-limits"
+import { clampPercent } from "@/lib/rate-limits"
 import type { ComposerAttachment } from "@/screens/components/composer-attachments"
 
 export function autoRotateTargetAccountForChat(
@@ -53,21 +53,18 @@ export function selectBestAvailableAccount(
   accounts: AccountResponse[],
   snapshots: Record<string, CodexRateLimitSnapshot>,
 ): AccountResponse | undefined {
-  return accounts
-    .map((account, index) => ({
-      account,
-      hasSnapshot: !!snapshots[account.id],
-      index,
-      score: accountAvailabilityScore(snapshots[account.id]),
-    }))
-    .filter((entry) => entry.score >= 0)
-    .sort(
-      (left, right) =>
-        right.score - left.score ||
-        Number(right.hasSnapshot) - Number(left.hasSnapshot) ||
-        left.index - right.index,
-    )
-    .at(0)?.account
+  let bestAccount: AccountResponse | undefined
+  let bestScore = -1
+
+  for (const account of accounts) {
+    const score = accountAvailabilityScore(snapshots[account.id])
+    if (score > bestScore) {
+      bestAccount = account
+      bestScore = score
+    }
+  }
+
+  return bestAccount
 }
 
 export function hasAvailableAccountSnapshot(
@@ -86,14 +83,7 @@ export function accountAvailabilityScore(
   if (!snapshot) {
     return 0
   }
-  if (snapshot.rateLimitReachedType || usageCapacitySeverity(snapshot)) {
-    return -1
-  }
-  if (
-    snapshot.credits &&
-    !snapshot.credits.unlimited &&
-    !snapshot.credits.hasCredits
-  ) {
+  if (snapshot.rateLimitReachedType) {
     return -1
   }
   if (snapshot.credits?.unlimited) {
@@ -108,7 +98,7 @@ export function accountAvailabilityScore(
     return 0
   }
   const score = Math.min(...remainingPercents)
-  return score < 1 ? -1 : score
+  return score <= 0 ? -1 : score
 }
 
 export function fullRateLimitWindowLabel(

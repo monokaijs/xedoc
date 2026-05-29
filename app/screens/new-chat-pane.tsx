@@ -46,7 +46,6 @@ import {
   appendMessages,
   canSend,
   executeResponseMessages,
-  hasAvailableAccountSnapshot,
   isAccountTokenInvalidatedError,
   readError,
   routeWorkingDirectoryFromState,
@@ -142,18 +141,9 @@ export function NewChatPane() {
   const manuallySelectedAccount = connectedAccounts.find(
     (account) => account.id === newChatAccountId,
   )
-  const quotaSelectionPending =
-    connectedAccounts.some((account) => accountRateLimitFetching[account.id]) &&
-    !hasAvailableAccountSnapshot(connectedAccounts, accountRateLimitSnapshots)
-  const pendingSelectedAccount =
-    connectedAccounts.find((account) => account.id === runtimeAccountId) ??
-    connectedAccounts[0]
-  const fallbackSelectedAccount = quotaSelectionPending
-    ? pendingSelectedAccount
-    : undefined
   const selectedConnectedAccount = autoRotateAccount
     ? bestAvailableAccount
-    : manuallySelectedAccount ?? bestAvailableAccount ?? fallbackSelectedAccount
+    : manuallySelectedAccount ?? bestAvailableAccount
   const selectedConnectedAccountId = selectedConnectedAccount?.id ?? null
 
   useEffect(() => {

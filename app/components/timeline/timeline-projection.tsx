@@ -246,7 +246,10 @@ function compactFileChangeBlocks(
     }
 
     const previous = pending.at(-1)
-    if (previous && actionBurstKey(previous) !== actionBurstKey(item.message)) {
+    if (
+      previous &&
+      fileChangeBurstKey(previous) !== fileChangeBurstKey(item.message)
+    ) {
       flushPending()
     }
     pending.push(item.message)
@@ -409,11 +412,11 @@ function shouldMergeAdjacentCodexResponse(
 }
 
 function codexTurnGroupId(message: ChatMessageResponse): string {
-  if (message.runId) {
-    return `codex-run:${message.runId}`
-  }
   if (message.turnId) {
     return `codex-turn:${message.turnId}`
+  }
+  if (message.runId) {
+    return `codex-run:${message.runId}`
   }
   return `codex-message:${message.id}`
 }
@@ -742,6 +745,10 @@ function sameActionBurst(
 
 function actionBurstKey(message: ChatMessageResponse): string {
   return message.runId ?? message.turnId ?? message.chatId
+}
+
+function fileChangeBurstKey(message: ChatMessageResponse): string {
+  return message.turnId ?? message.runId ?? message.chatId
 }
 
 export function uniqueMessages(

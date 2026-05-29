@@ -693,7 +693,13 @@ function titleCase(value: string): string {
 }
 
 function representsSamePath(left: string, right: string): boolean {
-  return normalizePathIdentity(left) === normalizePathIdentity(right)
+  const leftPath = normalizePathIdentity(left)
+  const rightPath = normalizePathIdentity(right)
+  return (
+    leftPath === rightPath ||
+    leftPath.endsWith(`/${rightPath}`) ||
+    rightPath.endsWith(`/${leftPath}`)
+  )
 }
 
 function normalizePathIdentity(path: string): string {

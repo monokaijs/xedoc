@@ -1794,31 +1794,25 @@ function selectBestAvailableAccount(
   accounts: CodexAccount[],
   snapshots: Map<string, CodexRateLimitSnapshot | undefined>,
 ): CodexAccount | undefined {
-  return accounts
-    .map((account, index) => ({
-      account,
-      hasSnapshot: !!snapshots.get(account.id),
-      index,
-      score: accountAvailabilityScore(snapshots.get(account.id)),
-    }))
-    .filter((entry) => entry.score >= 0)
-    .sort(
-      (left, right) =>
-        right.score - left.score ||
-        Number(right.hasSnapshot) - Number(left.hasSnapshot) ||
-        left.index - right.index,
-    )
-    .at(0)?.account
+  let bestAccount: CodexAccount | undefined
+  let bestScore = -1
+
+  for (const account of accounts) {
+    const score = accountAvailabilityScore(snapshots.get(account.id))
+    if (score > bestScore) {
+      bestAccount = account
+      bestScore = score
+    }
+  }
+
+  return bestAccount
 }
 
 function accountAvailabilityScore(snapshot?: CodexRateLimitSnapshot): number {
   if (!snapshot) {
     return 0
   }
-  if (snapshot.rateLimitReachedType || usageCapacitySeverity(snapshot)) {
-    return -1
-  }
-  if (snapshot.credits && !snapshot.credits.unlimited && !snapshot.credits.hasCredits) {
+  if (snapshot.rateLimitReachedType) {
     return -1
   }
   if (snapshot.credits?.unlimited) {
@@ -1831,28 +1825,7 @@ function accountAvailabilityScore(snapshot?: CodexRateLimitSnapshot): number {
     return 0
   }
   const score = Math.min(...remainingPercents)
-  return score < 1 ? -1 : score
-}
-
-function usageCapacitySeverity(
-  snapshot?: CodexRateLimitSnapshot,
-): "fiveHour" | "weekly" | null {
-  if (!snapshot) {
-    return null
-  }
-  if (rateLimitWindowReached(snapshot.secondary)) {
-    return "weekly"
-  }
-  if (rateLimitWindowReached(snapshot.primary)) {
-    return "fiveHour"
-  }
-  return null
-}
-
-function rateLimitWindowReached(
-  window: CodexRateLimitWindow | null | undefined,
-): boolean {
-  return clampPercent(window?.usedPercent ?? 0) >= 100
+  return score <= 0 ? -1 : score
 }
 
 function clampPercent(value: number): number {
@@ -3202,6 +3175,7 @@ function settleOpenRunTimelineMessages(
     }
     const updated = updateRuntimeMessage(threadId, message.id, {
       completedAt: new Date(),
+      metadataPatch: { status: status.toLowerCase() },
       status,
     })
     if (updated) {
