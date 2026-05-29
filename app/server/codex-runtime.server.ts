@@ -132,11 +132,18 @@ class CodexRuntime {
     )
 
     return new Promise((resolve, reject) => {
+      this.debug("request started", { id, method, timeoutMs })
+      const startedAt = Date.now()
       const timeout = setTimeout(() => {
         this.pending.delete(id)
+        this.debug("request timed out", {
+          durationMs: Date.now() - startedAt,
+          id,
+          method,
+        })
         reject(new Error(`Codex request timed out: ${method}`))
       }, timeoutMs)
-      this.pending.set(id, { resolve, reject, timeout })
+      this.pending.set(id, { method, reject, resolve, startedAt, timeout })
       this.child?.stdin.write(`${payload}\n`)
     })
   }
@@ -148,6 +155,12 @@ class CodexRuntime {
 
     const spawnConfig = buildCodexRuntimeSpawnConfig(this.config)
     ensureCodexHome(spawnConfig.codexHome)
+    this.debug("spawning runtime", {
+      args: spawnConfig.args,
+      codexHome: spawnConfig.codexHome,
+      command: spawnConfig.command,
+      cwd: spawnConfig.options.cwd ?? null,
+    })
     this.child = spawn(spawnConfig.command, spawnConfig.args, spawnConfig.options)
 
     this.child.stdout.on("data", (chunk: Buffer) => this.handleStdout(chunk))
@@ -156,12 +169,17 @@ class CodexRuntime {
       if (message) {
         console.warn(`[codex:${this.config.accountId}] ${message}`)
         if (isCodexAuthTokenInvalidatedMessage(message)) {
+          this.debug("auth invalidated from stderr", { message })
           void markCodexAccountInvalidated(this.config.accountId, message)
         }
       }
     })
-    this.child.on("error", (error) => this.failAll(error))
+    this.child.on("error", (error) => {
+      this.debug("runtime process error", { message: error.message })
+      this.failAll(error)
+    })
     this.child.on("close", (code) => {
+      this.debug("runtime process closed", { code })
       this.failAll(
         new Error(`Codex runtime exited with code ${code ?? "unknown"}.`),
       )
@@ -174,6 +192,7 @@ class CodexRuntime {
   }
 
   private async initialize(): Promise<void> {
+    this.debug("initializing runtime")
     await this.requestStarted("initialize", {
       clientInfo: {
         name: "xedoc",
@@ -185,6 +204,7 @@ class CodexRuntime {
       },
     })
     this.child?.stdin.write(`${JSON.stringify({ method: "initialized" })}\n`)
+    this.debug("runtime initialized")
   }
 
   private handleStdout(chunk: Buffer): void {
@@ -205,11 +225,18 @@ class CodexRuntime {
     try {
       message = JSON.parse(line) as CodexJsonRpcResponse
     } catch {
+      this.debug("ignored non-json stdout", { line })
       return
     }
 
     const classification = classifyCodexMessage(message)
+    const debugMessage = readCodexDebugMessage(message)
     if (classification === "server-request") {
+      this.debug("server request received", {
+        id: message.id,
+        message: debugMessage,
+        method: message.method ?? null,
+      })
       if (!this.serverRequestHandlers.size) {
         this.rejectServerRequest(
           message.id!,
@@ -225,6 +252,17 @@ class CodexRuntime {
     }
 
     if (classification === "notification") {
+      if (debugMessage && isCodexAuthTokenInvalidatedMessage(debugMessage)) {
+        this.debug("auth invalidated from notification", {
+          message: debugMessage,
+          method: message.method ?? null,
+        })
+        void markCodexAccountInvalidated(this.config.accountId, debugMessage)
+      }
+      this.debug("notification received", {
+        message: debugMessage,
+        method: message.method ?? null,
+      })
       for (const handler of this.eventHandlers) {
         handler(message)
       }
@@ -233,13 +271,28 @@ class CodexRuntime {
 
     const waiter = this.pending.get(jsonRpcIdKey(message.id))
     if (!waiter) {
+      this.debug("response without pending request", {
+        id: message.id,
+        error: message.error?.message ?? null,
+      })
       return
     }
 
     clearTimeout(waiter.timeout)
     this.pending.delete(jsonRpcIdKey(message.id))
     if (message.error) {
+      this.debug("request failed", {
+        code: message.error.code ?? null,
+        durationMs: Date.now() - waiter.startedAt,
+        id: message.id,
+        message: message.error.message ?? "Codex request failed.",
+        method: waiter.method,
+      })
       if (isCodexAuthTokenInvalidatedMessage(message.error.message)) {
+        this.debug("auth invalidated from response", {
+          method: waiter.method,
+          message: message.error.message,
+        })
         void markCodexAccountInvalidated(
           this.config.accountId,
           message.error.message,
@@ -248,15 +301,30 @@ class CodexRuntime {
       waiter.reject(new Error(message.error.message ?? "Codex request failed."))
       return
     }
+    this.debug("request completed", {
+      durationMs: Date.now() - waiter.startedAt,
+      id: message.id,
+      method: waiter.method,
+    })
     waiter.resolve(message)
   }
 
   private failAll(error: Error): void {
+    if (this.pending.size) {
+      this.debug("failing pending requests", {
+        message: error.message,
+        pending: [...this.pending.values()].map((waiter) => waiter.method),
+      })
+    }
     for (const waiter of this.pending.values()) {
       clearTimeout(waiter.timeout)
       waiter.reject(error)
     }
     this.pending.clear()
+  }
+
+  private debug(message: string, details?: JsonObject): void {
+    debugCodexRuntime(this.config.accountId, message, details)
   }
 }
 
@@ -295,6 +363,9 @@ export async function markCodexAccountInvalidated(
   accountId: string,
   cause?: unknown,
 ): Promise<void> {
+  debugCodexRuntime(accountId, "marking account invalidated", {
+    cause: readDebugErrorMessage(cause),
+  })
   invalidatedCodexAccountIds.add(accountId)
   await prisma.codexAccount.updateMany({
     where: { id: accountId },
@@ -352,6 +423,66 @@ function formatCodexAuthInvalidatedMessage(cause: unknown): string {
     "Codex authentication token was invalidated. Re-authenticate this account.",
     trimmed.length > 700 ? `${trimmed.slice(0, 700)}...` : trimmed,
   ].join("\n")
+}
+
+function debugCodexRuntime(
+  accountId: string,
+  message: string,
+  details?: JsonObject,
+): void {
+  if (!debugEnabled()) {
+    return
+  }
+  const suffix = details ? ` ${formatDebugDetails(details)}` : ""
+  console.error(
+    `[xedoc:debug][codex:${accountId}] ${new Date().toISOString()} ${message}${suffix}`,
+  )
+}
+
+function debugEnabled(): boolean {
+  return /^(1|true|yes|on)$/iu.test(process.env.XEDOC_DEBUG?.trim() ?? "")
+}
+
+function formatDebugDetails(details: JsonObject): string {
+  return JSON.stringify(details, (_key, value: unknown) => {
+    if (typeof value === "string" && value.length > 700) {
+      return `${value.slice(0, 700)}...`
+    }
+    return value
+  })
+}
+
+function readDebugErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message
+  }
+  if (typeof error === "string") {
+    return error
+  }
+  return String(error ?? "")
+}
+
+function readCodexDebugMessage(message: CodexJsonRpcResponse): string | null {
+  const params = asDebugObject(message.params)
+  const result = asDebugObject(message.result)
+  return (
+    readDebugString(message.error?.message) ??
+    readDebugString(asDebugObject(params?.error)?.message) ??
+    readDebugString(params?.message) ??
+    readDebugString(asDebugObject(result?.error)?.message) ??
+    readDebugString(result?.message)
+  )
+}
+
+function asDebugObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+function readDebugString(value: unknown): string | null {
+  const trimmed = typeof value === "string" ? value.trim() : ""
+  return trimmed || null
 }
 
 export function buildCodexRuntimeSpawnConfig(

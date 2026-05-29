@@ -25,6 +25,9 @@ const SERVER_AUTH_ID = "server"
 const serverRoot = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(serverRoot, "..")
 const options = parseArgs(process.argv.slice(2))
+if (options.debug) {
+  process.env.XEDOC_DEBUG = "1"
+}
 const workspaceRoot = resolveHomePath(process.env.CODEX_WORKSPACE_ROOT ?? homedir())
 const databasePath = join(workspaceRoot, ".xedoc", "xedoc.db")
 const databaseUrl = sqliteDatabaseUrl(databasePath)
@@ -62,7 +65,9 @@ function parseArgs(argv) {
   const parsed = {}
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
-    if (arg.startsWith("--")) {
+    if (arg === "--debug") {
+      parsed.debug = true
+    } else if (arg.startsWith("--")) {
       const [name, inlineValue] = arg.split("=", 2)
       const value = inlineValue ?? argv[++index]
       if (!value || value.startsWith("--")) {

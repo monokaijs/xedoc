@@ -32,6 +32,7 @@ Common CLI options:
 - `--accounts-home <path>` changes where Codex account state is stored.
 - `--shared-chat-home <path>` changes where shared Codex chat sessions are stored.
 - `--skip-setup` skips SQLite schema setup.
+- `--debug` prints Codex runtime debug logs for mid-run failures.
 
 To run xedoc in the background, install the package in a stable location and
 install the service:

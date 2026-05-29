@@ -4,7 +4,15 @@ import type {
   ChatMessageResponse,
   JsonSerializable,
 } from "@/types"
-import { ChevronDown, Eye, FileDiff, Loader2, RotateCcw } from "lucide-react"
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  Eye,
+  FileDiff,
+  Loader2,
+  RotateCcw,
+} from "lucide-react"
 import { useContext, useMemo } from "react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -19,8 +27,6 @@ import {
 import { FileViewerContext } from "@/components/timeline/file-viewer-context"
 import type { FileChangePromptAction } from "@/components/timeline/chat-timeline"
 import { cn } from "@/lib/utils"
-
-const ACTIVE_FILE_CHANGE_VISIBLE_COUNT = 4
 
 export function FileChangeBlock({
   disabled,
@@ -163,35 +169,31 @@ export function ActiveFileChangesPanel({
   if (!rows.length) {
     return null
   }
-  const visibleRows = rows.slice(-ACTIVE_FILE_CHANGE_VISIBLE_COUNT)
-  const hiddenCount = Math.max(0, rows.length - visibleRows.length)
+  const active = rows.some(
+    (row) => row.messageStatus === "STREAMING" || row.messageStatus === "PENDING",
+  )
+  const failed = rows.some((row) => row.messageStatus === "FAILED")
+  const additions = rows.reduce((sum, row) => sum + row.additions, 0)
+  const deletions = rows.reduce((sum, row) => sum + row.deletions, 0)
 
   return (
     <section
       aria-label="Latest file changes"
       aria-live="polite"
-      className="border-b bg-background px-3 py-2"
+      className="border-b bg-background px-3 py-1.5"
     >
       <div className="mx-auto w-full min-w-0 max-w-3xl">
-        <div className="grid min-w-0 gap-1.5 overflow-hidden rounded-lg border bg-muted/20 p-2 text-sm shadow-sm">
-          <div className="flex min-w-0 items-center justify-between gap-2 px-1">
-            <div className="flex min-w-0 items-center gap-2">
-              <FileDiff className="size-4 shrink-0 text-muted-foreground" />
-              <span className="min-w-0 truncate font-medium">
-                File changes
-              </span>
-            </div>
-            <div className="flex shrink-0 items-center gap-1">
-              {hiddenCount > 0 ? (
-                <Badge variant="outline">+{hiddenCount} earlier</Badge>
-              ) : null}
-              <Badge variant="secondary">running</Badge>
-            </div>
+        <div className="flex min-w-0 items-center justify-between gap-2 overflow-hidden rounded-md border bg-muted/20 px-2 py-1.5 text-xs shadow-sm">
+          <div className="flex min-w-0 items-center gap-2">
+            <FileDiff className="size-3.5 shrink-0 text-muted-foreground" />
+            <span className="min-w-0 truncate font-medium">File changes</span>
+            <span className="shrink-0 text-muted-foreground">
+              {rows.length} {rows.length === 1 ? "file" : "files"}
+            </span>
           </div>
-          <div className="grid min-w-0 gap-1">
-            {visibleRows.map((row) => (
-              <FileChangeActivityRow key={row.id} row={row} />
-            ))}
+          <div className="flex shrink-0 items-center gap-2">
+            <DiffCountText additions={additions} deletions={deletions} />
+            <FileChangeStatusIndicator active={active} failed={failed} />
           </div>
         </div>
       </div>
@@ -274,9 +276,37 @@ function FileChangeActivityRow({
       </button>
       <div className="flex shrink-0 items-center gap-1">
         <DiffCountText additions={row.additions} deletions={row.deletions} />
-        <Badge variant="secondary">{row.statusLabel}</Badge>
+        <FileChangeStatusIndicator
+          active={active}
+          failed={row.messageStatus === "FAILED"}
+          label={row.statusLabel}
+        />
       </div>
     </div>
+  )
+}
+
+function FileChangeStatusIndicator({
+  active,
+  failed,
+  label = active ? "running" : "complete",
+}: {
+  active: boolean
+  failed?: boolean
+  label?: string
+}) {
+  return active ? (
+    <Loader2
+      aria-label={label}
+      className="size-3.5 shrink-0 animate-spin text-muted-foreground"
+    />
+  ) : failed ? (
+    <AlertTriangle
+      aria-label={label}
+      className="size-3.5 shrink-0 text-destructive"
+    />
+  ) : (
+    <Check aria-label={label} className="size-3.5 shrink-0 text-primary" />
   )
 }
 

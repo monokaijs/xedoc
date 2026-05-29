@@ -295,7 +295,7 @@ export async function readLocalCodexSessionActivity(
     ? {
         activeStartedAt: session.activeStartedAt,
         activeTurnId: session.activeTurnId,
-        status: session.status,
+        status: localSessionActivityStatus(session),
       }
     : null
 }
@@ -560,10 +560,9 @@ function parseLocalCodexSessionJsonl(
     originator,
     path,
     source,
-    status:
-      activeTurnId && !activeSessionLooksStale(updatedAt ?? fallbackTimestamp)
-        ? "RUNNING"
-        : "IDLE",
+    status: activeTurnId && !activeSessionLooksStale(updatedAt ?? fallbackTimestamp)
+      ? "RUNNING"
+      : "IDLE",
     title,
     updatedAt: updatedAt ?? fallbackTimestamp,
     workingDirectory,
@@ -1250,6 +1249,15 @@ export function isInternalEnvironmentContext(content: string): boolean {
 
 function activeSessionLooksStale(updatedAt: Date): boolean {
   return Date.now() - updatedAt.getTime() > STALE_ACTIVE_SESSION_MS
+}
+
+function localSessionActivityStatus(
+  session: Pick<ParsedLocalCodexSession, "activeTurnId" | "status" | "updatedAt">,
+): ParsedLocalCodexSession["status"] {
+  if (session.status !== "RUNNING" || !session.activeTurnId) {
+    return "IDLE"
+  }
+  return activeSessionLooksStale(session.updatedAt) ? "IDLE" : "RUNNING"
 }
 
 function importedMessageMetadata(

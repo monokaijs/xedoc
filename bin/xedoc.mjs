@@ -66,6 +66,8 @@ function parseArgs(argv) {
       parsed.skipSetup = true
     } else if (arg === "--skip-prisma-generate") {
       parsed.skipPrismaGenerate = true
+    } else if (arg === "--debug") {
+      parsed.debug = true
     } else if (arg.startsWith("--")) {
       const [name, inlineValue] = arg.split("=", 2)
       const value = inlineValue ?? argv[++index]
@@ -168,6 +170,7 @@ function resolveRuntimeOptions(options) {
     HOST: host,
     NODE_ENV: "production",
     PORT: port,
+    XEDOC_DEBUG: options.debug ? "1" : process.env.XEDOC_DEBUG,
   }
   return {
     accountsHome,
@@ -176,6 +179,7 @@ function resolveRuntimeOptions(options) {
     codexCommand,
     databasePath,
     databaseUrl,
+    debug: !!options.debug || isDebugEnabled(process.env.XEDOC_DEBUG),
     env,
     host,
     port,
@@ -550,6 +554,9 @@ function runtimeServiceArgs(runtime) {
   if (runtime.skipPrismaGenerate) {
     args.push("--skip-prisma-generate")
   }
+  if (runtime.debug) {
+    args.push("--debug")
+  }
   return args
 }
 
@@ -643,7 +650,10 @@ async function runPrisma(args, env) {
 }
 
 async function runServer(env) {
-  await run(process.execPath, [join(packageRoot, "server/index.mjs")], {
+  await run(process.execPath, [
+    join(packageRoot, "server/index.mjs"),
+    ...(isDebugEnabled(env.XEDOC_DEBUG) ? ["--debug"] : []),
+  ], {
     cwd: packageRoot,
     env,
     stdio: "inherit",
@@ -709,6 +719,10 @@ function sqliteDatabaseUrl(databasePath) {
   return `file:${databasePath}?connection_limit=1&pool_timeout=30`
 }
 
+function isDebugEnabled(value) {
+  return /^(1|true|yes|on)$/iu.test(String(value ?? "").trim())
+}
+
 function fail(message) {
   console.error(message)
   process.exit(1)
@@ -730,6 +744,7 @@ Options:
   --shared-chat-home <path>     Shared Codex chat store. Defaults to ~/.codex.
   --skip-setup                  Do not create the SQLite database schema.
   --skip-prisma-generate        Do not regenerate Prisma Client.
+  --debug                       Print Codex runtime debug logs for run failures.
   --codex-command <command>     Codex command used for new accounts.
   --codex-args <args>           Codex command arguments used for new accounts.
   --home <path>                 App data directory. Defaults to ~/.xedoc.
@@ -766,5 +781,6 @@ Options:
   --home <path>                 App data directory. Defaults to ~/.xedoc.
   --skip-setup                  Do not create the SQLite database schema.
   --skip-prisma-generate        Do not regenerate Prisma Client.
+  --debug                       Print Codex runtime debug logs for run failures.
 `)
 }

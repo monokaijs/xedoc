@@ -205,6 +205,7 @@ export function PinnedPlanTasksPanel({
 }: {
   message?: ChatMessageResponse | null
 }) {
+  const [expanded, setExpanded] = useState(true)
   if (!message) {
     return null
   }
@@ -222,40 +223,60 @@ export function PinnedPlanTasksPanel({
     normalizedPlanText(metadata?.explanation) ??
     normalizedPlanText(message.content) ??
     "Planning..."
-  const statusLabel = pinnedPlanStatusLabel(message, steps)
+  const status = pinnedPlanStatus(message, steps)
 
   return (
     <section
       aria-label="Active plan"
       aria-live="polite"
-      className="border-b bg-background px-3 py-2"
+      className="border-b bg-background px-3 py-1.5"
     >
       <div className="mx-auto w-full min-w-0 max-w-3xl">
-        <div className="min-w-0 overflow-hidden rounded-lg border bg-muted/20 shadow-sm">
-          <div className="grid min-w-0 gap-2 p-3">
+        <div className="min-w-0 overflow-hidden rounded-md border bg-muted/20 shadow-sm">
+          <div className="grid min-w-0 gap-1.5 p-2">
             <div className="flex min-w-0 items-start justify-between gap-3">
               <div className="flex min-w-0 items-start gap-2">
-                <div className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-md bg-background text-muted-foreground">
-                  <ListChecks className="size-4" />
+                <div className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-md bg-background text-muted-foreground">
+                  <ListChecks className="size-3.5" />
                 </div>
                 <div className="min-w-0">
                   <div className="flex min-w-0 flex-wrap items-center gap-2">
                     <span className="text-sm font-medium">Plan</span>
-                    <Badge variant="secondary">{statusLabel}</Badge>
+                    <PlanStatusIndicator status={status} />
                   </div>
                   <div className="mt-0.5 min-w-0 truncate text-xs text-muted-foreground">
                     {summary}
                   </div>
                 </div>
               </div>
-              {steps.length ? (
-                <Badge className="shrink-0" variant="outline">
-                  {completedStepCount}/{steps.length}
-                </Badge>
-              ) : null}
+              <div className="flex shrink-0 items-center gap-1">
+                {steps.length ? (
+                  <Badge className="shrink-0" variant="outline">
+                    {completedStepCount}/{steps.length}
+                  </Badge>
+                ) : null}
+                {steps.length ? (
+                  <Button
+                    aria-expanded={expanded}
+                    aria-label={expanded ? "Collapse plan" : "Expand plan"}
+                    className="size-7"
+                    size="icon-sm"
+                    type="button"
+                    variant="ghost"
+                    onClick={() => setExpanded((current) => !current)}
+                  >
+                    <ChevronDown
+                      className={cn(
+                        "size-4 transition-transform",
+                        !expanded && "-rotate-90",
+                      )}
+                    />
+                  </Button>
+                ) : null}
+              </div>
             </div>
 
-            {steps.length ? (
+            {steps.length && expanded ? (
               <div className="grid max-h-44 min-w-0 gap-1.5 overflow-y-auto pr-1">
                 {steps.map((step, index) => {
                   const highlighted = index === highlightedStepIndex
@@ -276,9 +297,7 @@ export function PinnedPlanTasksPanel({
                       <div className="min-w-0 break-words leading-5 text-foreground">
                         {step.step}
                       </div>
-                      <span className="shrink-0 rounded bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                        {planStepStatusLabel(step.status)}
-                      </span>
+                      <PlanStepStatusIndicator status={step.status} />
                     </div>
                   )
                 })}
@@ -1295,20 +1314,57 @@ function highlightedPlanStepIndex(steps: PlanStep[]): number {
   return steps.length ? steps.length - 1 : -1
 }
 
-function pinnedPlanStatusLabel(
+function pinnedPlanStatus(
   message: ChatMessageResponse,
   steps: PlanStep[],
-): string {
+): "active" | "pending" | "planning" {
   if (
     steps.some((step) => planStepIsActive(step.status)) ||
     isActiveMessage(message)
   ) {
-    return "in progress"
+    return "active"
   }
   if (steps.length) {
     return "pending"
   }
   return "planning"
+}
+
+function PlanStatusIndicator({
+  status,
+}: {
+  status: "active" | "pending" | "planning"
+}) {
+  if (status === "active") {
+    return (
+      <Loader2
+        aria-label="In progress"
+        className="size-3.5 animate-spin text-muted-foreground"
+      />
+    )
+  }
+  if (status === "pending") {
+    return <Clock aria-label="Pending" className="size-3.5 text-muted-foreground" />
+  }
+  return (
+    <span
+      aria-label="Planning"
+      className="size-2 rounded-full bg-muted-foreground/45"
+      role="img"
+    />
+  )
+}
+
+function PlanStepStatusIndicator({ status }: { status: string }) {
+  return (
+    <span
+      aria-label={planStepStatusLabel(status)}
+      className="flex size-5 shrink-0 items-center justify-center"
+      role="img"
+    >
+      <PlanStepMarker highlighted={false} status={status} />
+    </span>
+  )
 }
 
 function PlanStepMarker({

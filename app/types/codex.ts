@@ -121,5 +121,7 @@ export interface CodexRuntimeSpawnConfig {
 export interface CodexPendingRequest {
   resolve: (response: CodexJsonRpcResponse) => void;
   reject: (error: Error) => void;
+  method: string;
+  startedAt: number;
   timeout: ReturnType<typeof setTimeout>;
 }
