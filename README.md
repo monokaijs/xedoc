@@ -1,172 +1,250 @@
+<div align="center">
+
 # xedoc
 
-xedoc is a single React Router Framework Mode app, built with Vite, for managing Codex accounts, chats, chat execution, workspace browsing, and live assistant output.
+**A local web workspace for running Codex across your projects, accounts, tasks, and file changes.**
 
-## What It Does
+[![npm](https://img.shields.io/npm/v/xedoc-cli?color=0b7285)](https://www.npmjs.com/package/xedoc-cli)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D20-339933)](https://nodejs.org/)
+[![License](https://img.shields.io/badge/license-UNLICENSED-lightgrey)](./package.json)
+[![Codex](https://img.shields.io/badge/powered%20by-Codex-111111)](https://www.npmjs.com/package/@openai/codex)
 
-- Stores shared Codex accounts and per-thread preferences in xedoc SQLite; chat history stays in the root Codex store.
-- Starts browser or device-code Codex account authentication through the local `codex app-server` JSON-RPC flow.
-- Isolates each Codex account with a separate `CODEX_HOME` while sharing Codex chat sessions through the system Codex chat store.
-- Stores a working directory on each chat so different chats can target different local projects.
-- Executes chat prompts against the selected Codex account and reads settled chat lists/transcripts from the root Codex store.
-- Serves the ChatGPT-style web UI and `/api/*` resource routes from one same-origin app.
-- Streams live chat updates through authenticated Socket.IO rooms on `/socket.io`.
+</div>
 
-## Setup
+---
 
-The easiest local install is the npm CLI:
+xedoc gives Codex a dedicated local control center in your browser. It keeps
+Codex running on your machine while adding account management, project-aware
+chats, live run tracking, workflow tasks, compact file-change status, and a
+cleaner interface for day-to-day development work.
+
+It is designed for people who use Codex often and want a reliable workspace
+instead of juggling terminal sessions, account state, project folders, and
+long-running runs manually.
+
+## Contents
+
+- [Why xedoc](#why-xedoc)
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [First Run](#first-run)
+- [How It Fits Your Workflow](#how-it-fits-your-workflow)
+- [Running in the Background](#running-in-the-background)
+- [Configuration](#configuration)
+- [Local Data](#local-data)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+
+## Why xedoc
+
+Codex is strongest when it can work directly in your local projects. xedoc adds
+the workspace layer around that local runtime:
+
+| Need | What xedoc provides |
+| --- | --- |
+| Work across multiple projects | Chats stay tied to working directories. |
+| Use multiple Codex accounts | Account state is isolated and selectable per chat. |
+| Track long-running work | Live messages, tool activity, task progress, and queued messages. |
+| Review code edits clearly | Compact active-change status plus detailed timeline diffs. |
+| Keep implementation organized | Plan mode and workflow tasks stay near the chat. |
+| Avoid silent account failures | Invalidated accounts are surfaced and marked for re-authentication. |
+
+## Features
+
+### Browser Workspace, Local Runtime
+
+Use Codex through a browser UI while Codex continues to run locally with access
+to your local files and tools.
+
+### Multi-Account Management
+
+Add and authenticate Codex accounts, switch accounts per chat, set the active
+local Codex account, and re-authenticate accounts when tokens expire or are
+invalidated.
+
+### Project-Aware Chats
+
+Each chat can remember its working directory, account, model, reasoning effort,
+service tier, collaboration mode, and permission mode.
+
+### Live Run Tracking
+
+Follow assistant output, tool activity, approval prompts, terminal activity,
+queued messages, and run status without losing the thread.
+
+### Compact File-Change Status
+
+While Codex is editing files, xedoc shows a compact change summary above the
+input. The full file-change details and diffs remain available in the timeline.
+
+### Plan Mode and Tasks
+
+Use Plan mode when you want Codex to break work into steps before implementation.
+Active tasks can be collapsed above the input, and the workflow view helps keep
+project tasks organized.
+
+### Local Terminal Dock
+
+Open a terminal in the selected working directory when you need to inspect,
+verify, or run project commands without leaving xedoc.
+
+## Quick Start
+
+Run xedoc:
 
 ```bash
 npx xedoc-cli
 ```
 
-By default the CLI creates a SQLite database under the workspace root at
-`<workspace-root>/.xedoc/xedoc.db`, prepares the schema, and serves the app at
-`http://127.0.0.1:6354`. Open the app in a browser and set the server password
-on first visit.
+Open the printed local URL:
 
-Common CLI options:
+```text
+http://127.0.0.1:6354
+```
 
-- `--port <port>` changes the web server port.
-- `--workspace-root <path>` changes the directory tree visible to the app.
-- `--accounts-home <path>` changes where Codex account state is stored.
-- `--shared-chat-home <path>` changes where shared Codex chat sessions are stored.
-- `--skip-setup` skips SQLite schema setup.
-- `--debug` prints Codex runtime debug logs for mid-run failures.
+On first visit, xedoc asks you to set a server password. This protects the local
+web UI from other browser sessions on the same machine.
 
-To run xedoc in the background, install the package in a stable location and
-install the service:
+## First Run
+
+1. Open xedoc in your browser.
+2. Add a Codex account from account management.
+3. Authenticate with browser login or device login.
+4. Choose a working directory for your chat.
+5. Send your first message to Codex.
+
+xedoc stores app data locally. Your code remains on your machine, and Codex runs
+with the same local access as your user account.
+
+## How It Fits Your Workflow
+
+### Start a Project Chat
+
+Create or open a chat, choose the project directory, select an account, and send
+your request. xedoc keeps the chat attached to that directory for future runs.
+
+### Guide Implementation
+
+Use the composer to send follow-up instructions. If Codex is already running,
+queue the next message so it is delivered when the active run completes.
+
+### Review Active Work
+
+Use the compact panels above the input for current state:
+
+- Plan tasks show the current implementation checklist and can collapse.
+- File changes stay compact while work is active.
+- Queued messages show what will be sent next.
+
+Use the timeline for full detail: transcript, tool activity, approvals, file
+change blocks, and diffs.
+
+### Recover from Account Issues
+
+If an account becomes invalidated, xedoc marks it clearly and records the last
+error. Re-authenticate the account from account management before using it again.
+
+## Running in the Background
+
+For regular use, install xedoc globally and run it as a background service:
 
 ```bash
 npm install -g xedoc-cli
-xedoc service install --port 6354 --workspace-root ~
+xedoc service install
 ```
 
-The default service driver is OS-native:
+Then open the local URL whenever you want to work.
 
-- Linux: user systemd unit at `~/.config/systemd/user/xedoc.service`
-- macOS: launchd agent at `~/Library/LaunchAgents/xedoc.plist`
-- Windows: Task Scheduler task named `xedoc`
-
-Inspect the service with the native tool for your OS:
-
-```bash
-systemctl --user status xedoc
-journalctl --user -u xedoc -f
-launchctl print gui/$(id -u)/xedoc
-schtasks /Query /TN xedoc
-```
-
-On Linux, if the service should start before you log in, enable user lingering
-with `loginctl enable-linger "$USER"`.
-
-`forever` is also available as an explicit fallback:
-
-```bash
-npm install -g forever
-xedoc service install --service-driver forever
-```
-
-The `forever` driver keeps xedoc alive in the current user session, but it does
-not install OS boot integration by itself.
-
-To remove the background service:
+Remove the background service:
 
 ```bash
 xedoc service uninstall
 ```
 
-For repository development:
+## Configuration
+
+Common options:
+
+| Option | Purpose |
+| --- | --- |
+| `--port <port>` | Change the local web server port. |
+| `--host <host>` | Change the local web server host. |
+| `--workspace-root <path>` | Change which directories xedoc can browse. |
+| `--accounts-home <path>` | Change where account authentication state is stored. |
+| `--shared-chat-home <path>` | Change where Codex chat history is stored. |
+| `--debug` | Print Codex runtime diagnostics for stuck runs and account failures. |
+
+Examples:
+
+```bash
+xedoc --port 6354
+xedoc --workspace-root ~/Projects
+xedoc --debug
+```
+
+## Local Data
+
+xedoc keeps its data on your machine:
+
+| Data | Default location |
+| --- | --- |
+| App database | `<workspace-root>/.xedoc/xedoc.db` |
+| Account state | `~/.xedoc/accounts` |
+| Shared Codex chat history | `~/.codex` |
+
+Each Codex account gets a separate account home. Chat history is shared so your
+threads stay visible across accounts and other local Codex tools.
+
+## Troubleshooting
+
+### The app asks me to sign in again
+
+The Codex account token was probably invalidated. Open account management and
+authenticate the account again.
+
+### A chat looks stuck
+
+Restart xedoc first. If the problem repeats, run with debug logging:
+
+```bash
+xedoc --debug
+```
+
+Debug logs include Codex request failures, runtime exits, invalidation signals,
+and other run-level diagnostics.
+
+### xedoc cannot see my project
+
+Start xedoc with a workspace root that contains the project:
+
+```bash
+xedoc --workspace-root ~/Projects
+```
+
+### The browser cannot connect
+
+Confirm xedoc is running and open the printed local URL. If you changed the
+port, use that port in the browser address.
+
+## Development
+
+For contributors working on xedoc itself:
 
 ```bash
 pnpm install
-cp .env.example .env
 pnpm prisma:generate
 pnpm db:setup
 pnpm dev
 ```
 
-On first visit, the web app asks you to set the server password and stores a
-hashed password plus token signing secret in the SQLite database. Later browser
-sessions exchange that password for a bearer token, then store the token in
-local storage. Authenticated sessions share the same local accounts and chats.
+Run type checking before submitting changes:
 
-The SQLite database path is derived from `CODEX_WORKSPACE_ROOT` and is always
-stored at `<workspace-root>/.xedoc/xedoc.db`.
-
-## Scripts
-
-- `pnpm dev` starts the React Router dev server.
-- `pnpm build` builds the app.
-- `pnpm start` serves the production React Router build through `server/index.mjs` and attaches Socket.IO.
-- `pnpm db:setup` creates or updates the local SQLite schema.
-- `pnpm prisma:generate` regenerates Prisma Client.
-- `pnpm run publish` publishes the package to npm with public access. npm runs `prepack`, which builds the production bundle first.
-- `pnpm run publish:dry-run` checks the npm package contents without publishing.
-
-## npm Releases
-
-Package releases are published by GitHub Actions. Run the `Publish to npm`
-workflow manually from a branch to bump `patch`, `minor`, or `major`, commit
-and tag the new version, then publish it. Pushing a tag matching `v*` also
-publishes that tag.
-
-The workflow uses npm trusted publishing, so configure the package on npmjs.com
-with this GitHub repository and the workflow file
-`.github/workflows/npm-publish.yml` before the first release.
-
-## Codex Account Isolation
-
-Each Codex account runs as its own local `codex app-server` process. The server sets `CODEX_HOME` per account so auth files, config, cache, and other non-chat account state stay under:
-
-```text
-~/.xedoc/accounts/<accountId>
+```bash
+pnpm typecheck
 ```
 
-Codex chat data is centralized separately. By default, each account home points
-`sessions/`, `session_index.jsonl`, and Codex `state_*.sqlite` chat state files
-at the system Codex chat store. Windows uses a directory junction for
-`sessions/` and hard links for shared files so admin symlink permission is not
-required:
+## Notes
 
-```text
-~/.codex
-```
-
-Set `CODEX_SHARED_CHAT_HOME` to change the shared chat store. Existing
-per-account chat storage is copied into the shared store when safe, then kept
-as timestamped `.pre-shared-*` backups before the shared links are created.
-
-For existing installations, saved account homes are prepared when the app lists
-accounts after upgrade. This migrates old per-account chat storage into the
-shared store without changing each account's `auth.json` or other
-account-specific files.
-
-Set `CODEX_ACCOUNTS_HOME` to change the base directory. This isolates Codex account state only; Codex still runs as the same host user and can access whatever that user can access.
-
-Set `CODEX_WORKSPACE_ROOT` to the directory the web app can browse for chat
-working directories. Local development defaults to the current user's home
-directory, for example `/home/ubuntu`.
-
-## API Entry Points
-
-- `GET /health`
-- `GET /api/auth/status`
-- `POST /api/auth/exchange`
-- `GET /api/auth/session`
-- `GET /api/accounts`
-- `POST /api/accounts`
-- `GET /api/accounts/:accountId`
-- `PATCH /api/accounts/:accountId`
-- `DELETE /api/accounts/:accountId`
-- `POST /api/accounts/:accountId/local-active`
-- `POST /api/accounts/:accountId/authenticate` with optional `{ "mode": "browser" | "device" }`
-- `POST /api/accounts/:accountId/authenticate/callback`
-- `GET /api/chats`
-- `POST /api/chats`
-- `GET /api/chats/:chatId`
-- `PATCH /api/chats/:chatId`
-- `DELETE /api/chats/:chatId`
-- `GET /api/chats/:chatId/messages`
-- `POST /api/chats/:chatId/messages`
-- `GET /api/workspaces/directories`
+xedoc is a local-first tool. It does not make your local project files public,
+but Codex runs with the permissions of your local user account. Choose working
+directories and permission modes with that in mind.
