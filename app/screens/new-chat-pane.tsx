@@ -46,7 +46,6 @@ import {
   appendMessages,
   canSend,
   executeResponseMessages,
-  hasAvailableAccountSnapshot,
   isAccountTokenInvalidatedError,
   readError,
   routeWorkingDirectoryFromState,
@@ -135,36 +134,26 @@ export function NewChatPane() {
     }
   }, [lastOpenedChat])
 
-  const quotaSelectionPending = useMemo(
-    () =>
-      connectedAccounts.some((account) => accountRateLimitFetching[account.id]) &&
-      !hasAvailableAccountSnapshot(connectedAccounts, accountRateLimitSnapshots),
-    [accountRateLimitFetching, accountRateLimitSnapshots, connectedAccounts],
-  )
   const bestAvailableAccount = useMemo(
-    () =>
-      quotaSelectionPending
-        ? undefined
-        : selectBestAvailableAccount(connectedAccounts, accountRateLimitSnapshots),
-    [accountRateLimitSnapshots, connectedAccounts, quotaSelectionPending],
+    () => selectBestAvailableAccount(connectedAccounts, accountRateLimitSnapshots),
+    [accountRateLimitSnapshots, connectedAccounts],
   )
   const manuallySelectedAccount = connectedAccounts.find(
     (account) => account.id === newChatAccountId,
   )
-  const selectedConnectedAccount = manuallySelectedAccount ?? bestAvailableAccount
+  const selectedConnectedAccount = autoRotateAccount
+    ? bestAvailableAccount
+    : (manuallySelectedAccount ?? bestAvailableAccount)
   const selectedConnectedAccountId = selectedConnectedAccount?.id ?? null
 
   useEffect(() => {
-    if (
-      newChatAccountId &&
-      connectedAccounts.some((account) => account.id === newChatAccountId)
-    ) {
+    if (!newChatAccountId) {
       return
     }
-    if (bestAvailableAccount?.id) {
-      setNewChatAccountId(bestAvailableAccount.id)
+    if (!connectedAccounts.some((account) => account.id === newChatAccountId)) {
+      setNewChatAccountId(null)
     }
-  }, [bestAvailableAccount?.id, connectedAccounts, newChatAccountId])
+  }, [connectedAccounts, newChatAccountId])
 
   useEffect(() => {
     if (!selectedConnectedAccount) {
@@ -434,6 +423,7 @@ export function NewChatPane() {
                     usageSummaries={accountUsageSummaries}
                     onAutoRotateChange={setAutoRotateAccount}
                     onSelect={(accountId) => {
+                      setAutoRotateAccount(false)
                       setNewChatAccountId(accountId)
                     }}
                   />
