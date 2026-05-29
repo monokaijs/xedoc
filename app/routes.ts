@@ -20,6 +20,7 @@ export default [
   route("api/accounts", "routes/api.accounts.ts"),
   route("api/accounts/export", "routes/api.accounts.export.ts"),
   route("api/accounts/import", "routes/api.accounts.import.ts"),
+  route("api/accounts/rate-limits", "routes/api.accounts.rate-limits.ts"),
   route(
     "api/accounts/import-local-active",
     "routes/api.accounts.import-local-active.ts",

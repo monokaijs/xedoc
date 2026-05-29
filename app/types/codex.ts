@@ -90,6 +90,12 @@ export interface CodexRateLimitsResponse {
   rateLimitsByLimitId?: Record<string, CodexRateLimitSnapshot | undefined> | null;
 }
 
+export interface AccountRateLimitsResponse {
+  data: Record<string, CodexRateLimitsResponse>;
+  errors?: Record<string, string>;
+  invalidatedAccountIds?: string[];
+}
+
 export interface CodexJsonRpcResponse {
   id?: string | number;
   result?: unknown;

@@ -1,5 +1,6 @@
 import type {
   AccountResponse,
+  AccountRateLimitsResponse,
   AccountRuntimeSettingsRequest,
   AccountExportDocument,
   AuthenticateAccountRequest,
@@ -288,6 +289,16 @@ export async function readCodexRateLimits(
   return fetchJson<CodexRateLimitsResponse>(
     session.serverUrl,
     `/api/accounts/${accountId}/rate-limits`,
+    { token: session.token },
+  )
+}
+
+export async function readCodexAccountRateLimits(
+  session: ApiSession,
+): Promise<AccountRateLimitsResponse> {
+  return fetchJson<AccountRateLimitsResponse>(
+    session.serverUrl,
+    "/api/accounts/rate-limits",
     { token: session.token },
   )
 }

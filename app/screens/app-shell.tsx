@@ -1,5 +1,5 @@
 import type { CodexRateLimitSnapshot } from "@/types"
-import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { ClipboardList, Loader2, Menu, Settings, SquarePen } from "lucide-react"
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { Navigate, Outlet, useLocation, useNavigate, useParams } from "react-router"
@@ -22,7 +22,11 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar"
 import { WorkspacePickerDialog } from "@/components/workspace-picker-dialog"
-import { listAccounts, listChats, readCodexRateLimits } from "@/lib/api"
+import {
+  listAccounts,
+  listChats,
+  readCodexAccountRateLimits,
+} from "@/lib/api"
 import { useDocumentTitle } from "@/lib/document-title"
 import { selectRateLimitSnapshot, usageCapacityLabel } from "@/lib/rate-limits"
 import { cn } from "@/lib/utils"
@@ -35,7 +39,6 @@ import {
   HeaderTerminalButton,
 } from "@/screens/components/header-menu"
 import type { ShellContext } from "@/screens/shell-context"
-import { isAccountTokenInvalidatedError } from "@/screens/chat-runtime-utils"
 
 export function AppShell() {
   const { loading, session } = useSession()
@@ -136,29 +139,31 @@ export function AppShell() {
     () => accounts.filter((account) => account.status === "CONNECTED"),
     [accounts],
   )
+  const connectedAccountIds = useMemo(
+    () => connectedAccounts.map((account) => account.id),
+    [connectedAccounts],
+  )
   useDocumentTitle(activeChatTitle)
-  const accountRateLimitQueries = useQueries({
-    queries: connectedAccounts.map((account) => ({
-      enabled: !!session,
-      queryKey: ["rate-limits", account.id],
-      queryFn: () => readCodexRateLimits(session!, account.id),
-      refetchInterval: 60_000,
-      retry: false,
-      staleTime: 30_000,
-    })),
+  const accountRateLimitsQuery = useQuery({
+    enabled: !!session && connectedAccountIds.length > 0,
+    queryKey: ["rate-limits", connectedAccountIds],
+    queryFn: () => readCodexAccountRateLimits(session!),
+    refetchInterval: 60_000,
+    retry: false,
+    staleTime: 30_000,
   })
   const accountRateLimitSnapshots = useMemo(() => {
     return Object.fromEntries(
       connectedAccounts
-        .map((account, index) => {
+        .map((account) => {
           const snapshot = selectRateLimitSnapshot(
-            accountRateLimitQueries[index]?.data,
+            accountRateLimitsQuery.data?.data[account.id],
           )
           return snapshot ? [account.id, snapshot] : null
         })
         .filter((entry): entry is [string, CodexRateLimitSnapshot] => !!entry),
     )
-  }, [accountRateLimitQueries, connectedAccounts])
+  }, [accountRateLimitsQuery.data, connectedAccounts])
   const accountUsageSummaries = useMemo(() => {
     return Object.fromEntries(
       connectedAccounts
@@ -171,21 +176,25 @@ export function AppShell() {
   }, [accountRateLimitSnapshots, connectedAccounts])
   const accountRateLimitFetching = useMemo(() => {
     return Object.fromEntries(
-      connectedAccounts.map((account, index) => [
+      connectedAccounts.map((account) => [
         account.id,
-        accountRateLimitQueries[index]?.isFetching ?? false,
+        accountRateLimitsQuery.isFetching,
       ]),
     )
-  }, [accountRateLimitQueries, connectedAccounts])
-  const hasInvalidatedRateLimitError = accountRateLimitQueries.some((query) =>
-    isAccountTokenInvalidatedError(query.error),
-  )
+  }, [accountRateLimitsQuery.isFetching, connectedAccounts])
+  const invalidatedRateLimitAccountIds =
+    accountRateLimitsQuery.data?.invalidatedAccountIds ?? []
+  const invalidatedRateLimitAccountKey = invalidatedRateLimitAccountIds.join("|")
 
   useEffect(() => {
-    if (hasInvalidatedRateLimitError) {
+    if (invalidatedRateLimitAccountIds.length) {
       void queryClient.invalidateQueries({ queryKey: ["accounts"] })
     }
-  }, [hasInvalidatedRateLimitError, queryClient])
+  }, [
+    invalidatedRateLimitAccountIds.length,
+    invalidatedRateLimitAccountKey,
+    queryClient,
+  ])
 
   useEffect(() => {
     if (!activeProjectPath.trim()) {

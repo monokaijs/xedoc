@@ -1,4 +1,8 @@
-import type { CodexModelListResponse, CodexRateLimitsResponse } from "@/types"
+import type {
+  AccountRateLimitsResponse,
+  CodexModelListResponse,
+  CodexRateLimitsResponse,
+} from "@/types"
 import {
   codexRuntimeService,
   isCodexAccountMarkedInvalidated,
@@ -34,6 +38,62 @@ export async function readRateLimits(
     return handleCodexAccountDataError(accountId, error)
   }
 }
+
+export async function readConnectedAccountRateLimits(): Promise<AccountRateLimitsResponse> {
+  const accounts = await prisma.codexAccount.findMany({
+    orderBy: { createdAt: "asc" },
+    where: { status: "CONNECTED" },
+  })
+  const results = await Promise.all(
+    accounts.map(async (account): Promise<AccountRateLimitResult> => {
+      try {
+        return {
+          accountId: account.id,
+          response: await readRateLimits(account.id),
+        }
+      } catch (error) {
+        return {
+          accountId: account.id,
+          error,
+        }
+      }
+    }),
+  )
+  const data: AccountRateLimitsResponse["data"] = {}
+  const errors: Record<string, string> = {}
+  const invalidatedAccountIds: string[] = []
+
+  for (const result of results) {
+    if ("response" in result) {
+      data[result.accountId] = result.response
+      continue
+    }
+    const message =
+      result.error instanceof Error
+        ? result.error.message
+        : "Unable to load rate limits."
+    errors[result.accountId] = message
+    if (result.error instanceof HttpError && result.error.status === 401) {
+      invalidatedAccountIds.push(result.accountId)
+    }
+  }
+
+  return {
+    data,
+    ...(Object.keys(errors).length ? { errors } : {}),
+    ...(invalidatedAccountIds.length ? { invalidatedAccountIds } : {}),
+  }
+}
+
+type AccountRateLimitResult =
+  | {
+      accountId: string
+      response: CodexRateLimitsResponse
+    }
+  | {
+      accountId: string
+      error: unknown
+    }
 
 async function requireConnectedAccount(accountId: string) {
   const account = await prisma.codexAccount.findUnique({
