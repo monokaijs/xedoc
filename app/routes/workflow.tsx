@@ -89,6 +89,9 @@ const statusLabels: Record<WorkflowTaskStatus, string> = {
   pending: "Pending",
 }
 
+const paneHeaderClass =
+  "flex h-12 shrink-0 items-center justify-between gap-2 border-b px-3"
+
 export default function WorkflowRoute() {
   const {
     accountRateLimitFetching,
@@ -259,12 +262,11 @@ export default function WorkflowRoute() {
   }
 
   return (
-    <main className="flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background">
+    <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background lg:flex-row">
       <section className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
         <ProjectRail
           projects={projects}
           selectedProjectPath={selectedProjectPath}
-          onCreateTask={openCreateTask}
           onSelectProject={setSelectedProjectPath}
         />
         <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
@@ -364,30 +366,22 @@ export default function WorkflowRoute() {
 function ProjectRail({
   projects,
   selectedProjectPath,
-  onCreateTask,
   onSelectProject,
 }: {
   projects: WorkflowProject[]
   selectedProjectPath: string
-  onCreateTask: () => void
   onSelectProject: (path: string) => void
 }) {
   return (
     <aside className="hidden w-64 shrink-0 border-r bg-sidebar/60 md:flex md:flex-col">
-      <div className="flex h-12 items-center justify-between gap-2 border-b px-3">
+      <div className={paneHeaderClass}>
         <div className="flex min-w-0 items-center gap-2 text-sm font-semibold">
           <ClipboardList className="size-4 text-cyan-500" />
           <span className="truncate">Workflow</span>
         </div>
-        <Button
-          aria-label="New task"
-          disabled={!selectedProjectPath}
-          size="icon-sm"
-          variant="ghost"
-          onClick={onCreateTask}
-        >
-          <Plus />
-        </Button>
+        <span className="shrink-0 text-xs text-muted-foreground">
+          {projects.length}
+        </span>
       </div>
       <ScrollArea className="min-h-0 flex-1">
         <div className="grid gap-1 p-2">
@@ -399,7 +393,6 @@ function ProjectRail({
                   "bg-sidebar-accent text-sidebar-accent-foreground",
               )}
               key={project.key}
-              title={project.path}
               type="button"
               onClick={() => onSelectProject(project.path)}
             >
@@ -437,8 +430,8 @@ function WorkflowToolbar({
   onViewChange: (view: WorkflowView) => void
 }) {
   return (
-    <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b px-3 py-2">
-      <div className="min-w-0">
+    <div className={cn(paneHeaderClass, "overflow-hidden")}>
+      <div className="min-w-0 flex-1">
         <div className="truncate text-sm font-semibold">
           {project?.name ?? "Workflow"}
         </div>
@@ -446,30 +439,42 @@ function WorkflowToolbar({
           {projectPath || "Choose a project folder"}
         </div>
       </div>
-      <div className="flex shrink-0 items-center gap-1">
+      <div className="flex max-w-[60%] shrink-0 items-center gap-1 overflow-x-auto sm:max-w-none">
         <Button
           size="sm"
+          title="Board view"
           variant={view === "board" ? "secondary" : "ghost"}
           onClick={() => onViewChange("board")}
         >
           <Columns3 />
-          Board
+          <span className="hidden sm:inline">Board</span>
         </Button>
         <Button
           size="sm"
+          title="List view"
           variant={view === "list" ? "secondary" : "ghost"}
           onClick={() => onViewChange("list")}
         >
           <LayoutList />
-          List
+          <span className="hidden sm:inline">List</span>
         </Button>
-        <Button size="sm" variant="outline" onClick={onChooseProject}>
+        <Button
+          size="sm"
+          title="Choose project"
+          variant="outline"
+          onClick={onChooseProject}
+        >
           <FolderOpen />
-          Project
+          <span className="hidden sm:inline">Project</span>
         </Button>
-        <Button disabled={!projectPath} size="sm" onClick={onCreateTask}>
+        <Button
+          disabled={!projectPath}
+          size="sm"
+          title="New task"
+          onClick={onCreateTask}
+        >
           <Plus />
-          Task
+          <span className="hidden sm:inline">Task</span>
         </Button>
       </div>
     </div>
@@ -486,7 +491,7 @@ function WorkflowBoard(props: TaskCollectionProps) {
             className="min-h-48 min-w-0 rounded-lg border bg-muted/20"
             key={status}
           >
-            <div className="flex h-10 items-center justify-between gap-2 border-b px-3">
+            <div className={paneHeaderClass}>
               <div className="flex min-w-0 items-center gap-2">
                 <span className={cn("size-2 rounded-full", statusDot(status))} />
                 <span className="truncate text-sm font-medium">
@@ -556,16 +561,21 @@ type TaskCollectionProps = {
   onStatusChange: (task: WorkflowTaskResponse, status: WorkflowTaskStatus) => void
 }
 
+type TaskActionProps = Pick<
+  TaskCollectionProps,
+  "deletingTaskId" | "executingTaskId" | "onDelete" | "onEdit" | "onExecute"
+> & {
+  task: WorkflowTaskResponse
+}
+
 function TaskCard({
   deletingTaskId,
   executingTaskId,
   task,
-  updatingTaskId,
   onDelete,
   onEdit,
   onExecute,
-  onStatusChange,
-}: TaskCollectionProps & { task: WorkflowTaskResponse }) {
+}: TaskActionProps) {
   return (
     <article className="grid min-w-0 gap-2 rounded-md border bg-card p-3 shadow-sm">
       <div className="min-w-0">
@@ -574,22 +584,14 @@ function TaskCard({
           {task.description || "No description."}
         </div>
       </div>
-      <div className="flex min-w-0 items-center justify-between gap-2">
-        <StatusSelect
-          disabled={updatingTaskId === task.id}
-          status={task.status}
-          onChange={(status) => onStatusChange(task, status)}
-        />
+      <div className="flex min-w-0 items-center justify-end">
         <TaskActions
           deletingTaskId={deletingTaskId}
           executingTaskId={executingTaskId}
           task={task}
-          updatingTaskId={updatingTaskId}
-          tasks={[]}
           onDelete={onDelete}
           onEdit={onEdit}
           onExecute={onExecute}
-          onStatusChange={onStatusChange}
         />
       </div>
     </article>
@@ -603,7 +605,7 @@ function TaskActions({
   onDelete,
   onEdit,
   onExecute,
-}: TaskCollectionProps & { task: WorkflowTaskResponse }) {
+}: TaskActionProps) {
   const deleting = deletingTaskId === task.id
   const executing = executingTaskId === task.id
   return (
@@ -726,8 +728,8 @@ function WorkflowAssistantPanel({
   })
 
   return (
-    <aside className="hidden w-[400px] shrink-0 border-l bg-sidebar/40 lg:flex lg:flex-col">
-      <div className="flex h-12 items-center justify-between gap-2 border-b px-3">
+    <aside className="flex h-72 max-h-[40vh] shrink-0 flex-col border-t bg-sidebar/40 lg:h-auto lg:max-h-none lg:w-[400px] lg:border-l lg:border-t-0">
+      <div className={paneHeaderClass}>
         <div className="flex min-w-0 items-center gap-2 text-sm font-semibold">
           <MessageSquarePlus className="size-4 text-emerald-500" />
           <span className="truncate">Codex Workflow</span>
@@ -783,8 +785,8 @@ function WorkflowAssistantPanel({
           }}
         />
         <div className="flex items-center justify-between gap-2">
-          <div className="min-w-0 truncate font-mono text-xs text-muted-foreground">
-            {project?.path ?? "No project selected"}
+          <div className="min-w-0 truncate text-xs text-muted-foreground">
+            {project?.name ?? "No project selected"}
           </div>
           <Button
             disabled={!prompt.trim() || !project || !account || sendMutation.isPending}
@@ -928,7 +930,7 @@ async function createWorkflowChat({
 }) {
   return createChat(session, {
     accountId: account.id,
-    autoRotateAccount: true,
+    autoRotateAccount: false,
     collaborationMode: "default",
     model: lastOpenedChat?.model ?? account.defaultModel ?? null,
     permissionMode:

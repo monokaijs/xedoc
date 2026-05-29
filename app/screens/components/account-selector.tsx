@@ -36,11 +36,11 @@ export function CodexAccountSelector({
   usageSummaries: Record<string, string>
 }) {
   const label = autoRotate
-    ? "Auto rotate"
+    ? "Auto"
     : (account?.displayName ?? "Choose account")
   const title =
     autoRotate && account
-      ? `Auto rotate: ${account.displayName}`
+      ? `Auto: ${account.displayName}`
       : (account?.displayName ?? "Choose account")
   return (
     <DropdownMenu>
@@ -77,7 +77,7 @@ export function CodexAccountSelector({
               }}
             >
               <RefreshCw />
-              <span className="min-w-0 flex-1">Auto rotate</span>
+              <span className="min-w-0 flex-1">Auto</span>
               <Switch
                 checked={!!autoRotate}
                 className="pointer-events-none"

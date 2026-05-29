@@ -43,7 +43,6 @@ import {
   UsageCapacityPill,
 } from "@/screens/components/composer-controls"
 import {
-  accountAvailabilityScore,
   appendMessages,
   canSend,
   executeResponseMessages,
@@ -82,7 +81,7 @@ export function NewChatPane() {
   const [collaborationMode, setCollaborationMode] =
     useState<CodexCollaborationMode>("default")
   const [model, setModel] = useState<string | null>(null)
-  const [autoRotateAccount, setAutoRotateAccount] = useState(true)
+  const [autoRotateAccount, setAutoRotateAccount] = useState(false)
   const [newChatAccountId, setNewChatAccountId] = useState<string | null>(null)
   const [permissionMode, setPermissionMode] =
     useState<CodexPermissionMode>("default")
@@ -152,18 +151,23 @@ export function NewChatPane() {
   const manuallySelectedAccount = connectedAccounts.find(
     (account) => account.id === newChatAccountId,
   )
-  const selectedConnectedAccount =
-    (autoRotateAccount &&
-    manuallySelectedAccount &&
-    accountAvailabilityScore(
-      accountRateLimitSnapshots[manuallySelectedAccount.id],
-    ) < 0
-      ? undefined
-      : manuallySelectedAccount) ??
-    bestAvailableAccount
+  const selectedConnectedAccount = manuallySelectedAccount ?? bestAvailableAccount
+  const selectedConnectedAccountId = selectedConnectedAccount?.id ?? null
 
   useEffect(() => {
-    if (!selectedConnectedAccount?.id) {
+    if (
+      newChatAccountId &&
+      connectedAccounts.some((account) => account.id === newChatAccountId)
+    ) {
+      return
+    }
+    if (bestAvailableAccount?.id) {
+      setNewChatAccountId(bestAvailableAccount.id)
+    }
+  }, [bestAvailableAccount?.id, connectedAccounts, newChatAccountId])
+
+  useEffect(() => {
+    if (!selectedConnectedAccount) {
       setRuntimeAccountId(null)
       setModel(null)
       setPermissionMode("default")
@@ -178,13 +182,7 @@ export function NewChatPane() {
     )
     setReasoningEffort(selectedConnectedAccount.defaultReasoningEffort ?? null)
     setServiceTier(selectedConnectedAccount.defaultServiceTier ?? null)
-  }, [
-    selectedConnectedAccount?.defaultModel,
-    selectedConnectedAccount?.defaultPermissionMode,
-    selectedConnectedAccount?.defaultReasoningEffort,
-    selectedConnectedAccount?.defaultServiceTier,
-    selectedConnectedAccount?.id,
-  ])
+  }, [selectedConnectedAccountId])
 
   const modelsQuery = useQuery({
     enabled: !!selectedConnectedAccount?.id,
@@ -199,7 +197,7 @@ export function NewChatPane() {
   }, [modelsQuery.error, queryClient])
   const modelOptions = modelsQuery.data?.data ?? []
   const runtimeSelectionsApply =
-    runtimeAccountId === selectedConnectedAccount?.id
+    runtimeAccountId === selectedConnectedAccountId
   const effectiveModel = runtimeSelectionsApply ? model : null
   const effectiveReasoningEffort = runtimeSelectionsApply
     ? reasoningEffort
@@ -265,7 +263,7 @@ export function NewChatPane() {
     onSuccess: ({ chat, response }) => {
       setContent("")
       setAttachments([])
-      setAutoRotateAccount(true)
+      setAutoRotateAccount(false)
       setCollaborationMode("default")
       setPermissionMode(
         selectedConnectedAccount?.defaultPermissionMode ?? "default",
