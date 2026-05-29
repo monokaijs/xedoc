@@ -1,0 +1,63 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version bump"
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Bump version
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "branch" ]; then
+            echo "Manual releases must be run from a branch." >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "$GITHUB_REF_NAME"
+          git checkout -B "$GITHUB_REF_NAME" "origin/$GITHUB_REF_NAME"
+
+          npm version "${{ inputs.version }}" --no-git-tag-version
+          version="$(node -p "require('./package.json').version")"
+
+          git add package.json
+          git commit -m "chore(release): v${version}"
+          git tag "v${version}"
+          git push origin "HEAD:${GITHUB_REF_NAME}" "v${version}"
+
+      - run: npm publish --access public

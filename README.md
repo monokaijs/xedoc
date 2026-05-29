@@ -105,10 +105,14 @@ stored at `<workspace-root>/.xedoc/xedoc.db`.
 
 ## npm Releases
 
-Package releases are published by GitHub Actions when a tag matching `v*` is
-pushed. The workflow uses npm trusted publishing, so configure the package on
-npmjs.com with this GitHub repository and the workflow file
-`.github/workflows/npm-publish.yml` before pushing the first release tag.
+Package releases are published by GitHub Actions. Run the `Publish to npm`
+workflow manually from a branch to bump `patch`, `minor`, or `major`, commit
+and tag the new version, then publish it. Pushing a tag matching `v*` also
+publishes that tag.
+
+The workflow uses npm trusted publishing, so configure the package on npmjs.com
+with this GitHub repository and the workflow file
+`.github/workflows/npm-publish.yml` before the first release.
 
 ## Codex Account Isolation
 
