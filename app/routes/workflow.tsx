@@ -137,10 +137,14 @@ export default function WorkflowRoute() {
     return () => setActiveProjectPath("")
   }, [selectedProjectPath, setActiveProjectPath])
 
-  const selectedProject = useMemo(
-    () => projects.find((project) => project.path === selectedProjectPath) ?? null,
-    [projects, selectedProjectPath],
-  )
+  const selectedProject = useMemo(() => {
+    const project = projects.find((entry) => entry.path === selectedProjectPath)
+    if (project) {
+      return project
+    }
+    const path = selectedProjectPath.trim()
+    return path ? workflowProjectForPath(path, tasks) : null
+  }, [projects, selectedProjectPath, tasks])
   const visibleTasks = useMemo(
     () =>
       selectedProjectPath
@@ -987,22 +991,26 @@ function buildProjects(
     paths.add(lastOpenedChat.workingDirectory.trim())
   }
   return [...paths]
-    .map((path) => {
-      const projectTasks = tasks.filter((task) => task.projectPath === path)
-      return {
-        activeCount: projectTasks.filter((task) => task.status !== "finished")
-          .length,
-        count: projectTasks.length,
-        key: path,
-        name: projectName(path),
-        path,
-      }
-    })
+    .map((path) => workflowProjectForPath(path, tasks))
     .sort(
       (left, right) =>
         right.activeCount - left.activeCount ||
         left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
     )
+}
+
+function workflowProjectForPath(
+  path: string,
+  tasks: WorkflowTaskResponse[],
+): WorkflowProject {
+  const projectTasks = tasks.filter((task) => task.projectPath === path)
+  return {
+    activeCount: projectTasks.filter((task) => task.status !== "finished").length,
+    count: projectTasks.length,
+    key: path,
+    name: projectName(path),
+    path,
+  }
 }
 
 function projectName(path: string): string {
