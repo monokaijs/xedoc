@@ -150,9 +150,11 @@ const accountRunLocks = new Map<string, Promise<void>>()
 const queueFlushLocks = new Map<string, Promise<void>>()
 const runProjectionQueues = new Map<string, Promise<void>>()
 const timelineMessageLocks = new Map<string, Promise<void>>()
+const commandOutputUpdateEmittedAt = new Map<string, number>()
 const cancelledThreadActivity = new Map<string, number>()
 const DEFAULT_CHAT_TITLE = "New Thread"
 const CANCELLED_ACTIVITY_IGNORE_MS = 10 * 60 * 1000
+const COMMAND_OUTPUT_UPDATE_INTERVAL_MS = 500
 
 export async function createChat(dto: CreateChatRequest): Promise<ChatResponse> {
   const account = await readConnectedAccount(dto.accountId)
@@ -1522,6 +1524,7 @@ async function runCodexWithAccountLock(
     }
     const completedEvent = await terminalEventPromise
     await drainRunProjectionQueue(runId)
+    flushCommandOutputBuffers(threadId, runId, streamBuffers)
     if (turnEventIsInterrupted(completedEvent)) {
       throw new CodexRunInterruptedError(terminalTurnMessage(completedEvent))
     }
@@ -1572,6 +1575,7 @@ async function runCodexWithAccountLock(
     }
     const message = error instanceof Error ? error.message : "Codex run failed."
     const keepPrimedRuntime = usePrimedThread && !turnStarted
+    flushCommandOutputBuffers(threadId, runId, streamBuffers)
     expirePendingServerRequests(threadId, runId, message)
     const failedAt = new Date()
     if (error instanceof CodexRunInterruptedError) {
@@ -1621,6 +1625,7 @@ async function runCodexWithAccountLock(
     unsubscribeEvents()
     unsubscribeRequests()
     runProjectionQueues.delete(runId)
+    clearCommandOutputUpdateThrottles(runId)
     state.runId = null
     state.turnId = null
     if (state.queuedTurns.length) {
@@ -2873,6 +2878,9 @@ async function projectCommandEvent(
   context.streamBuffers.set(bufferKey, output)
   const command = readString(payload.command) ?? readString(params.command) ?? "command"
   const status = itemStatus(payload, event.method ?? "")
+  if (!shouldProjectCommandOutputUpdate(context, itemId, event.method ?? "", status)) {
+    return
+  }
   await upsertTimelineMessage({
     completedAt: eventIsCompleted(event) ? new Date() : undefined,
     content: command,
@@ -2900,6 +2908,108 @@ async function projectCommandEvent(
     threadId: context.threadId,
     turnId: eventTurnId(event),
   })
+}
+
+function shouldProjectCommandOutputUpdate(
+  context: ProjectCodexEventContext,
+  itemId: string,
+  method: string,
+  status: string,
+): boolean {
+  const key = commandOutputUpdateThrottleKey(context.runId, context.threadId, itemId)
+  if (!isCommandOutputDeltaMethod(method) || commandStatusIsTerminal(status, method)) {
+    commandOutputUpdateEmittedAt.delete(key)
+    return true
+  }
+
+  const state = runtimeStates.get(context.threadId)
+  const existing = state
+    ? findTimelineMessage(state, {
+        itemId,
+        kind: "COMMAND_EXECUTION",
+        runId: context.runId,
+        threadId: context.threadId,
+      })
+    : null
+
+  if (!existing) {
+    commandOutputUpdateEmittedAt.set(key, Date.now())
+    return true
+  }
+
+  const now = Date.now()
+  const lastEmittedAt = commandOutputUpdateEmittedAt.get(key) ?? 0
+  if (now - lastEmittedAt >= COMMAND_OUTPUT_UPDATE_INTERVAL_MS) {
+    commandOutputUpdateEmittedAt.set(key, now)
+    return true
+  }
+  return false
+}
+
+function isCommandOutputDeltaMethod(method: string): boolean {
+  return normalizedType(method).includes("outputdelta")
+}
+
+function commandStatusIsTerminal(status: string, method: string): boolean {
+  return (
+    status === "completed" ||
+    status === "failed" ||
+    eventIsCompleted({ method })
+  )
+}
+
+function commandOutputUpdateThrottleKey(
+  runId: string,
+  threadId: string,
+  itemId: string,
+): string {
+  return `${runId}:${threadId}:${itemId}`
+}
+
+function clearCommandOutputUpdateThrottles(runId: string): void {
+  const prefix = `${runId}:`
+  for (const key of commandOutputUpdateEmittedAt.keys()) {
+    if (key.startsWith(prefix)) {
+      commandOutputUpdateEmittedAt.delete(key)
+    }
+  }
+}
+
+function flushCommandOutputBuffers(
+  threadId: string,
+  runId: string,
+  streamBuffers: Map<string, string>,
+): void {
+  const state = runtimeStates.get(threadId)
+  if (!state) {
+    return
+  }
+
+  for (const [bufferKey, output] of streamBuffers) {
+    if (!bufferKey.startsWith("COMMAND:")) {
+      continue
+    }
+    const itemId = bufferKey.slice("COMMAND:".length)
+    const message = state.messages.find(
+      (entry) =>
+        entry.runId === runId &&
+        entry.kind === "COMMAND_EXECUTION" &&
+        entry.itemId === itemId,
+    )
+    if (!message) {
+      continue
+    }
+    const metadata = asJsonObject(message.metadata) ?? {}
+    if (readText(metadata.output) === output) {
+      continue
+    }
+    const updated = updateRuntimeMessage(threadId, message.id, {
+      metadata: { ...metadata, output },
+    })
+    if (updated) {
+      emit(threadId, "message.updated", updated)
+    }
+  }
 }
 
 async function projectFileChangeEvent(

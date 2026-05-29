@@ -42,6 +42,10 @@ class CodexRuntime {
   private readonly pending = new Map<string, CodexPendingRequest>()
   private readonly eventHandlers = new Set<CodexEventHandler>()
   private readonly serverRequestHandlers = new Set<CodexServerRequestHandler>()
+  private readonly notificationDebugThrottles = new Map<
+    string,
+    { lastLoggedAt: number; suppressed: number }
+  >()
 
   constructor(private readonly config: CodexRuntimeConfig) {}
 
@@ -259,10 +263,7 @@ class CodexRuntime {
         })
         void markCodexAccountInvalidated(this.config.accountId, debugMessage)
       }
-      this.debug("notification received", {
-        message: debugMessage,
-        method: message.method ?? null,
-      })
+      this.debugNotificationReceived(message.method ?? null, debugMessage)
       for (const handler of this.eventHandlers) {
         handler(message)
       }
@@ -326,7 +327,46 @@ class CodexRuntime {
   private debug(message: string, details?: JsonObject): void {
     debugCodexRuntime(this.config.accountId, message, details)
   }
+
+  private debugNotificationReceived(
+    method: string | null,
+    debugMessage: string | null,
+  ): void {
+    if (!isHighFrequencyNotification(method, debugMessage)) {
+      this.debug("notification received", { message: debugMessage, method })
+      return
+    }
+
+    const key = method ?? "unknown"
+    const now = Date.now()
+    const state =
+      this.notificationDebugThrottles.get(key) ?? {
+        lastLoggedAt: 0,
+        suppressed: 0,
+      }
+
+    if (
+      now - state.lastLoggedAt >=
+      HIGH_FREQUENCY_NOTIFICATION_DEBUG_INTERVAL_MS
+    ) {
+      this.notificationDebugThrottles.set(key, {
+        lastLoggedAt: now,
+        suppressed: 0,
+      })
+      this.debug("notification received", {
+        message: debugMessage,
+        method,
+        ...(state.suppressed ? { suppressed: state.suppressed } : {}),
+      })
+      return
+    }
+
+    state.suppressed += 1
+    this.notificationDebugThrottles.set(key, state)
+  }
 }
+
+const HIGH_FREQUENCY_NOTIFICATION_DEBUG_INTERVAL_MS = 1_000
 
 class CodexRuntimeService {
   private readonly runtimes = new Map<string, CodexRuntime>()
@@ -441,6 +481,20 @@ function debugCodexRuntime(
 
 function debugEnabled(): boolean {
   return /^(1|true|yes|on)$/iu.test(process.env.XEDOC_DEBUG?.trim() ?? "")
+}
+
+function isHighFrequencyNotification(
+  method: string | null,
+  debugMessage: string | null,
+): boolean {
+  if (debugMessage) {
+    return false
+  }
+  const normalized = method?.toLowerCase() ?? ""
+  return (
+    normalized.includes("outputdelta") ||
+    normalized.includes("commandexecution/output")
+  )
 }
 
 function formatDebugDetails(details: JsonObject): string {
