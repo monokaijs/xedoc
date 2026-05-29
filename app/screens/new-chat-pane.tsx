@@ -141,9 +141,12 @@ export function NewChatPane() {
   const manuallySelectedAccount = connectedAccounts.find(
     (account) => account.id === newChatAccountId,
   )
+  const fallbackSelectedAccount =
+    connectedAccounts.find((account) => account.id === runtimeAccountId) ??
+    connectedAccounts[0]
   const selectedConnectedAccount = autoRotateAccount
     ? bestAvailableAccount
-    : (manuallySelectedAccount ?? bestAvailableAccount)
+    : manuallySelectedAccount ?? bestAvailableAccount ?? fallbackSelectedAccount
   const selectedConnectedAccountId = selectedConnectedAccount?.id ?? null
 
   useEffect(() => {

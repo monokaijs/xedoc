@@ -150,7 +150,7 @@ function normalizeCredits(
   return {
     balance: readString(raw.balance) ?? null,
     hasCredits:
-      readBoolean(raw.hasCredits) ?? readBoolean(raw.has_credits) ?? false,
+      readBoolean(raw.hasCredits) ?? readBoolean(raw.has_credits) ?? true,
     unlimited: readBoolean(raw.unlimited) ?? false,
   }
 }
