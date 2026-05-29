@@ -142,16 +142,6 @@ export async function importAccounts(
   )
 }
 
-export async function importLocalCodexActiveAccount(
-  session: ApiSession,
-): Promise<ImportAccountsResponse> {
-  return fetchJson<ImportAccountsResponse>(
-    session.serverUrl,
-    "/api/accounts/import-local-active",
-    { body: {}, token: session.token },
-  )
-}
-
 export async function readLoginCallbackPortStatus(
   session: ApiSession,
 ): Promise<LoginCallbackPortStatus> {

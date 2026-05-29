@@ -184,30 +184,6 @@ export async function importAccounts(
   }
 }
 
-export async function importLocalCodexActiveAccount(): Promise<ImportAccountsResponse> {
-  const localAuth = readDefaultLocalCodexAuthSnapshot({ required: true })
-  const existing = await findAccountMatchingLocalCodexAuth(localAuth)
-  const account = existing
-    ? await replaceAccountAuthWithLocalCodexAuth(existing, localAuth)
-    : await createAccountFromLocalCodexAuth(localAuth)
-
-  return {
-    imported: 1,
-    accounts: [serializeAccount(account, true)],
-    authentications: [
-      {
-        accountId: account.id,
-        status: "CONNECTED",
-        authMode: null,
-        authUrl: null,
-        verificationUrl: null,
-        userCode: null,
-        message: "Imported the active local Codex account.",
-      },
-    ],
-  }
-}
-
 export async function setLocalCodexActiveAccount(
   accountId: string,
 ): Promise<AccountResponse> {
@@ -906,7 +882,7 @@ function serializeAccountsWithLocalCodexActive(
 }
 
 function localCodexActiveAccountIds(accounts: CodexAccount[]): Set<string> {
-  const localAuth = readDefaultLocalCodexAuthSnapshot({ required: false })
+  const localAuth = readDefaultLocalCodexAuthSnapshot()
   if (!localAuth) {
     return new Set()
   }
@@ -932,70 +908,7 @@ function localCodexActiveAccountIds(accounts: CodexAccount[]): Set<string> {
   )
 }
 
-async function findAccountMatchingLocalCodexAuth(
-  localAuth: LocalCodexAuthSnapshot,
-): Promise<CodexAccount | null> {
-  const accounts = await prisma.codexAccount.findMany({
-    orderBy: { createdAt: "asc" },
-  })
-  const accountAuths = accounts.flatMap((account) => {
-    const auth = readAccountAuthSnapshot(account.id)
-    return auth ? [{ account, auth }] : []
-  })
-  const exactMatch = accountAuths.find(
-    (entry) => entry.auth.fingerprint === localAuth.fingerprint,
-  )
-  if (exactMatch) {
-    return exactMatch.account
-  }
-  if (!localAuth.email) {
-    return null
-  }
-  const emailMatches = accountAuths.filter(
-    (entry) => entry.auth.email === localAuth.email,
-  )
-  return emailMatches.length === 1 ? emailMatches[0].account : null
-}
-
-async function replaceAccountAuthWithLocalCodexAuth(
-  account: CodexAccount,
-  localAuth: LocalCodexAuthSnapshot,
-): Promise<CodexAccount> {
-  codexRuntimeService.stopRuntime(account.id)
-  writeImportedAccountAuthFile(account.id, { authJson: localAuth.authJson })
-  return prisma.codexAccount.update({
-    where: { id: account.id },
-    data: connectedAccountAuthData(account.id),
-  })
-}
-
-async function createAccountFromLocalCodexAuth(
-  localAuth: LocalCodexAuthSnapshot,
-): Promise<CodexAccount> {
-  const account = await prisma.codexAccount.create({
-    data: {
-      displayName: localAuth.email ?? "Local Codex account",
-      command: process.env.CODEX_COMMAND ?? "codex",
-      args: toJsonInput(parseDefaultCodexArgs()),
-      environment: toJsonInput(undefined),
-    },
-  })
-  writeImportedAccountAuthFile(account.id, { authJson: localAuth.authJson })
-  return prisma.codexAccount.update({
-    where: { id: account.id },
-    data: connectedAccountAuthData(account.id),
-  })
-}
-
-function readDefaultLocalCodexAuthSnapshot(options: {
-  required: true
-}): LocalCodexAuthSnapshot
-function readDefaultLocalCodexAuthSnapshot(options: {
-  required: false
-}): LocalCodexAuthSnapshot | null
-function readDefaultLocalCodexAuthSnapshot(options: {
-  required: boolean
-}): LocalCodexAuthSnapshot | null {
+function readDefaultLocalCodexAuthSnapshot(): LocalCodexAuthSnapshot | null {
   try {
     const authPath = join(resolveDefaultLocalCodexHome(), ACCOUNT_AUTH_FILE_NAME)
     const raw = readFileSync(authPath, "utf8")
@@ -1013,17 +926,8 @@ function readDefaultLocalCodexAuthSnapshot(options: {
       )
     }
     return authSnapshotFromJson(authJson)
-  } catch (error) {
-    if (!options.required) {
-      return null
-    }
-    if (error instanceof HttpError) {
-      throw error
-    }
-    throw new HttpError(
-      404,
-      "No active local Codex auth.json was found. Sign in with the local Codex CLI first.",
-    )
+  } catch {
+    return null
   }
 }
 

@@ -158,7 +158,6 @@ directory, for example `/home/ubuntu`.
 - `GET /api/accounts/:accountId`
 - `PATCH /api/accounts/:accountId`
 - `DELETE /api/accounts/:accountId`
-- `POST /api/accounts/import-local-active`
 - `POST /api/accounts/:accountId/local-active`
 - `POST /api/accounts/:accountId/authenticate` with optional `{ "mode": "browser" | "device" }`
 - `POST /api/accounts/:accountId/authenticate/callback`

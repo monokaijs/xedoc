@@ -22,10 +22,6 @@ export default [
   route("api/accounts/import", "routes/api.accounts.import.ts"),
   route("api/accounts/rate-limits", "routes/api.accounts.rate-limits.ts"),
   route(
-    "api/accounts/import-local-active",
-    "routes/api.accounts.import-local-active.ts",
-  ),
-  route(
     "api/accounts/login-callback-port",
     "routes/api.accounts.login-callback-port.ts",
   ),

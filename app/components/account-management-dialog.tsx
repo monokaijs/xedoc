@@ -15,7 +15,6 @@ import {
   CircleAlert,
   Download,
   ExternalLink,
-  Import,
   KeyRound,
   Loader2,
   Plus,
@@ -51,7 +50,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Input } from "@/components/ui/input"
@@ -66,7 +64,6 @@ import {
   deleteAccount,
   exportAccounts,
   importAccounts,
-  importLocalCodexActiveAccount,
   killLoginCallbackPortProcess,
   readLoginCallbackPortStatus,
   setLocalCodexActiveAccount,
@@ -386,18 +383,6 @@ export function AccountManagementPanel({
     },
   })
 
-  const localImportMutation = useMutation({
-    mutationFn: () => importLocalCodexActiveAccount(session),
-    onError: (caught) => toast.error(readError(caught)),
-    onSuccess: (response) => {
-      toast.success(
-        `Imported ${response.imported} local ${accountLabel(response.imported)}.`,
-      )
-      void invalidateAccounts()
-      void queryClient.invalidateQueries({ queryKey: ["chats"] })
-    },
-  })
-
   const setLocalActiveMutation = useMutation({
     mutationFn: (accountId: string) =>
       setLocalCodexActiveAccount(session, accountId),
@@ -641,7 +626,7 @@ export function AccountManagementPanel({
                 <DropdownMenuTrigger
                   render={<Button className="w-full sm:w-auto" />}
                 >
-                  {createMutation.isPending || localImportMutation.isPending ? (
+                  {createMutation.isPending ? (
                     <Loader2 className="animate-spin" />
                   ) : (
                     <Plus />
@@ -663,21 +648,6 @@ export function AccountManagementPanel({
                   >
                     <KeyRound />
                     Device Auth
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    disabled={localImportMutation.isPending}
-                    onClick={() => {
-                      setAddMenuOpen(false)
-                      localImportMutation.mutate()
-                    }}
-                  >
-                    {localImportMutation.isPending ? (
-                      <Loader2 className="animate-spin" />
-                    ) : (
-                      <Import />
-                    )}
-                    Import Local
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
