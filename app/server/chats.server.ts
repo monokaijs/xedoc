@@ -1827,7 +1827,11 @@ function accountAvailabilityScore(snapshot?: CodexRateLimitSnapshot): number {
   const remainingPercents = [snapshot.primary, snapshot.secondary]
     .filter((window): window is CodexRateLimitWindow => !!window)
     .map((window) => 100 - clampPercent(window.usedPercent))
-  return remainingPercents.length ? Math.min(...remainingPercents) : 0
+  if (!remainingPercents.length) {
+    return 0
+  }
+  const score = Math.min(...remainingPercents)
+  return score < 1 ? -1 : score
 }
 
 function usageCapacitySeverity(

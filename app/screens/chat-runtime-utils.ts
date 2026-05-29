@@ -107,7 +107,8 @@ export function accountAvailabilityScore(
   if (!remainingPercents.length) {
     return 0
   }
-  return Math.min(...remainingPercents)
+  const score = Math.min(...remainingPercents)
+  return score < 1 ? -1 : score
 }
 
 export function fullRateLimitWindowLabel(
