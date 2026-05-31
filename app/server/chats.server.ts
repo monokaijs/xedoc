@@ -3559,7 +3559,11 @@ function readReasoningTextFromObject(object?: JsonObject): string | undefined {
 }
 
 function normalizedType(value: string): string {
-  return value.toLowerCase().replaceAll("_", "").replaceAll("-", "")
+  return value
+    .toLowerCase()
+    .replaceAll("/", "")
+    .replaceAll("_", "")
+    .replaceAll("-", "")
 }
 
 function isAssistantItem(itemType: string): boolean {
