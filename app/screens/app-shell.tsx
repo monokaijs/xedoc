@@ -133,7 +133,7 @@ export function AppShell() {
         return openedChat
       }
     }
-    return chats[0] ?? null
+    return null
   }, [chatId, chats, lastOpenedChatId])
   const connectedAccounts = useMemo(
     () => accounts.filter((account) => account.status === "CONNECTED"),

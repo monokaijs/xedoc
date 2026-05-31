@@ -10,7 +10,7 @@ import {
   Pencil,
   Plus,
 } from "lucide-react"
-import { useMemo, useState } from "react"
+import { useMemo, useRef, useState } from "react"
 import { useNavigate, useParams } from "react-router"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
@@ -54,13 +54,14 @@ type ChatSidebarItem = {
   folderKey: string
   folderName: string
   folderPath: string
+  order: number
 }
 
 type ChatSidebarGroup = {
   items: ChatSidebarItem[]
   key: string
-  latestActivityAt: number
   name: string
+  order: number
   path: string
 }
 
@@ -74,6 +75,7 @@ export function ChatSidebar({
   const navigate = useNavigate()
   const { chatId } = useParams()
   const queryClient = useQueryClient()
+  const chatOrderRef = useRef<Map<string, number>>(new Map())
   const [renameTarget, setRenameTarget] = useState<ChatResponse | null>(null)
   const [renameTitle, setRenameTitle] = useState("")
   const [archiveTarget, setArchiveTarget] = useState<ChatResponse | null>(null)
@@ -84,32 +86,35 @@ export function ChatSidebar({
     () => new Set(),
   )
 
+  const stableChats = useMemo(
+    () => sortChatsByStableOrder(chats, chatOrderRef.current),
+    [chats],
+  )
   const chatItems = useMemo(
     () =>
-      chats.map((chat) => ({
+      stableChats.map((chat, index) => ({
         chat,
         dateLabel: formatChatListDate(chat.lastActivityAt),
         folderKey: chatFolderKey(chat.workingDirectory),
         folderName: chatFolderName(chat.workingDirectory),
         folderPath: chatFolderPath(chat.workingDirectory),
+        order: index,
       })),
-    [chats],
+    [stableChats],
   )
   const chatGroups = useMemo<ChatSidebarGroup[]>(() => {
     const groups = new Map<string, ChatSidebarGroup>()
     for (const item of chatItems) {
-      const activityTime = new Date(item.chat.lastActivityAt).getTime()
       const group = groups.get(item.folderKey)
       if (group) {
         group.items.push(item)
-        group.latestActivityAt = Math.max(group.latestActivityAt, activityTime)
         continue
       }
       groups.set(item.folderKey, {
         items: [item],
         key: item.folderKey,
-        latestActivityAt: activityTime,
         name: item.folderName,
+        order: item.order,
         path: item.folderPath,
       })
     }
@@ -118,8 +123,7 @@ export function ChatSidebar({
         ...group,
         items: group.items.sort(
           (a, b) =>
-            new Date(b.chat.lastActivityAt).getTime() -
-              new Date(a.chat.lastActivityAt).getTime() ||
+            a.order - b.order ||
             a.chat.title.localeCompare(b.chat.title, undefined, {
               sensitivity: "base",
             }),
@@ -127,7 +131,7 @@ export function ChatSidebar({
       }))
       .sort(
         (a, b) =>
-          b.latestActivityAt - a.latestActivityAt ||
+          a.order - b.order ||
           a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
       )
   }, [chatItems])
@@ -168,9 +172,11 @@ export function ChatSidebar({
           chatGroups.map((group) => {
             const groupCollapsed = collapsedFolderKeys.has(group.key)
             const groupExpanded = expandedFolderKeys.has(group.key)
-            const visibleItems = groupExpanded
-              ? group.items
-              : group.items.slice(0, CHAT_GROUP_VISIBLE_LIMIT)
+            const visibleItems = visibleChatItems(
+              group.items,
+              chatId,
+              groupExpanded,
+            )
             const hiddenCount = group.items.length - visibleItems.length
             const canStartInFolder = isConcreteFolderPath(group.path)
 
@@ -416,6 +422,58 @@ function ChatStatusIcon({ status }: { status: ChatStatus }) {
       className="size-3.5 shrink-0 text-muted-foreground"
     />
   )
+}
+
+function sortChatsByStableOrder(
+  chats: ChatResponse[],
+  order: Map<string, number>,
+): ChatResponse[] {
+  const chatIds = new Set(chats.map((chat) => chat.id))
+  for (const chatId of Array.from(order.keys())) {
+    if (!chatIds.has(chatId)) {
+      order.delete(chatId)
+    }
+  }
+
+  if (!order.size) {
+    chats.forEach((chat, index) => order.set(chat.id, index))
+  } else {
+    const newChats = chats.filter((chat) => !order.has(chat.id))
+    if (newChats.length) {
+      const firstOrder = Math.min(...order.values())
+      newChats.forEach((chat, index) =>
+        order.set(chat.id, firstOrder - newChats.length + index),
+      )
+    }
+  }
+
+  return [...chats].sort(
+    (left, right) =>
+      (order.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
+      (order.get(right.id) ?? Number.MAX_SAFE_INTEGER),
+  )
+}
+
+function visibleChatItems(
+  items: ChatSidebarItem[],
+  activeChatId: string | undefined,
+  expanded: boolean,
+): ChatSidebarItem[] {
+  if (expanded || items.length <= CHAT_GROUP_VISIBLE_LIMIT) {
+    return items
+  }
+
+  const visible = items.slice(0, CHAT_GROUP_VISIBLE_LIMIT)
+  if (!activeChatId || visible.some((item) => item.chat.id === activeChatId)) {
+    return visible
+  }
+
+  const activeItem = items.find((item) => item.chat.id === activeChatId)
+  if (!activeItem) {
+    return visible
+  }
+
+  return [...visible.slice(0, CHAT_GROUP_VISIBLE_LIMIT - 1), activeItem]
 }
 
 function chatStatusLabel(status: ChatStatus): string {
