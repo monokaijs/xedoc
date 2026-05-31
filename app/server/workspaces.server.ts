@@ -3,7 +3,7 @@ import type { Dirent } from "node:fs"
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs"
 import { mkdir, readdir } from "node:fs/promises"
 import { homedir } from "node:os"
-import { dirname, isAbsolute, join, relative, resolve } from "node:path"
+import { dirname, isAbsolute, join, resolve } from "node:path"
 import type {
   WorkspaceDirectoryResponse,
   WorkspaceEntry,
@@ -44,10 +44,6 @@ export async function createDirectory(
   const parent = resolveWorkspacePath(root, parentPath)
   const directoryName = normalizeDirectoryName(name)
   const target = resolve(parent, directoryName)
-  const rootRelativePath = relative(root, target)
-  if (rootRelativePath.startsWith("..") || isAbsolute(rootRelativePath)) {
-    throw new HttpError(403, "Path is outside the workspace root.")
-  }
 
   try {
     await mkdir(target)
@@ -87,14 +83,10 @@ function resolveWorkspacePath(root: string, inputPath?: string): string {
   try {
     path = realpathSync(resolve(unresolvedPath))
   } catch {
-    throw new HttpError(400, "Workspace path does not exist.")
-  }
-  const rootRelativePath = relative(root, path)
-  if (rootRelativePath.startsWith("..") || isAbsolute(rootRelativePath)) {
-    throw new HttpError(403, "Path is outside the workspace root.")
+    throw new HttpError(400, "Directory path does not exist.")
   }
   if (!statSync(path).isDirectory()) {
-    throw new HttpError(400, "Workspace path is not a directory.")
+    throw new HttpError(400, "Path is not a directory.")
   }
   return path
 }

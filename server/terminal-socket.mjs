@@ -6,7 +6,6 @@ import {
   basename,
   isAbsolute,
   join,
-  relative,
   resolve,
 } from "node:path"
 
@@ -325,14 +324,10 @@ function resolveWorkspaceDirectory(inputPath, configuredRoot) {
   try {
     path = realpathSync(resolve(unresolvedPath))
   } catch {
-    throw new Error("Workspace path does not exist.")
-  }
-  const rootRelativePath = relative(root, path)
-  if (rootRelativePath.startsWith("..") || isAbsolute(rootRelativePath)) {
-    throw new Error("Path is outside the workspace root.")
+    throw new Error("Directory path does not exist.")
   }
   if (!statSync(path).isDirectory()) {
-    throw new Error("Workspace path is not a directory.")
+    throw new Error("Path is not a directory.")
   }
   return path
 }

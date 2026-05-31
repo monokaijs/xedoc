@@ -213,9 +213,10 @@ xedoc --debug
 Debug logs include Codex request failures, runtime exits, invalidation signals,
 and other run-level diagnostics.
 
-### xedoc cannot see my project
+### Change the file browser start directory
 
-Start xedoc with a workspace root that contains the project:
+xedoc opens the file browser at your home directory by default. You can type an
+absolute project path in the picker, or choose a different start directory:
 
 ```bash
 xedoc --workspace-root ~/Projects

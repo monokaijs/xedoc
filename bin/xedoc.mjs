@@ -45,7 +45,7 @@ if (!options.skipSetup) {
 const url = `http://${runtime.host === "0.0.0.0" ? "localhost" : runtime.host}:${runtime.port}`
 console.log(`xedoc: ${url}`)
 console.log("Set the server password in your browser on first visit.")
-console.log(`Workspace root: ${runtime.workspaceRoot}`)
+console.log(`File browser home: ${runtime.workspaceRoot}`)
 console.log(`Shared chat store: ${runtime.sharedChatHome}`)
 console.log("Press Ctrl+C to stop.")
 
@@ -739,7 +739,7 @@ Usage:
 Options:
   --port <port>                 Web server port. Defaults to 6354.
   --host <host>                 Web server host. Defaults to 127.0.0.1.
-  --workspace-root <path>       Directory tree visible in the app. Defaults to your home directory.
+  --workspace-root <path>       File browser start directory. Defaults to your home directory.
   --accounts-home <path>        Codex account state directory. Defaults to ~/.xedoc/accounts.
   --shared-chat-home <path>     Shared Codex chat store. Defaults to ~/.codex.
   --skip-setup                  Do not create the SQLite database schema.
@@ -775,7 +775,7 @@ Options:
   --no-start                    Enable service without starting it during install.
   --port <port>                 Web server port. Defaults to 6354.
   --host <host>                 Web server host. Defaults to 127.0.0.1.
-  --workspace-root <path>       Directory tree visible in the app. Defaults to your home directory.
+  --workspace-root <path>       File browser start directory. Defaults to your home directory.
   --accounts-home <path>        Codex account state directory. Defaults to ~/.xedoc/accounts.
   --shared-chat-home <path>     Shared Codex chat store. Defaults to ~/.codex.
   --home <path>                 App data directory. Defaults to ~/.xedoc.

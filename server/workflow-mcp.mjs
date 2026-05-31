@@ -3,7 +3,7 @@ import "dotenv/config"
 import { randomUUID } from "node:crypto"
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs"
 import { homedir } from "node:os"
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
+import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { PrismaClient } from "@prisma/client"
 
 const statuses = ["pending", "in_progress", "finished", "failed"]
@@ -402,10 +402,6 @@ function normalizeProjectPath(value) {
     path = realpathSync(resolve(unresolved))
   } catch {
     throw new Error("projectPath must be an existing directory.")
-  }
-  const relativePath = relative(root, path)
-  if (relativePath.startsWith("..") || isAbsolute(relativePath)) {
-    throw new Error("projectPath must be inside the workspace root.")
   }
   if (!statSync(path).isDirectory()) {
     throw new Error("projectPath must be a directory.")

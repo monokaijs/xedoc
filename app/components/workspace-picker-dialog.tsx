@@ -52,6 +52,9 @@ export function WorkspacePickerDialog({
   const [selectedPath, setSelectedPath] = useState(initialPath ?? "")
   const [selectedType, setSelectedType] = useState<WorkspaceEntry["type"]>("directory")
   const [manualPath, setManualPath] = useState(initialPath ?? "")
+  const [browserPath, setBrowserPath] = useState<string | undefined>(
+    initialPath?.trim() || undefined,
+  )
   const [filter, setFilter] = useState("")
   const [showPath, setShowPath] = useState(true)
   const [showCreateFolder, setShowCreateFolder] = useState(false)
@@ -60,11 +63,11 @@ export function WorkspacePickerDialog({
 
   const rootQuery = useQuery({
     enabled: open,
-    queryKey: workspaceDirectoryQueryKey(session, undefined),
-    queryFn: () => listWorkspaceDirectory(session, undefined),
+    queryKey: workspaceDirectoryQueryKey(session, browserPath),
+    queryFn: () => listWorkspaceDirectory(session, browserPath),
   })
   const rootDirectory = rootQuery.data
-  const rootPath = rootDirectory?.root ?? rootDirectory?.path ?? ""
+  const rootPath = rootDirectory?.path ?? rootDirectory?.root ?? ""
   const effectiveSelectedPath = selectedPath || rootDirectory?.path || ""
 
   const createFolderMutation = useMutation({
@@ -101,6 +104,7 @@ export function WorkspacePickerDialog({
     setSelectedPath(initialPath ?? "")
     setSelectedType("directory")
     setManualPath(initialPath ?? "")
+    setBrowserPath(initialPath?.trim() || undefined)
     setFilter("")
     setShowPath(true)
     setShowCreateFolder(false)
@@ -112,17 +116,17 @@ export function WorkspacePickerDialog({
     if (!rootDirectory) {
       return
     }
-    const nextPath = initialPath || rootDirectory.path
+    const nextPath = rootDirectory.path
     setSelectedPath((current) => current || nextPath)
     setManualPath((current) => current || nextPath)
     setExpandedPaths((current) => {
       const next = new Set(current)
-      for (const path of ancestorPaths(nextPath, rootDirectory.root)) {
+      for (const path of ancestorPaths(nextPath, rootDirectory.path)) {
         next.add(path)
       }
       return next
     })
-  }, [initialPath, rootDirectory])
+  }, [rootDirectory])
 
   function selectPath(path: string, type: WorkspaceEntry["type"] = "directory") {
     setSelectedPath(path)
@@ -162,16 +166,20 @@ export function WorkspacePickerDialog({
   }
 
   function openManualPath() {
-    const nextPath = manualPath.trim() || rootDirectory?.path
+    const nextPath = manualPath.trim() || rootDirectory?.root || rootDirectory?.path
     if (nextPath) {
+      setBrowserPath(nextPath)
       selectPath(nextPath)
     }
   }
 
   function moveHome() {
-    if (rootDirectory?.path) {
-      openDirectory(rootDirectory.path)
-    }
+    const homePath = rootDirectory?.root ?? ""
+    setBrowserPath(undefined)
+    setSelectedPath(homePath)
+    setSelectedType("directory")
+    setManualPath(homePath)
+    setExpandedPaths(homePath ? new Set([homePath]) : new Set())
   }
 
   function refreshTree() {
@@ -221,7 +229,7 @@ export function WorkspacePickerDialog({
           </DialogTitle>
           <DialogDescription className="truncate">
             {rootDirectory?.root
-              ? `Workspace root: ${rootDirectory.root}`
+              ? `File browser home: ${rootDirectory.root}`
               : mode === "file"
                 ? "Pick a file from the workspace."
                 : "Pick a project folder for Codex."}
