@@ -34,12 +34,13 @@ import { HttpError } from "./http.server"
 import { asJsonObject, readString } from "./json.server"
 import { selectRateLimitSnapshot } from "@/lib/rate-limits"
 import {
+  hydrateThreadForAccount,
   listLocalCodexSessionSummaries,
-  mirrorCodexSessionForAccount,
   readLatestLocalCodexContextUsage,
   readLocalCodexSessionActivity,
   readLocalCodexSessionMetadata,
   readLocalCodexSessionTranscript,
+  syncThreadFromAccount,
   type ImportedLocalMessage,
   type LocalCodexSessionSummary,
 } from "./local-codex-import.server"
@@ -156,6 +157,21 @@ const DEFAULT_CHAT_TITLE = "New Thread"
 const CANCELLED_ACTIVITY_IGNORE_MS = 10 * 60 * 1000
 const COMMAND_OUTPUT_UPDATE_INTERVAL_MS = 500
 
+async function syncThreadFromAccountBestEffort(
+  threadId: string,
+  accountId: string | null | undefined,
+): Promise<void> {
+  if (!accountId) {
+    return
+  }
+  await syncThreadFromAccount(threadId, accountId).catch((error) => {
+    console.warn(
+      "Failed to sync Codex session history.",
+      error instanceof Error ? error.message : error,
+    )
+  })
+}
+
 export async function createChat(dto: CreateChatRequest): Promise<ChatResponse> {
   const account = await readConnectedAccount(dto.accountId)
   const workingDirectory = resolveDirectory(dto.workingDirectory)
@@ -197,6 +213,7 @@ export async function createChat(dto: CreateChatRequest): Promise<ChatResponse> 
   state.primed = true
   state.runtime = runtime
   state.updatedAt = new Date()
+  await syncThreadFromAccountBestEffort(threadId, account.id)
   const chat = await buildChatResponse(threadId, preference)
   emit(threadId, "chat.updated", chat)
   return chat
@@ -292,6 +309,12 @@ export async function updateChat(
       ? undefined
       : resolveDirectory(dto.workingDirectory)
 
+  if (accountId && accountId !== chat.accountId) {
+    await syncThreadFromAccountBestEffort(threadId, chat.accountId)
+    codexRuntimeService.stopRuntime(accountId)
+    await hydrateThreadForAccount(threadId, accountId)
+  }
+
   const preference = await upsertThreadPreference(threadId, {
     accountId,
     autoRotateAccount: dto.autoRotateAccount,
@@ -308,14 +331,6 @@ export async function updateChat(
     workingDirectory,
   })
 
-  if (accountId) {
-    void mirrorCodexSessionForAccount(threadId, accountId).catch((error) => {
-      console.warn(
-        "Failed to mirror Codex session.",
-        error instanceof Error ? error.message : error,
-      )
-    })
-  }
   if (title) {
     void persistThreadTitleToCodex(threadId, preference, title).catch((error) => {
       console.warn(
@@ -1395,9 +1410,14 @@ async function runCodexWithAccountLock(
     return
   }
   const permissionMode = normalizeStoredPermissionMode(preference?.permissionMode)
-  const runtime = runtimeForAccount(account)
+  let runtime = runtimeForAccount(account)
   const usePrimedThread =
     state.primed && state.accountId === account.id && state.runtime === runtime
+  if (!usePrimedThread) {
+    codexRuntimeService.stopRuntime(account.id)
+    await hydrateThreadForAccount(threadId, account.id)
+    runtime = runtimeForAccount(account)
+  }
   state.permissionMode = permissionMode
   state.runtime = runtime
   state.status = "RUNNING"
@@ -1410,7 +1430,6 @@ async function runCodexWithAccountLock(
   }
   emit(threadId, "chat.updated", await getChat(threadId))
   emit(threadId, "run.status", { runId, status: "RUNNING" })
-  await mirrorCodexSessionForAccount(threadId, account.id)
   if (state.runId !== runId || !state.runtime) {
     return
   }
@@ -1566,7 +1585,7 @@ async function runCodexWithAccountLock(
     }
     emit(threadId, "run.status", { runId, status: "COMPLETED" })
     await refreshThreadTitleFromCodex(runtimeForAccount(account), threadId)
-    await mirrorCodexSessionForAccount(threadId, account.id)
+    await syncThreadFromAccountBestEffort(threadId, account.id)
   } catch (error) {
     terminalWaitAbort?.abort()
     await terminalEventPromise?.catch(() => undefined)
@@ -1599,6 +1618,7 @@ async function runCodexWithAccountLock(
         runId,
         status: "CANCELLED",
       })
+      await syncThreadFromAccountBestEffort(threadId, account.id)
       return
     }
     settleOpenRunTimelineMessages(threadId, runId, "FAILED")
@@ -1620,6 +1640,7 @@ async function runCodexWithAccountLock(
       runId,
       status: "FAILED",
     })
+    await syncThreadFromAccountBestEffort(threadId, account.id)
   } finally {
     terminalWaitAbort?.abort()
     unsubscribeEvents()
@@ -1760,10 +1781,12 @@ async function autoRotateChatAccountIfNeeded(
   if (accountAvailabilityScore(snapshots.get(bestAccount.id)) < 0) {
     return chat
   }
+  await syncThreadFromAccountBestEffort(chat.id, chat.accountId)
+  codexRuntimeService.stopRuntime(bestAccount.id)
+  await hydrateThreadForAccount(chat.id, bestAccount.id)
   const preference = await upsertThreadPreference(chat.id, {
     accountId: bestAccount.id,
   })
-  void mirrorCodexSessionForAccount(chat.id, bestAccount.id).catch(() => undefined)
   const updated = await buildChatResponse(chat.id, preference)
   emit(chat.id, "chat.updated", updated)
   return updated

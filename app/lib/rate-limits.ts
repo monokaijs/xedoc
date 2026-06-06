@@ -29,7 +29,10 @@ export function usageCapacityLabel(
     return "Unlimited"
   }
   if (snapshot.rateLimitReachedType) {
-    return "Limit reached"
+    const refillLabel = usageCapacityRefillLabel(snapshot)
+    return refillLabel
+      ? `Limit reached · refills ${refillLabel}`
+      : "Limit reached · refill time unavailable"
   }
   const parts = [
     rateLimitSummary(snapshot.primary, "5h"),
@@ -38,6 +41,26 @@ export function usageCapacityLabel(
     .filter(Boolean)
     .join(" · ")
   return parts || "Usage n/a"
+}
+
+export function usageCapacityRefillLabel(
+  snapshot?: CodexRateLimitSnapshot,
+): string | null {
+  const resetAt = usageCapacityRefillTimestamp(snapshot)
+  return resetAt === null ? null : formatRateLimitResetTime(resetAt)
+}
+
+export function formatRateLimitResetTime(value: number): string {
+  const timestamp = normalizeResetTimestamp(value)
+  if (timestamp <= Date.now()) {
+    return "now"
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    month: "short",
+  }).format(new Date(timestamp))
 }
 
 export function usageCapacitySeverity(
@@ -94,6 +117,41 @@ function compactRateLimitWindowLabel(
     return `${minutes / 60}h`
   }
   return `${minutes}m`
+}
+
+function usageCapacityRefillTimestamp(
+  snapshot?: CodexRateLimitSnapshot,
+): number | null {
+  if (!snapshot) {
+    return null
+  }
+
+  const windows = [snapshot.primary, snapshot.secondary].filter(
+    (window): window is CodexRateLimitWindow => !!window,
+  )
+  const exhaustedWindows = windows.filter(rateLimitWindowReached)
+  const candidateWindows = exhaustedWindows.length
+    ? exhaustedWindows
+    : snapshot.rateLimitReachedType
+      ? windows
+      : []
+  const resetTimestamps = candidateWindows
+    .map((window) =>
+      window.resetsAt ? normalizeResetTimestamp(window.resetsAt) : null,
+    )
+    .filter((value): value is number => value !== null)
+
+  if (!resetTimestamps.length) {
+    return null
+  }
+
+  return exhaustedWindows.length
+    ? Math.max(...resetTimestamps)
+    : Math.min(...resetTimestamps)
+}
+
+function normalizeResetTimestamp(value: number): number {
+  return value < 1_000_000_000_000 ? value * 1000 : value
 }
 
 function normalizeRateLimitSnapshot(

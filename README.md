@@ -171,7 +171,8 @@ Common options:
 | `--host <host>` | Change the local web server host. |
 | `--workspace-root <path>` | Change which directories xedoc can browse. |
 | `--accounts-home <path>` | Change where account authentication state is stored. |
-| `--shared-chat-home <path>` | Change where Codex chat history is stored. |
+| `--history-home <path>` | Change where xedoc keeps canonical chat history. |
+| `--shared-chat-home <path>` | Change which external Codex history directory xedoc syncs with. |
 | `--debug` | Print Codex runtime diagnostics for stuck runs and account failures. |
 
 Examples:
@@ -190,10 +191,14 @@ xedoc keeps its data on your machine:
 | --- | --- |
 | App database | `<workspace-root>/.xedoc/xedoc.db` |
 | Account state | `~/.xedoc/accounts` |
-| Shared Codex chat history | `~/.codex` |
+| xedoc chat history | `~/.xedoc/history` |
+| External Codex sync | `~/.codex` |
 
-Each Codex account gets a separate account home. Chat history is shared so your
-threads stay visible across accounts and other local Codex tools.
+Each Codex account gets a separate account home. xedoc keeps a canonical local
+history store and hydrates account-local Codex state when a chat switches
+accounts, so account switching does not require multiple runtimes to write the
+same Codex files. xedoc also syncs completed history snapshots to the external
+Codex directory so other Codex clients can see the chats.
 
 ## Troubleshooting
 

@@ -2,13 +2,14 @@ import "dotenv/config"
 import { constants } from "node:fs"
 import {
   access,
-  appendFile,
   copyFile,
   mkdir,
   readdir,
   readFile,
   realpath,
+  rename,
   stat,
+  writeFile,
 } from "node:fs/promises"
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve, sep } from "node:path"
@@ -21,9 +22,10 @@ import type {
 } from "@/types"
 import {
   ensureAccountCodexHome,
+  resolveAccountCodexStateDatabasePath,
+  resolveCodexAccountsHome,
+  resolveCodexHistoryHome,
   resolveCodexSharedChatHome,
-  resolveCodexSharedSessionIndexPath,
-  resolveCodexSharedStateDatabasePath,
 } from "./codex-runtime.server"
 import { asJsonObject, readString } from "./json.server"
 import { prisma } from "./prisma.server"
@@ -107,15 +109,34 @@ type LocalFunctionCallOutput = {
 
 type CodexStateThreadRow = {
   archived: number | null
-  archivedAt: number | null
+  archivedAt: number | string | bigint | null
+  agentNickname: string | null
+  agentPath: string | null
+  agentRole: string | null
+  approvalMode: string | null
+  cliVersion: string | null
   createdAt: number | string | bigint | null
+  createdAtMs: number | string | bigint | null
   cwd: string | null
   firstUserMessage: string | null
+  gitBranch: string | null
+  gitOriginUrl: string | null
+  gitSha: string | null
+  hasUserEvent: number | null
   id: string
+  memoryMode: string | null
+  model: string | null
+  modelProvider: string | null
   preview: string | null
+  reasoningEffort: string | null
   rolloutPath: string | null
+  sandboxPolicy: string | null
+  source: string | null
+  threadSource: string | null
   title: string | null
+  tokensUsed: number | null
   updatedAt: number | string | bigint | null
+  updatedAtMs: number | string | bigint | null
 }
 
 type SqliteTableColumn = {
@@ -123,8 +144,14 @@ type SqliteTableColumn = {
 }
 
 const globalForCodexState = globalThis as typeof globalThis & {
-  codexStateDatabasePath?: string
-  codexStatePrisma?: PrismaClient
+  codexStateClients?: Map<string, PrismaClient>
+}
+
+type CanonicalThreadRecord = {
+  index: LocalCodexSessionIndexMetadata | null
+  sessionRelativePath: string
+  state: CodexStateThreadRow
+  syncedAt: string
 }
 
 const DEFAULT_SCAN_INTERVAL_MS = 30_000
@@ -134,6 +161,7 @@ const DEFAULT_MAX_FILE_BYTES = 25 * 1024 * 1024
 const FILE_CACHE_MAX_ENTRIES = 100
 const GLOBAL_IMPORT_STATE_KEY = "global"
 const importStates = new Map<string, LocalImportState>()
+const threadHistoryLocks = new Map<string, Promise<void>>()
 const contextUsageFileCache = new Map<
   string,
   FileCacheEntry<ContextWindowUsagePayload | null>
@@ -142,6 +170,8 @@ const transcriptFileCache = new Map<
   string,
   FileCacheEntry<ParsedLocalCodexSession | null>
 >()
+let canonicalHistoryImportPromise: Promise<void> | null = null
+let canonicalHistoryImported = false
 
 export async function importLocalCodexChats(
   options: { force?: boolean } = {},
@@ -167,7 +197,8 @@ export async function importLocalCodexChats(
   }
 
   const nextState: LocalImportState = { lastScanAt: now }
-  const promise = scanAndImportLocalCodexChats()
+  const promise = ensureCanonicalHistoryImported({ force: options.force })
+    .then(() => scanAndImportLocalCodexChats())
     .catch((error) => {
       console.warn(
         "Local Codex chat import failed.",
@@ -186,63 +217,24 @@ export async function importLocalCodexChats(
   await repairImportedLocalCodexChats()
 }
 
-export async function mirrorCodexSessionForAccount(
+export async function hydrateThreadForAccount(
   threadId: string,
   accountId: string,
-): Promise<void> {
-  const sessionPath = await findLocalCodexSessionPath(threadId)
-  if (!sessionPath) {
-    return
-  }
-
-  const destination = join(
-    ensureAccountCodexHome(accountId),
-    "sessions",
-    sessionRelativePath(sessionPath),
+): Promise<boolean> {
+  await ensureCanonicalHistoryImported()
+  return withThreadHistoryLock(threadId, () =>
+    hydrateCanonicalThreadToAccount(threadId, accountId),
   )
-  if (
-    resolve(sessionPath) === resolve(destination) ||
-    (await sameRealPath(sessionPath, destination))
-  ) {
-    return
-  }
-  await mirrorSessionIndex(sessionPath)
-  try {
-    await access(destination, constants.R_OK)
-    return
-  } catch {
-    // Copy below when the selected account does not already have the session.
-  }
-
-  await mkdir(dirname(destination), { recursive: true, mode: 0o700 })
-  await copyFile(sessionPath, destination)
 }
 
-async function mirrorSessionIndex(sessionPath: string): Promise<void> {
-  const indexPath = localSessionIndexPath(sessionPath)
-  const destination = resolveCodexSharedSessionIndexPath()
-  if (
-    !indexPath ||
-    resolve(indexPath) === resolve(destination) ||
-    (await sameRealPath(indexPath, destination))
-  ) {
-    return
-  }
-  try {
-    const content = await readFile(indexPath, "utf8")
-    if (!content.trim()) {
-      return
-    }
-    const destinationContent = await readFile(destination, "utf8").catch(() => "")
-    const prefix =
-      destinationContent && !destinationContent.endsWith("\n") ? "\n" : ""
-    await appendFile(
-      destination,
-      `${prefix}${content.endsWith("\n") ? content : `${content}\n`}`,
-    )
-  } catch {
-    // The session file itself is enough for transcript import; index mirroring is best effort.
-  }
+export async function syncThreadFromAccount(
+  threadId: string,
+  accountId: string,
+): Promise<boolean> {
+  await ensureCanonicalHistoryImported()
+  return withThreadHistoryLock(threadId, async () =>
+    syncThreadFromCodexHome(threadId, ensureAccountCodexHome(accountId)),
+  )
 }
 
 async function sameRealPath(left: string, right: string): Promise<boolean> {
@@ -251,6 +243,734 @@ async function sameRealPath(left: string, right: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+async function ensureCanonicalHistoryImported(
+  options: { force?: boolean } = {},
+): Promise<void> {
+  if (canonicalHistoryImported && !options.force) {
+    return
+  }
+  if (!canonicalHistoryImportPromise || options.force) {
+    canonicalHistoryImportPromise = importCanonicalCodexHistory()
+      .then(() => {
+        canonicalHistoryImported = true
+      })
+      .finally(() => {
+        canonicalHistoryImportPromise = null
+      })
+  }
+  await canonicalHistoryImportPromise
+}
+
+async function importCanonicalCodexHistory(): Promise<void> {
+  await ensureCanonicalHistoryHome()
+  for (const codexHome of await existingCodexHistoryHomes()) {
+    await syncCodexHomeHistory(codexHome).catch((error) => {
+      console.warn(
+        `Failed to import Codex history from ${codexHome}.`,
+        error instanceof Error ? error.message : error,
+      )
+    })
+  }
+}
+
+async function syncCodexHomeHistory(codexHome: string): Promise<void> {
+  const index = await readCodexSessionIndexFile(join(codexHome, "session_index.jsonl"))
+  for (const row of await readCodexStateThreadsFromHome(codexHome, localImportMaxFiles())) {
+    await withThreadHistoryLock(row.id, () =>
+      syncThreadToCanonicalFromSource(codexHome, row, index),
+    )
+  }
+
+  const files = (await listSessionFiles(join(codexHome, "sessions")))
+    .sort((left, right) => right.mtimeMs - left.mtimeMs)
+    .slice(0, localImportMaxFiles())
+  for (const file of files) {
+    const threadId = extractSessionIdFromPath(file.path)
+    if (!threadId) {
+      continue
+    }
+    const parsed = await readLocalCodexSessionTranscriptFile(file.path, threadId)
+    if (!parsed) {
+      continue
+    }
+    await withThreadHistoryLock(threadId, () =>
+      syncThreadToCanonicalFromSource(
+        codexHome,
+        stateRowFromParsedSession(parsed, file.path),
+        index,
+        parsed,
+      ),
+    )
+  }
+}
+
+async function syncThreadFromCodexHome(
+  threadId: string,
+  codexHome: string,
+): Promise<boolean> {
+  const index = await readCodexSessionIndexFile(join(codexHome, "session_index.jsonl"))
+  const row = await readCodexStateThreadFromHome(codexHome, threadId)
+  if (row) {
+    return syncThreadToCanonicalFromSource(codexHome, row, index)
+  }
+
+  const sessionPath = await findCodexHomeSessionPath(codexHome, threadId)
+  if (!sessionPath) {
+    return false
+  }
+  const parsed = await readLocalCodexSessionTranscriptFile(sessionPath, threadId)
+  if (!parsed) {
+    return false
+  }
+  return syncThreadToCanonicalFromSource(
+    codexHome,
+    stateRowFromParsedSession(parsed, sessionPath),
+    index,
+    parsed,
+  )
+}
+
+async function syncThreadToCanonicalFromSource(
+  codexHome: string,
+  row: CodexStateThreadRow,
+  index: Map<string, LocalCodexSessionIndexMetadata>,
+  parsed?: ParsedLocalCodexSession | null,
+): Promise<boolean> {
+  const sessionPath =
+    (await firstAccessiblePath(codexHomeSessionPathCandidates(codexHome, row.rolloutPath))) ??
+    (await findCodexHomeSessionPath(codexHome, row.id))
+  if (!sessionPath) {
+    return false
+  }
+  const resolvedParsed =
+    parsed ?? (await readLocalCodexSessionTranscriptFile(sessionPath, row.id))
+  const info = await stat(sessionPath).catch(() => null)
+  const sourceUpdatedAt = latestDate([
+    codexStateUpdatedAt(row),
+    resolvedParsed?.updatedAt,
+    info ? new Date(info.mtimeMs) : null,
+  ])
+  const existing = await readCanonicalThreadRecord(row.id)
+  if (
+    existing &&
+    codexStateUpdatedAt(existing.state).getTime() > sourceUpdatedAt.getTime()
+  ) {
+    return false
+  }
+
+  const relativePath = sessionRelativePath(sessionPath)
+  const destination = canonicalSessionPath(relativePath)
+  await copyFileAtomic(sessionPath, destination)
+  const metadata = mergeSessionIndexMetadata(
+    index.get(row.id) ?? null,
+    await readLocalSessionIndexMetadata(sessionPath, row.id),
+    row,
+    resolvedParsed,
+    sourceUpdatedAt,
+  )
+  const state = normalizeCodexStateThreadRow({
+    ...row,
+    rolloutPath: destination,
+    updatedAt: timestampSeconds(sourceUpdatedAt),
+    updatedAtMs: sourceUpdatedAt.getTime(),
+  })
+  const record: CanonicalThreadRecord = {
+    index: metadata,
+    sessionRelativePath: relativePath,
+    state,
+    syncedAt: new Date().toISOString(),
+  }
+  await writeCanonicalThreadRecord(record)
+  await upsertSessionIndexRecord(canonicalSessionIndexPath(), row.id, metadata)
+  await exportCanonicalThreadToSharedCodex(record).catch((error) => {
+    console.warn(
+      "Failed to export history to external Codex home.",
+      error instanceof Error ? error.message : error,
+    )
+  })
+  return true
+}
+
+async function hydrateCanonicalThreadToAccount(
+  threadId: string,
+  accountId: string,
+): Promise<boolean> {
+  const record = await readCanonicalThreadRecord(threadId)
+  if (!record) {
+    return false
+  }
+  const accountHome = ensureAccountCodexHome(accountId)
+  const source = canonicalSessionPath(record.sessionRelativePath)
+  const destination = join(accountHome, "sessions", record.sessionRelativePath)
+  await copyFileAtomic(source, destination)
+  await upsertSessionIndexRecord(
+    join(accountHome, "session_index.jsonl"),
+    threadId,
+    record.index,
+  )
+  await upsertAccountCodexStateThread(accountId, record, destination)
+  return true
+}
+
+async function upsertAccountCodexStateThread(
+  accountId: string,
+  record: CanonicalThreadRecord,
+  rolloutPath: string,
+): Promise<void> {
+  const databasePath = resolveAccountCodexStateDatabasePath(accountId)
+  await upsertCodexStateThreadAtDatabase(
+    databasePath,
+    record,
+    rolloutPath,
+    `account ${accountId}`,
+  )
+}
+
+async function exportCanonicalThreadToSharedCodex(
+  record: CanonicalThreadRecord,
+): Promise<void> {
+  const sharedHome = resolveCodexSharedChatHome()
+  const source = canonicalSessionPath(record.sessionRelativePath)
+  const destination = join(sharedHome, "sessions", record.sessionRelativePath)
+  await copyFileAtomic(source, destination)
+  await upsertSessionIndexRecord(
+    join(sharedHome, "session_index.jsonl"),
+    record.state.id,
+    record.index,
+  )
+  await upsertCodexStateThreadAtDatabase(
+    await codexStateDatabasePathForHome(sharedHome),
+    record,
+    destination,
+    "external Codex home",
+  )
+}
+
+async function upsertCodexStateThreadAtDatabase(
+  databasePath: string,
+  record: CanonicalThreadRecord,
+  rolloutPath: string,
+  label: string,
+): Promise<void> {
+  await ensureCodexStateDatabaseSchema(databasePath)
+  const client = await codexStateClient(databasePath)
+  if (!client) {
+    throw new Error(`Codex state database is not readable for ${label}.`)
+  }
+  const columns = await readCodexStateThreadColumns(client)
+  await upsertCodexStateThreadRow(
+    client,
+    columns,
+    normalizeCodexStateThreadRow({
+      ...record.state,
+      rolloutPath,
+    }),
+  )
+}
+
+async function upsertCodexStateThreadRow(
+  client: PrismaClient,
+  columns: Set<string>,
+  row: CodexStateThreadRow,
+): Promise<void> {
+  const values = codexStateThreadValueMap(row)
+  const names = Object.keys(values).filter((name) => columns.has(name))
+  if (!names.includes("id") || !names.includes("rollout_path")) {
+    throw new Error("Codex state database is missing required thread columns.")
+  }
+  const placeholders = names.map(() => "?").join(", ")
+  const updateSql = names
+    .filter((name) => name !== "id")
+    .map((name) => `"${name}" = excluded."${name}"`)
+    .join(", ")
+  await client.$executeRawUnsafe(
+    `
+      INSERT INTO threads (${names.map((name) => `"${name}"`).join(", ")})
+      VALUES (${placeholders})
+      ON CONFLICT(id) DO UPDATE SET ${updateSql}
+    `,
+    ...names.map((name) => values[name]),
+  )
+}
+
+function codexStateThreadValueMap(
+  row: CodexStateThreadRow,
+): Record<string, string | number | null> {
+  const updatedAt = codexStateUpdatedAt(row)
+  const createdAt = codexStateCreatedAt(row, updatedAt)
+  return {
+    agent_nickname: row.agentNickname,
+    agent_path: row.agentPath,
+    agent_role: row.agentRole,
+    approval_mode: row.approvalMode ?? "",
+    archived: row.archived ?? 0,
+    archived_at: row.archivedAt
+      ? timestampSeconds(dateFromCodexTimestamp(row.archivedAt, new Date(0)))
+      : null,
+    cli_version: row.cliVersion ?? "",
+    created_at: timestampSeconds(createdAt),
+    created_at_ms: createdAt.getTime(),
+    cwd: row.cwd ?? "",
+    first_user_message: row.firstUserMessage ?? "",
+    git_branch: row.gitBranch,
+    git_origin_url: row.gitOriginUrl,
+    git_sha: row.gitSha,
+    has_user_event: row.hasUserEvent ?? (row.firstUserMessage ? 1 : 0),
+    id: row.id,
+    memory_mode: row.memoryMode ?? "enabled",
+    model: row.model,
+    model_provider: row.modelProvider ?? "",
+    preview: row.preview ?? "",
+    reasoning_effort: row.reasoningEffort,
+    rollout_path: row.rolloutPath ?? "",
+    sandbox_policy: row.sandboxPolicy ?? "",
+    source: row.source ?? "xedoc",
+    thread_source: row.threadSource ?? "xedoc",
+    title: row.title ?? "",
+    tokens_used: row.tokensUsed ?? 0,
+    updated_at: timestampSeconds(updatedAt),
+    updated_at_ms: updatedAt.getTime(),
+  }
+}
+
+async function ensureCodexStateDatabaseSchema(databasePath: string): Promise<void> {
+  await mkdir(dirname(databasePath), { recursive: true, mode: 0o700 })
+  const client = await openCodexStateClient(databasePath)
+  for (const statement of CODEX_STATE_SCHEMA_SQL) {
+    await client.$executeRawUnsafe(statement)
+  }
+}
+
+const CODEX_STATE_SCHEMA_SQL = [
+  `CREATE TABLE IF NOT EXISTS threads (
+    id TEXT PRIMARY KEY,
+    rollout_path TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    model_provider TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    title TEXT NOT NULL,
+    sandbox_policy TEXT NOT NULL,
+    approval_mode TEXT NOT NULL,
+    tokens_used INTEGER NOT NULL DEFAULT 0,
+    has_user_event INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    archived_at INTEGER,
+    git_sha TEXT,
+    git_branch TEXT,
+    git_origin_url TEXT,
+    cli_version TEXT NOT NULL DEFAULT '',
+    first_user_message TEXT NOT NULL DEFAULT '',
+    agent_nickname TEXT,
+    agent_role TEXT,
+    memory_mode TEXT NOT NULL DEFAULT 'enabled',
+    model TEXT,
+    reasoning_effort TEXT,
+    agent_path TEXT,
+    created_at_ms INTEGER,
+    updated_at_ms INTEGER,
+    thread_source TEXT,
+    preview TEXT NOT NULL DEFAULT ''
+  )`,
+  "CREATE INDEX IF NOT EXISTS idx_threads_created_at ON threads(created_at DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_threads_updated_at ON threads(updated_at DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_threads_archived ON threads(archived)",
+  "CREATE INDEX IF NOT EXISTS idx_threads_created_at_ms ON threads(created_at_ms DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_threads_updated_at_ms ON threads(updated_at_ms DESC, id DESC)",
+]
+
+async function existingCodexHistoryHomes(): Promise<string[]> {
+  const homes = [resolveCodexSharedChatHome(), ...(await accountCodexHomes())]
+  const existing: string[] = []
+  const seen = new Set<string>()
+  for (const home of homes.map((entry) => resolveHomePath(entry))) {
+    try {
+      await access(home, constants.R_OK)
+      const key = await realpath(home).catch(() => home)
+      if (!seen.has(key)) {
+        seen.add(key)
+        existing.push(home)
+      }
+    } catch {
+      // Missing Codex homes are expected for new installs.
+    }
+  }
+  return existing
+}
+
+async function accountCodexHomes(): Promise<string[]> {
+  try {
+    const accountsHome = resolveCodexAccountsHome()
+    const entries = await readdir(accountsHome, { withFileTypes: true })
+    return entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => join(accountsHome, entry.name))
+  } catch {
+    return []
+  }
+}
+
+async function ensureCanonicalHistoryHome(): Promise<void> {
+  await mkdir(canonicalSessionsHome(), { recursive: true, mode: 0o700 })
+  await mkdir(canonicalThreadsHome(), { recursive: true, mode: 0o700 })
+  await upsertSessionIndexRecord(canonicalSessionIndexPath(), "", null)
+}
+
+function canonicalSessionsHome(): string {
+  return join(resolveCodexHistoryHome(), "sessions")
+}
+
+function canonicalThreadsHome(): string {
+  return join(resolveCodexHistoryHome(), "threads")
+}
+
+function canonicalSessionIndexPath(): string {
+  return join(resolveCodexHistoryHome(), "session_index.jsonl")
+}
+
+function canonicalSessionPath(relativePath: string): string {
+  return join(canonicalSessionsHome(), relativePath)
+}
+
+function canonicalThreadRecordPath(threadId: string): string {
+  return join(canonicalThreadsHome(), `${encodeURIComponent(threadId)}.json`)
+}
+
+async function readCanonicalThreadRecord(
+  threadId: string,
+): Promise<CanonicalThreadRecord | null> {
+  try {
+    const parsed = asJsonObject(
+      JSON.parse(await readFile(canonicalThreadRecordPath(threadId), "utf8")),
+    )
+    if (!parsed) {
+      return null
+    }
+    const state = readCanonicalCodexStateThreadRow(parsed.state)
+    if (!state || state.id !== threadId) {
+      return null
+    }
+    return {
+      index: readCanonicalIndexMetadata(parsed.index),
+      sessionRelativePath:
+        readString(parsed.sessionRelativePath) ?? sessionRelativePath(state.rolloutPath ?? ""),
+      state,
+      syncedAt: readString(parsed.syncedAt) ?? new Date(0).toISOString(),
+    }
+  } catch {
+    return null
+  }
+}
+
+async function readCanonicalThreadRecords(): Promise<CanonicalThreadRecord[]> {
+  try {
+    const entries = await readdir(canonicalThreadsHome(), { withFileTypes: true })
+    const records = await Promise.all(
+      entries
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .map((entry) =>
+          readCanonicalThreadRecord(decodeURIComponent(entry.name.slice(0, -5))),
+        ),
+    )
+    return records.filter(
+      (record): record is CanonicalThreadRecord => record !== null,
+    )
+  } catch {
+    return []
+  }
+}
+
+async function writeCanonicalThreadRecord(
+  record: CanonicalThreadRecord,
+): Promise<void> {
+  await writeFileAtomic(
+    canonicalThreadRecordPath(record.state.id),
+    `${JSON.stringify(record, jsonStringifyReplacer)}\n`,
+  )
+}
+
+function readCanonicalCodexStateThreadRow(
+  value: unknown,
+): CodexStateThreadRow | null {
+  const object = asJsonObject(value)
+  const id = readString(object?.id)
+  if (!object || !id) {
+    return null
+  }
+  return normalizeCodexStateThreadRow({
+    agentNickname: readString(object.agentNickname),
+    agentPath: readString(object.agentPath),
+    agentRole: readString(object.agentRole),
+    approvalMode: readString(object.approvalMode),
+    archived: readNumber(object.archived),
+    archivedAt: readNumber(object.archivedAt) ?? readString(object.archivedAt),
+    cliVersion: readString(object.cliVersion),
+    createdAt: readNumber(object.createdAt) ?? readString(object.createdAt),
+    createdAtMs: readNumber(object.createdAtMs) ?? readString(object.createdAtMs),
+    cwd: readString(object.cwd),
+    firstUserMessage: readString(object.firstUserMessage),
+    gitBranch: readString(object.gitBranch),
+    gitOriginUrl: readString(object.gitOriginUrl),
+    gitSha: readString(object.gitSha),
+    hasUserEvent: readNumber(object.hasUserEvent),
+    id,
+    memoryMode: readString(object.memoryMode),
+    model: readString(object.model),
+    modelProvider: readString(object.modelProvider),
+    preview: readString(object.preview),
+    reasoningEffort: readString(object.reasoningEffort),
+    rolloutPath: readString(object.rolloutPath),
+    sandboxPolicy: readString(object.sandboxPolicy),
+    source: readString(object.source),
+    threadSource: readString(object.threadSource),
+    title: readString(object.title),
+    tokensUsed: readNumber(object.tokensUsed),
+    updatedAt: readNumber(object.updatedAt) ?? readString(object.updatedAt),
+    updatedAtMs: readNumber(object.updatedAtMs) ?? readString(object.updatedAtMs),
+  })
+}
+
+function readCanonicalIndexMetadata(
+  value: unknown,
+): LocalCodexSessionIndexMetadata | null {
+  const object = asJsonObject(value)
+  if (!object) {
+    return null
+  }
+  return {
+    title: normalizeImportedTitle(readString(object.title)),
+    updatedAt: readDate(object.updatedAt) ?? null,
+  }
+}
+
+async function upsertSessionIndexRecord(
+  indexPath: string,
+  threadId: string,
+  metadata: LocalCodexSessionIndexMetadata | null,
+): Promise<void> {
+  await mkdir(dirname(indexPath), { recursive: true, mode: 0o700 })
+  if (!threadId) {
+    await readFile(indexPath, "utf8").catch(async () => {
+      await writeFile(indexPath, "", { mode: 0o600 })
+    })
+    return
+  }
+  const existing = await readFile(indexPath, "utf8").catch(() => "")
+  const lines = existing
+    .split(/\r?\n/)
+    .filter((line) => line.trim() && sessionIndexLineId(line) !== threadId)
+  lines.push(
+    JSON.stringify({
+      id: threadId,
+      threadId,
+      thread_id: threadId,
+      ...(metadata?.title ? { thread_name: metadata.title, title: metadata.title } : {}),
+      ...(metadata?.updatedAt
+        ? { updatedAt: metadata.updatedAt.toISOString(), updated_at: metadata.updatedAt.toISOString() }
+        : {}),
+    }),
+  )
+  await writeFileAtomic(indexPath, `${lines.join("\n")}\n`)
+}
+
+function sessionIndexLineId(line: string): string | null {
+  const record = parseJsonObject(line)
+  return record
+    ? readString(record.id) ??
+        readString(record.thread_id) ??
+        readString(record.threadId) ??
+        readString(record.session_id) ??
+        readString(record.sessionId) ??
+        null
+    : null
+}
+
+async function copyFileAtomic(source: string, destination: string): Promise<void> {
+  if (resolve(source) === resolve(destination) || (await sameRealPath(source, destination))) {
+    return
+  }
+  await mkdir(dirname(destination), { recursive: true, mode: 0o700 })
+  const temporary = `${destination}.tmp-${process.pid}-${Date.now()}`
+  await copyFile(source, temporary)
+  await rename(temporary, destination)
+}
+
+async function writeFileAtomic(path: string, content: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+  const temporary = `${path}.tmp-${process.pid}-${Date.now()}`
+  await writeFile(temporary, content, { encoding: "utf8", mode: 0o600 })
+  await rename(temporary, path)
+}
+
+async function findCodexHomeSessionPath(
+  codexHome: string,
+  threadId: string,
+): Promise<string | null> {
+  const files = (await listSessionFiles(join(codexHome, "sessions")))
+    .sort((left, right) => right.mtimeMs - left.mtimeMs)
+    .slice(0, localImportMaxFiles())
+  return files.find((file) => extractSessionIdFromPath(file.path) === threadId)?.path ?? null
+}
+
+function codexHomeSessionPathCandidates(
+  codexHome: string,
+  rolloutPath: string | null | undefined,
+): string[] {
+  const trimmed = rolloutPath?.trim()
+  if (!trimmed) {
+    return []
+  }
+  return [
+    ...new Set([
+      trimmed,
+      join(codexHome, "sessions", sessionRelativePath(trimmed)),
+      canonicalSessionPath(sessionRelativePath(trimmed)),
+    ]),
+  ]
+}
+
+async function firstAccessiblePath(paths: string[]): Promise<string | null> {
+  for (const path of paths) {
+    try {
+      await access(path, constants.R_OK)
+      return path
+    } catch {
+      // Try the next candidate.
+    }
+  }
+  return null
+}
+
+function mergeSessionIndexMetadata(
+  primary: LocalCodexSessionIndexMetadata | null,
+  secondary: LocalCodexSessionIndexMetadata | null,
+  row: CodexStateThreadRow,
+  parsed: ParsedLocalCodexSession | null | undefined,
+  fallbackUpdatedAt: Date,
+): LocalCodexSessionIndexMetadata {
+  return {
+    title:
+      normalizeImportedTitle(primary?.title) ??
+      normalizeImportedTitle(secondary?.title) ??
+      normalizeImportedTitle(row.title) ??
+      normalizeImportedTitle(parsed?.title) ??
+      null,
+    updatedAt:
+      primary?.updatedAt ??
+      secondary?.updatedAt ??
+      latestDate([codexStateUpdatedAt(row), parsed?.updatedAt, fallbackUpdatedAt]),
+  }
+}
+
+function stateRowFromParsedSession(
+  session: ParsedLocalCodexSession,
+  path: string,
+): CodexStateThreadRow {
+  return normalizeCodexStateThreadRow({
+    archived: 0,
+    createdAt: timestampSeconds(session.createdAt),
+    createdAtMs: session.createdAt.getTime(),
+    cwd: session.workingDirectory ?? "",
+    firstUserMessage:
+      session.messages.find((message) => message.role === "USER")?.content ?? "",
+    hasUserEvent: session.messages.some((message) => message.role === "USER") ? 1 : 0,
+    id: session.externalThreadId,
+    rolloutPath: path,
+    source: session.source ?? "xedoc",
+    title: session.title,
+    updatedAt: timestampSeconds(session.updatedAt),
+    updatedAtMs: session.updatedAt.getTime(),
+  })
+}
+
+function normalizeCodexStateThreadRow(
+  row: Partial<CodexStateThreadRow> & { id: string },
+): CodexStateThreadRow {
+  return {
+    agentNickname: row.agentNickname ?? null,
+    agentPath: row.agentPath ?? null,
+    agentRole: row.agentRole ?? null,
+    approvalMode: row.approvalMode ?? null,
+    archived: row.archived ?? null,
+    archivedAt: row.archivedAt ?? null,
+    cliVersion: row.cliVersion ?? null,
+    createdAt: row.createdAt ?? null,
+    createdAtMs: row.createdAtMs ?? null,
+    cwd: row.cwd ?? null,
+    firstUserMessage: row.firstUserMessage ?? null,
+    gitBranch: row.gitBranch ?? null,
+    gitOriginUrl: row.gitOriginUrl ?? null,
+    gitSha: row.gitSha ?? null,
+    hasUserEvent: row.hasUserEvent ?? null,
+    id: row.id,
+    memoryMode: row.memoryMode ?? null,
+    model: row.model ?? null,
+    modelProvider: row.modelProvider ?? null,
+    preview: row.preview ?? null,
+    reasoningEffort: row.reasoningEffort ?? null,
+    rolloutPath: row.rolloutPath ?? null,
+    sandboxPolicy: row.sandboxPolicy ?? null,
+    source: row.source ?? null,
+    threadSource: row.threadSource ?? null,
+    title: row.title ?? null,
+    tokensUsed: row.tokensUsed ?? null,
+    updatedAt: row.updatedAt ?? null,
+    updatedAtMs: row.updatedAtMs ?? null,
+  }
+}
+
+function codexStateUpdatedAt(row: CodexStateThreadRow): Date {
+  return dateFromCodexTimestamp(row.updatedAtMs ?? row.updatedAt, new Date(0))
+}
+
+function codexStateCreatedAt(row: CodexStateThreadRow, fallback: Date): Date {
+  return dateFromCodexTimestamp(row.createdAtMs ?? row.createdAt, fallback)
+}
+
+function latestDate(values: Array<Date | null | undefined>): Date {
+  let latest = new Date(0)
+  for (const value of values) {
+    if (!value || Number.isNaN(value.getTime())) {
+      continue
+    }
+    if (value.getTime() > latest.getTime()) {
+      latest = value
+    }
+  }
+  return latest
+}
+
+function withThreadHistoryLock<T>(
+  threadId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = threadHistoryLocks.get(threadId) ?? Promise.resolve()
+  let release!: () => void
+  const current = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const next = previous.catch(() => undefined).then(() => current)
+  threadHistoryLocks.set(threadId, next)
+  return previous
+    .catch(() => undefined)
+    .then(operation)
+    .finally(() => {
+      release()
+      if (threadHistoryLocks.get(threadId) === next) {
+        threadHistoryLocks.delete(threadId)
+      }
+    })
+}
+
+function timestampSeconds(value: Date): number {
+  return Math.floor(value.getTime() / 1000)
+}
+
+function jsonStringifyReplacer(_key: string, value: unknown): unknown {
+  return typeof value === "bigint" ? Number(value) : value
 }
 
 export async function readLocalCodexSessionTranscriptForChat(
@@ -312,24 +1032,24 @@ export async function readLatestLocalCodexContextUsage(
 export async function readLocalCodexSessionMetadata(
   threadId: string,
 ): Promise<LocalCodexSessionSummary | null> {
-  const row = await readCodexStateThread(threadId)
-  if (!row) {
+  await ensureCanonicalHistoryImported()
+  const record = await readCanonicalThreadRecord(threadId)
+  if (!record) {
     return null
   }
-  const indexedMetadata = await readSharedCodexSessionIndexMetadata(threadId)
-  return summaryFromCodexStateThread(row, indexedMetadata?.title ?? null)
+  return summaryFromCodexStateThread(record.state, record.index?.title ?? null)
 }
 
 export async function listLocalCodexSessionSummaries(): Promise<
   LocalCodexSessionSummary[]
 > {
-  const [rows, indexedMetadata] = await Promise.all([
-    readCodexStateThreads(localImportMaxFiles()),
-    readSharedCodexSessionIndex(),
-  ])
-  return rows
-    .map((row) =>
-      summaryFromCodexStateThread(row, indexedMetadata.get(row.id)?.title ?? null),
+  await ensureCanonicalHistoryImported()
+  return (await readCanonicalThreadRecords())
+    .map((record) =>
+      summaryFromCodexStateThread(
+        record.state,
+        record.index?.title ?? null,
+      ),
     )
     .sort(
       (left, right) => right.updatedAt.getTime() - left.updatedAt.getTime(),
@@ -1597,18 +2317,6 @@ export async function readCodexSessionIndexFile(
   }
 }
 
-async function readSharedCodexSessionIndex(): Promise<
-  Map<string, LocalCodexSessionIndexMetadata>
-> {
-  return readCodexSessionIndexFile(resolveCodexSharedSessionIndexPath())
-}
-
-async function readSharedCodexSessionIndexMetadata(
-  threadId: string,
-): Promise<LocalCodexSessionIndexMetadata | null> {
-  return (await readSharedCodexSessionIndex()).get(threadId) ?? null
-}
-
 function localSessionIndexPath(sessionPath: string): string | null {
   const marker = `${sep}sessions${sep}`
   const resolvedPath = resolve(sessionPath)
@@ -1695,8 +2403,21 @@ function isGenericImportedTitle(value: string): boolean {
   )
 }
 
-async function readCodexStateThreads(limit: number): Promise<CodexStateThreadRow[]> {
-  const client = await codexStateClient()
+async function readCodexStateThreadsFromHome(
+  codexHome: string,
+  limit: number,
+): Promise<CodexStateThreadRow[]> {
+  return readCodexStateThreadsFromDatabasePath(
+    await codexStateDatabasePathForHome(codexHome),
+    limit,
+  )
+}
+
+async function readCodexStateThreadsFromDatabasePath(
+  databasePath: string,
+  limit: number,
+): Promise<CodexStateThreadRow[]> {
+  const client = await codexStateClient(databasePath)
   if (!client) {
     return []
   }
@@ -1721,10 +2442,21 @@ async function readCodexStateThreads(limit: number): Promise<CodexStateThreadRow
   }
 }
 
-async function readCodexStateThread(
+async function readCodexStateThreadFromHome(
+  codexHome: string,
   threadId: string,
 ): Promise<CodexStateThreadRow | null> {
-  const client = await codexStateClient()
+  return readCodexStateThreadFromDatabasePath(
+    await codexStateDatabasePathForHome(codexHome),
+    threadId,
+  )
+}
+
+async function readCodexStateThreadFromDatabasePath(
+  databasePath: string,
+  threadId: string,
+): Promise<CodexStateThreadRow | null> {
+  const client = await codexStateClient(databasePath)
   if (!client) {
     return null
   }
@@ -1758,22 +2490,41 @@ function codexStateThreadSelectSql(columns: Set<string>): string {
   return [
     codexStateColumnSql(columns, "id"),
     codexStateColumnSql(columns, "rollout_path", "rolloutPath"),
+    codexStateColumnSql(columns, "source"),
+    codexStateColumnSql(columns, "model_provider", "modelProvider"),
     codexStateDateColumnSql(
       columns,
       columns.has("created_at_ms") ? "created_at_ms" : "created_at",
       "createdAt",
     ),
+    codexStateDateColumnSql(columns, "created_at_ms", "createdAtMs"),
     codexStateDateColumnSql(
       columns,
       codexStateThreadUpdatedAtColumn(columns),
       "updatedAt",
     ),
+    codexStateDateColumnSql(columns, "updated_at_ms", "updatedAtMs"),
     codexStateColumnSql(columns, "cwd"),
     codexStateColumnSql(columns, "title"),
+    codexStateColumnSql(columns, "sandbox_policy", "sandboxPolicy"),
+    codexStateColumnSql(columns, "approval_mode", "approvalMode"),
+    codexStateColumnSql(columns, "tokens_used", "tokensUsed"),
+    codexStateColumnSql(columns, "has_user_event", "hasUserEvent"),
     codexStateColumnSql(columns, "first_user_message", "firstUserMessage"),
     codexStateColumnSql(columns, "preview"),
     codexStateColumnSql(columns, "archived"),
     codexStateColumnSql(columns, "archived_at", "archivedAt"),
+    codexStateColumnSql(columns, "git_sha", "gitSha"),
+    codexStateColumnSql(columns, "git_branch", "gitBranch"),
+    codexStateColumnSql(columns, "git_origin_url", "gitOriginUrl"),
+    codexStateColumnSql(columns, "cli_version", "cliVersion"),
+    codexStateColumnSql(columns, "agent_nickname", "agentNickname"),
+    codexStateColumnSql(columns, "agent_role", "agentRole"),
+    codexStateColumnSql(columns, "memory_mode", "memoryMode"),
+    codexStateColumnSql(columns, "model"),
+    codexStateColumnSql(columns, "reasoning_effort", "reasoningEffort"),
+    codexStateColumnSql(columns, "agent_path", "agentPath"),
+    codexStateColumnSql(columns, "thread_source", "threadSource"),
   ].join(",\n          ")
 }
 
@@ -1809,34 +2560,47 @@ function codexStateThreadUpdatedAtColumn(columns: Set<string>): string {
   return "rowid"
 }
 
-async function codexStateClient(): Promise<PrismaClient | null> {
-  const databasePath = resolveCodexSharedStateDatabasePath()
+async function codexStateClient(databasePath: string): Promise<PrismaClient | null> {
   try {
     await access(databasePath, constants.R_OK)
   } catch {
     return null
   }
-  if (
-    globalForCodexState.codexStatePrisma &&
-    globalForCodexState.codexStateDatabasePath === databasePath
-  ) {
-    return globalForCodexState.codexStatePrisma
+  return openCodexStateClient(databasePath)
+}
+
+async function openCodexStateClient(databasePath: string): Promise<PrismaClient> {
+  globalForCodexState.codexStateClients ??= new Map()
+  const existing = globalForCodexState.codexStateClients.get(databasePath)
+  if (existing) {
+    return existing
   }
-  await globalForCodexState.codexStatePrisma?.$disconnect().catch(() => undefined)
-  globalForCodexState.codexStateDatabasePath = databasePath
-  globalForCodexState.codexStatePrisma = new PrismaClient({
+  const client = new PrismaClient({
     datasources: { db: { url: sqliteDatabaseUrl(databasePath) } },
   })
-  return globalForCodexState.codexStatePrisma
+  globalForCodexState.codexStateClients.set(databasePath, client)
+  return client
+}
+
+async function codexStateDatabasePathForHome(codexHome: string): Promise<string> {
+  const names = await readdir(codexHome).catch(() => [])
+  const newest = names
+    .filter((name) => /^state_\d+\.sqlite$/i.test(name))
+    .sort((left, right) => stateDatabaseVersion(right) - stateDatabaseVersion(left))
+    .at(0)
+  return join(codexHome, newest ?? "state_5.sqlite")
+}
+
+function stateDatabaseVersion(name: string): number {
+  return Number(/^state_(\d+)\.sqlite$/i.exec(name)?.[1] ?? 0)
 }
 
 function summaryFromCodexStateThread(
   row: CodexStateThreadRow,
   indexedTitle?: string | null,
 ): LocalCodexSessionSummary {
-  const fallbackTimestamp = new Date(0)
-  const updatedAt = dateFromCodexTimestamp(row.updatedAt, fallbackTimestamp)
-  const createdAt = dateFromCodexTimestamp(row.createdAt, updatedAt)
+  const updatedAt = codexStateUpdatedAt(row)
+  const createdAt = codexStateCreatedAt(row, updatedAt)
   const path = rootCodexSessionPathCandidates(row.rolloutPath)[0] ?? ""
   const firstUserMessage = normalizeImportedTitle(row.firstUserMessage, {
     allowGeneric: true,
@@ -1922,7 +2686,10 @@ function rootCodexSessionPathCandidates(
 }
 
 async function existingSessionRoots(): Promise<string[]> {
-  const roots = [join(resolveCodexSharedChatHome(), "sessions")]
+  const roots = [
+    canonicalSessionsHome(),
+    join(resolveCodexSharedChatHome(), "sessions"),
+  ]
   const existing: string[] = []
   const seen = new Set<string>()
   for (const root of roots.map((entry) => resolveHomePath(entry))) {
@@ -1942,8 +2709,12 @@ async function existingSessionRoots(): Promise<string[]> {
 }
 
 async function findLocalCodexSessionPath(threadId: string): Promise<string | null> {
-  const row = await readCodexStateThread(threadId)
-  for (const path of rootCodexSessionPathCandidates(row?.rolloutPath)) {
+  await ensureCanonicalHistoryImported()
+  const record = await readCanonicalThreadRecord(threadId)
+  if (!record) {
+    return null
+  }
+  for (const path of rootCodexSessionPathCandidates(record.state.rolloutPath)) {
     try {
       await access(path, constants.R_OK)
       return path

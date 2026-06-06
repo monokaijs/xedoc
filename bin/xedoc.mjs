@@ -34,6 +34,7 @@ const runtime = resolveRuntimeOptions(options)
 await mkdir(runtime.appHome, { recursive: true, mode: 0o700 })
 await mkdir(dirname(runtime.databasePath), { recursive: true, mode: 0o700 })
 await mkdir(runtime.accountsHome, { recursive: true, mode: 0o700 })
+await mkdir(runtime.historyHome, { recursive: true, mode: 0o700 })
 
 if (!options.skipPrismaGenerate) {
   await runPrisma(["generate"], runtime.env)
@@ -46,7 +47,8 @@ const url = `http://${runtime.host === "0.0.0.0" ? "localhost" : runtime.host}:$
 console.log(`xedoc: ${url}`)
 console.log("Set the server password in your browser on first visit.")
 console.log(`File browser home: ${runtime.workspaceRoot}`)
-console.log(`Shared chat store: ${runtime.sharedChatHome}`)
+console.log(`History store: ${runtime.historyHome}`)
+console.log(`External Codex sync: ${runtime.sharedChatHome}`)
 console.log("Press Ctrl+C to stop.")
 
 await runServer(runtime.env)
@@ -112,6 +114,9 @@ function assignOption(parsed, name, value) {
     case "--host":
       parsed.host = value
       return
+    case "--history-home":
+      parsed.historyHome = value
+      return
     case "--port":
       parsed.port = value
       return
@@ -149,6 +154,11 @@ function resolveRuntimeOptions(options) {
       process.env.CODEX_HOME ??
       "~/.codex",
   )
+  const historyHome = resolveHomePath(
+    options.historyHome ??
+      process.env.XEDOC_HISTORY_HOME ??
+      join(appHome, "history"),
+  )
   const workspaceRoot = resolveHomePath(
     options.workspaceRoot ?? process.env.CODEX_WORKSPACE_ROOT ?? homedir(),
   )
@@ -171,6 +181,7 @@ function resolveRuntimeOptions(options) {
     NODE_ENV: "production",
     PORT: port,
     XEDOC_DEBUG: options.debug ? "1" : process.env.XEDOC_DEBUG,
+    XEDOC_HISTORY_HOME: historyHome,
   }
   return {
     accountsHome,
@@ -181,6 +192,7 @@ function resolveRuntimeOptions(options) {
     databaseUrl,
     debug: !!options.debug || isDebugEnabled(process.env.XEDOC_DEBUG),
     env,
+    historyHome,
     host,
     port,
     sharedChatHome,
@@ -541,6 +553,8 @@ function runtimeServiceArgs(runtime) {
     runtime.workspaceRoot,
     "--accounts-home",
     runtime.accountsHome,
+    "--history-home",
+    runtime.historyHome,
     "--shared-chat-home",
     runtime.sharedChatHome,
     "--codex-command",
@@ -741,7 +755,8 @@ Options:
   --host <host>                 Web server host. Defaults to 127.0.0.1.
   --workspace-root <path>       File browser start directory. Defaults to your home directory.
   --accounts-home <path>        Codex account state directory. Defaults to ~/.xedoc/accounts.
-  --shared-chat-home <path>     Shared Codex chat store. Defaults to ~/.codex.
+  --history-home <path>         xedoc canonical chat history directory. Defaults to <home>/history.
+  --shared-chat-home <path>     External Codex history sync directory. Defaults to ~/.codex.
   --skip-setup                  Do not create the SQLite database schema.
   --skip-prisma-generate        Do not regenerate Prisma Client.
   --debug                       Print Codex runtime debug logs for run failures.
@@ -777,7 +792,8 @@ Options:
   --host <host>                 Web server host. Defaults to 127.0.0.1.
   --workspace-root <path>       File browser start directory. Defaults to your home directory.
   --accounts-home <path>        Codex account state directory. Defaults to ~/.xedoc/accounts.
-  --shared-chat-home <path>     Shared Codex chat store. Defaults to ~/.codex.
+  --history-home <path>         xedoc canonical chat history directory. Defaults to <home>/history.
+  --shared-chat-home <path>     External Codex history sync directory. Defaults to ~/.codex.
   --home <path>                 App data directory. Defaults to ~/.xedoc.
   --skip-setup                  Do not create the SQLite database schema.
   --skip-prisma-generate        Do not regenerate Prisma Client.

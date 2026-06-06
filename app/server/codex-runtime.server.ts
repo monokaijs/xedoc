@@ -2,11 +2,8 @@ import "dotenv/config"
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import {
-  appendFileSync,
   chmodSync,
   closeSync,
-  copyFileSync,
-  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -15,7 +12,7 @@ import {
   readlinkSync,
   renameSync,
   statSync,
-  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs"
 import { homedir } from "node:os"
@@ -583,10 +580,25 @@ export function resolveAccountCodexHome(accountId: string): string {
   return join(resolveCodexAccountsHome(), accountId)
 }
 
+export function resolveAccountCodexStateDatabasePath(accountId: string): string {
+  const accountHome = resolveAccountCodexHome(accountId)
+  const newest = readDirectoryNames(accountHome)
+    .filter((name) => /^state_\d+\.sqlite$/i.test(name))
+    .sort((left, right) => stateDatabaseVersion(right) - stateDatabaseVersion(left))
+    .at(0)
+  return join(accountHome, newest ?? "state_5.sqlite")
+}
+
 export function ensureAccountCodexHome(accountId: string): string {
   const codexHome = resolveAccountCodexHome(accountId)
   ensureCodexHome(codexHome)
   return codexHome
+}
+
+export function resolveCodexHistoryHome(): string {
+  return resolveHomePath(
+    process.env.XEDOC_HISTORY_HOME?.trim() || "~/.xedoc/history",
+  )
 }
 
 export function resolveCodexSharedChatHome(): string {
@@ -640,7 +652,7 @@ export function jsonRpcIdKey(id: unknown): string {
     : JSON.stringify(id)
 }
 
-function resolveCodexAccountsHome(): string {
+export function resolveCodexAccountsHome(): string {
   return resolveHomePath(
     process.env.CODEX_ACCOUNTS_HOME?.trim() || "~/.xedoc/accounts",
   )
@@ -660,7 +672,7 @@ function ensureCodexHome(codexHome: string): void {
   mkdirSync(codexHome, { recursive: true, mode: 0o700 })
   chmodSync(codexHome, 0o700)
   ensureWorkflowMcpConfig(codexHome)
-  ensureSharedCodexChatStorage(codexHome)
+  ensureLocalCodexChatStorage(codexHome)
 }
 
 function ensureWorkflowMcpConfig(codexHome: string): void {
@@ -723,68 +735,54 @@ function tomlString(value: string): string {
   return JSON.stringify(value)
 }
 
-function ensureSharedCodexChatStorage(codexHome: string): void {
+function ensureLocalCodexChatStorage(codexHome: string): void {
   const sharedChatHome = ensureCodexSharedChatHome()
   if (resolve(codexHome) === resolve(sharedChatHome)) {
     return
   }
 
-  ensureSharedSessionsLink(codexHome, sharedChatHome)
-  ensureSharedSessionIndexLink(codexHome, sharedChatHome)
-  ensureSharedStateDatabaseLinks(codexHome, sharedChatHome)
+  ensureLocalSessionsDirectory(codexHome, sharedChatHome)
+  ensureLocalSessionIndexFile(codexHome, sharedChatHome)
+  ensureLocalStateDatabaseFiles(codexHome, sharedChatHome)
 }
 
-function ensureSharedSessionsLink(
+function ensureLocalSessionsDirectory(
   codexHome: string,
   sharedChatHome: string,
 ): void {
-  const target = join(sharedChatHome, "sessions")
-  const link = join(codexHome, "sessions")
-  mkdirSync(target, { recursive: true, mode: 0o700 })
-
-  if (isSharedFileLink(link, target)) {
-    return
+  const shared = join(sharedChatHome, "sessions")
+  const local = join(codexHome, "sessions")
+  if (isSymlinkTo(local, shared)) {
+    renameSync(local, nextBackupPath(local))
+  } else if (pathExists(local) && !(statIfExists(local)?.isDirectory() ?? false)) {
+    renameSync(local, nextBackupPath(local))
   }
 
-  if (pathExists(link)) {
-    const readableDirectory = statIfExists(link)?.isDirectory() ?? false
-    if (readableDirectory) {
-      copyDirectoryContents(link, target)
-    }
-    renameSync(link, nextBackupPath(link))
-  }
-
-  createSharedDirectoryLink(target, link)
+  mkdirSync(local, { recursive: true, mode: 0o700 })
+  chmodSync(local, 0o700)
 }
 
-function ensureSharedSessionIndexLink(
+function ensureLocalSessionIndexFile(
   codexHome: string,
   sharedChatHome: string,
 ): void {
-  const target = join(sharedChatHome, "session_index.jsonl")
-  const link = join(codexHome, "session_index.jsonl")
-  ensureFile(target, 0o600)
-
-  if (isSharedFileLink(link, target)) {
-    return
+  const shared = join(sharedChatHome, "session_index.jsonl")
+  const local = join(codexHome, "session_index.jsonl")
+  if (isSharedFileLink(local, shared)) {
+    unlinkSync(local)
+  } else if (pathExists(local) && !(statIfExists(local)?.isFile() ?? false)) {
+    renameSync(local, nextBackupPath(local))
   }
 
-  if (pathExists(link)) {
-    if (statIfExists(link)?.isFile()) {
-      appendIndexFile(link, target)
-    }
-    renameSync(link, nextBackupPath(link))
-  }
-
-  createSharedFileLink(target, link)
+  ensureFile(local, 0o600)
 }
 
-function ensureSharedStateDatabaseLinks(
+function ensureLocalStateDatabaseFiles(
   codexHome: string,
   sharedChatHome: string,
 ): void {
   for (const name of sharedStateDatabaseFileNames(codexHome, sharedChatHome)) {
-    ensureSharedStateFileLink(codexHome, sharedChatHome, name)
+    ensureLocalStateDatabaseFile(codexHome, sharedChatHome, name)
   }
 }
 
@@ -803,43 +801,16 @@ function sharedStateDatabaseFileNames(
   return [...bases].flatMap((base) => [base, `${base}-wal`, `${base}-shm`])
 }
 
-function ensureSharedStateFileLink(
+function ensureLocalStateDatabaseFile(
   codexHome: string,
   sharedChatHome: string,
   name: string,
 ): void {
-  const target = join(sharedChatHome, name)
-  const link = join(codexHome, name)
-  if (isSharedFileLink(link, target)) {
-    return
+  const shared = join(sharedChatHome, name)
+  const local = join(codexHome, name)
+  if (isSharedFileLink(local, shared)) {
+    unlinkSync(local)
   }
-
-  const linkInfo = statIfExists(link)
-  if (linkInfo?.isFile()) {
-    copyFileIfMissing(link, target)
-  }
-  if (!name.endsWith("-wal") && !name.endsWith("-shm")) {
-    ensureFile(target, 0o600)
-  }
-  if (pathExists(link)) {
-    renameSync(link, nextBackupPath(link))
-  }
-  createSharedFileLink(target, link)
-}
-
-function createSharedDirectoryLink(target: string, link: string): void {
-  symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir")
-}
-
-function createSharedFileLink(target: string, link: string): void {
-  if (process.platform === "win32") {
-    if (!pathExists(target)) {
-      return
-    }
-    linkSync(target, link)
-    return
-  }
-  symlinkSync(target, link, "file")
 }
 
 function readDirectoryNames(path: string): string[] {
@@ -858,43 +829,6 @@ function ensureFile(path: string, mode: number): void {
   const fd = openSync(path, "a", mode)
   closeSync(fd)
   chmodSync(path, mode)
-}
-
-function copyDirectoryContents(source: string, destination: string): void {
-  mkdirSync(destination, { recursive: true, mode: 0o700 })
-  for (const entry of readdirSync(source, { withFileTypes: true })) {
-    const sourcePath = join(source, entry.name)
-    const destinationPath = join(destination, entry.name)
-    if (entry.isDirectory()) {
-      copyDirectoryContents(sourcePath, destinationPath)
-      continue
-    }
-    if (entry.isFile()) {
-      copyFileIfMissing(sourcePath, destinationPath)
-    }
-  }
-}
-
-function copyFileIfMissing(source: string, destination: string): void {
-  if (pathExists(destination)) {
-    return
-  }
-  mkdirSync(dirname(destination), { recursive: true, mode: 0o700 })
-  copyFileSync(source, destination)
-}
-
-function appendIndexFile(source: string, destination: string): void {
-  const content = readFileSync(source, "utf8")
-  if (!content.trim()) {
-    return
-  }
-  const destinationContent = readFileSync(destination, "utf8")
-  const prefix =
-    destinationContent && !destinationContent.endsWith("\n") ? "\n" : ""
-  appendFileSync(
-    destination,
-    `${prefix}${content.endsWith("\n") ? content : `${content}\n`}`,
-  )
 }
 
 function isSymlinkTo(path: string, target: string): boolean {

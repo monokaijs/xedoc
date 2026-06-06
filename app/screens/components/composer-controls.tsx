@@ -47,8 +47,10 @@ import {
 import { Switch } from "@/components/ui/switch"
 import {
   clampPercent,
+  formatRateLimitResetTime,
   rateLimitWindowReached,
   usageCapacityLabel,
+  usageCapacityRefillLabel,
   usageCapacitySeverity,
 } from "@/lib/rate-limits"
 import { cn } from "@/lib/utils"
@@ -56,7 +58,6 @@ import {
   formatEffortLabel,
   formatPlanType,
   formatRateLimitReached,
-  formatResetTime,
   formatServiceTierLabel,
   formatTokenCount,
   formatWindowDuration,
@@ -586,6 +587,8 @@ export function UsageCapacityDetails({
     )
   }
 
+  const refillLabel = usageCapacityRefillLabel(snapshot)
+
   return (
     <div className="grid gap-2">
       <div className="grid gap-1 text-xs text-muted-foreground">
@@ -605,6 +608,9 @@ export function UsageCapacityDetails({
         {snapshot.rateLimitReachedType ? (
           <div className="text-destructive">
             {formatRateLimitReached(snapshot.rateLimitReachedType)}
+            {refillLabel
+              ? ` · Refills ${refillLabel}`
+              : " · Refill time unavailable"}
           </div>
         ) : null}
       </div>
@@ -681,7 +687,7 @@ export function CapacityRow({
           <span>{formatWindowDuration(window.windowDurationMins)}</span>
         ) : null}
         {window?.resetsAt ? (
-          <span>Resets {formatResetTime(window.resetsAt)}</span>
+          <span>Resets {formatRateLimitResetTime(window.resetsAt)}</span>
         ) : null}
       </div>
     </div>
