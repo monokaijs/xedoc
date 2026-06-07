@@ -159,6 +159,7 @@ const STALE_ACTIVE_SESSION_MS = 10 * 60 * 1000
 const DEFAULT_MAX_FILES = 1_000
 const DEFAULT_MAX_FILE_BYTES = 25 * 1024 * 1024
 const FILE_CACHE_MAX_ENTRIES = 100
+const ACCOUNT_HISTORY_SYNC_STATE_KEY = "accounts"
 const GLOBAL_IMPORT_STATE_KEY = "global"
 const importStates = new Map<string, LocalImportState>()
 const threadHistoryLocks = new Map<string, Promise<void>>()
@@ -237,6 +238,49 @@ export async function syncThreadFromAccount(
   )
 }
 
+export async function syncAccountCodexHistories(
+  options: { force?: boolean } = {},
+): Promise<void> {
+  const now = Date.now()
+  const state = importStates.get(ACCOUNT_HISTORY_SYNC_STATE_KEY)
+  if (
+    !options.force &&
+    state &&
+    now - state.lastScanAt < localImportScanIntervalMs()
+  ) {
+    await state.promise
+    return
+  }
+
+  if (state?.promise) {
+    await state.promise
+    return
+  }
+
+  const nextState: LocalImportState = { lastScanAt: now }
+  const promise = ensureCanonicalHistoryHome()
+    .then(async () => {
+      for (const codexHome of await existingAccountCodexHistoryHomes()) {
+        await syncCodexHomeHistory(codexHome).catch((error) => {
+          console.warn(
+            `Failed to sync Codex account history from ${codexHome}.`,
+            error instanceof Error ? error.message : error,
+          )
+        })
+      }
+      canonicalHistoryImported = true
+    })
+    .finally(() => {
+      const current = importStates.get(ACCOUNT_HISTORY_SYNC_STATE_KEY)
+      if (current?.promise === promise) {
+        current.promise = undefined
+      }
+    })
+  nextState.promise = promise
+  importStates.set(ACCOUNT_HISTORY_SYNC_STATE_KEY, nextState)
+  await promise
+}
+
 async function sameRealPath(left: string, right: string): Promise<boolean> {
   try {
     return (await realpath(left)) === (await realpath(right))
@@ -265,7 +309,7 @@ async function ensureCanonicalHistoryImported(
 
 async function importCanonicalCodexHistory(): Promise<void> {
   await ensureCanonicalHistoryHome()
-  for (const codexHome of await existingCodexHistoryHomes()) {
+  for (const codexHome of await existingAccountCodexHistoryHomes()) {
     await syncCodexHomeHistory(codexHome).catch((error) => {
       console.warn(
         `Failed to import Codex history from ${codexHome}.`,
@@ -347,25 +391,20 @@ async function syncThreadToCanonicalFromSource(
   const resolvedParsed =
     parsed ?? (await readLocalCodexSessionTranscriptFile(sessionPath, row.id))
   const info = await stat(sessionPath).catch(() => null)
+  const primaryMetadata = index.get(row.id) ?? null
+  const secondaryMetadata = await readLocalSessionIndexMetadata(sessionPath, row.id)
   const sourceUpdatedAt = latestDate([
     codexStateUpdatedAt(row),
     resolvedParsed?.updatedAt,
     info ? new Date(info.mtimeMs) : null,
+    primaryMetadata?.updatedAt,
+    secondaryMetadata?.updatedAt,
   ])
-  const existing = await readCanonicalThreadRecord(row.id)
-  if (
-    existing &&
-    codexStateUpdatedAt(existing.state).getTime() > sourceUpdatedAt.getTime()
-  ) {
-    return false
-  }
-
   const relativePath = sessionRelativePath(sessionPath)
   const destination = canonicalSessionPath(relativePath)
-  await copyFileAtomic(sessionPath, destination)
   const metadata = mergeSessionIndexMetadata(
-    index.get(row.id) ?? null,
-    await readLocalSessionIndexMetadata(sessionPath, row.id),
+    primaryMetadata,
+    secondaryMetadata,
     row,
     resolvedParsed,
     sourceUpdatedAt,
@@ -376,6 +415,28 @@ async function syncThreadToCanonicalFromSource(
     updatedAt: timestampSeconds(sourceUpdatedAt),
     updatedAtMs: sourceUpdatedAt.getTime(),
   })
+  const existing = await readCanonicalThreadRecord(row.id)
+  if (existing) {
+    const existingUpdatedAt = codexStateUpdatedAt(existing.state).getTime()
+    const sourceTime = sourceUpdatedAt.getTime()
+    if (existingUpdatedAt > sourceTime) {
+      return false
+    }
+    const destinationInfo = await stat(destination).catch(() => null)
+    if (
+      existingUpdatedAt === sourceTime &&
+      destinationInfo &&
+      info &&
+      destinationInfo.size === info.size &&
+      existing.sessionRelativePath === relativePath &&
+      sameSessionIndexMetadata(existing.index, metadata) &&
+      sameCodexStateThread(existing.state, state)
+    ) {
+      return false
+    }
+  }
+
+  await copyFileAtomic(sessionPath, destination)
   const record: CanonicalThreadRecord = {
     index: metadata,
     sessionRelativePath: relativePath,
@@ -582,8 +643,8 @@ const CODEX_STATE_SCHEMA_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_threads_updated_at_ms ON threads(updated_at_ms DESC, id DESC)",
 ]
 
-async function existingCodexHistoryHomes(): Promise<string[]> {
-  const homes = [resolveCodexSharedChatHome(), ...(await accountCodexHomes())]
+async function existingAccountCodexHistoryHomes(): Promise<string[]> {
+  const homes = await accountCodexHomes()
   const existing: string[] = []
   const seen = new Set<string>()
   for (const home of homes.map((entry) => resolveHomePath(entry))) {
@@ -863,6 +924,26 @@ function mergeSessionIndexMetadata(
       secondary?.updatedAt ??
       latestDate([codexStateUpdatedAt(row), parsed?.updatedAt, fallbackUpdatedAt]),
   }
+}
+
+function sameSessionIndexMetadata(
+  left: LocalCodexSessionIndexMetadata | null,
+  right: LocalCodexSessionIndexMetadata | null,
+): boolean {
+  return (
+    (left?.title ?? null) === (right?.title ?? null) &&
+    (left?.updatedAt?.getTime() ?? null) === (right?.updatedAt?.getTime() ?? null)
+  )
+}
+
+function sameCodexStateThread(
+  left: CodexStateThreadRow,
+  right: CodexStateThreadRow,
+): boolean {
+  return (
+    JSON.stringify(codexStateThreadValueMap(left)) ===
+    JSON.stringify(codexStateThreadValueMap(right))
+  )
 }
 
 function stateRowFromParsedSession(
@@ -2674,15 +2755,7 @@ function rootCodexSessionPathCandidates(
   rolloutPath: string | null | undefined,
 ): string[] {
   const trimmed = rolloutPath?.trim()
-  if (!trimmed) {
-    return []
-  }
-  const sharedPath = join(
-    resolveCodexSharedChatHome(),
-    "sessions",
-    sessionRelativePath(trimmed),
-  )
-  return [...new Set([trimmed, sharedPath])]
+  return trimmed ? [trimmed] : []
 }
 
 async function existingSessionRoots(): Promise<string[]> {

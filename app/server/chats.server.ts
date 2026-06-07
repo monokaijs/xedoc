@@ -40,6 +40,7 @@ import {
   readLocalCodexSessionActivity,
   readLocalCodexSessionMetadata,
   readLocalCodexSessionTranscript,
+  syncAccountCodexHistories,
   syncThreadFromAccount,
   type ImportedLocalMessage,
   type LocalCodexSessionSummary,
@@ -160,16 +161,60 @@ const COMMAND_OUTPUT_UPDATE_INTERVAL_MS = 500
 async function syncThreadFromAccountBestEffort(
   threadId: string,
   accountId: string | null | undefined,
-): Promise<void> {
+): Promise<boolean> {
   if (!accountId) {
-    return
+    return false
   }
-  await syncThreadFromAccount(threadId, accountId).catch((error) => {
+  return syncThreadFromAccount(threadId, accountId).catch((error) => {
     console.warn(
       "Failed to sync Codex session history.",
       error instanceof Error ? error.message : error,
     )
+    return false
   })
+}
+
+async function syncThreadFromAccountOrThrow(
+  threadId: string,
+  accountId: string | null | undefined,
+): Promise<void> {
+  if (!accountId) {
+    return
+  }
+  const synced = await syncThreadFromAccount(threadId, accountId).catch((error) => {
+    throw new HttpError(
+      409,
+      `Unable to sync chat history from the current Codex account: ${readErrorMessage(error)}`,
+    )
+  })
+  if (!synced) {
+    throw new HttpError(
+      409,
+      "Chat history is not available in the current Codex account.",
+    )
+  }
+}
+
+async function hydrateThreadForAccountOrThrow(
+  threadId: string,
+  accountId: string,
+): Promise<void> {
+  const hydrated = await hydrateThreadForAccount(threadId, accountId).catch((error) => {
+    throw new HttpError(
+      409,
+      `Unable to hydrate chat history for the selected Codex account: ${readErrorMessage(error)}`,
+    )
+  })
+  if (!hydrated) {
+    throw new HttpError(
+      409,
+      "Chat history is not available for the selected Codex account.",
+    )
+  }
+}
+
+function readErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error ?? "Unknown error")
 }
 
 export async function createChat(dto: CreateChatRequest): Promise<ChatResponse> {
@@ -220,6 +265,12 @@ export async function createChat(dto: CreateChatRequest): Promise<ChatResponse> 
 }
 
 export async function listChats(): Promise<ChatResponse[]> {
+  await syncAccountCodexHistories().catch((error) => {
+    console.warn(
+      "Failed to refresh Codex account history.",
+      error instanceof Error ? error.message : error,
+    )
+  })
   const [preferences, snapshots] = await Promise.all([
     listThreadPreferences(),
     readThreadSnapshots(),
@@ -228,6 +279,7 @@ export async function listChats(): Promise<ChatResponse[]> {
     preferences.map((preference) => [preference.threadId, preference]),
   )
   const threadIds = new Set([
+    ...preferences.map((preference) => preference.threadId),
     ...snapshots.keys(),
     ...runtimeStates.keys(),
   ])
@@ -252,8 +304,9 @@ export async function listChats(): Promise<ChatResponse[]> {
 
 export async function getChat(threadId: string): Promise<ChatResponse> {
   const preference = await getThreadPreference(threadId)
+  await syncThreadFromAccountBestEffort(threadId, preference?.accountId)
   const snapshot = await readThreadSnapshot(threadId)
-  if (!snapshot && !runtimeStates.has(threadId)) {
+  if (!preference && !snapshot && !runtimeStates.has(threadId)) {
     throw new HttpError(404, "Chat not found.")
   }
   return buildChatResponse(threadId, preference, snapshot, {
@@ -310,9 +363,9 @@ export async function updateChat(
       : resolveDirectory(dto.workingDirectory)
 
   if (accountId && accountId !== chat.accountId) {
-    await syncThreadFromAccountBestEffort(threadId, chat.accountId)
+    await syncThreadFromAccountOrThrow(threadId, chat.accountId)
     codexRuntimeService.stopRuntime(accountId)
-    await hydrateThreadForAccount(threadId, accountId)
+    await hydrateThreadForAccountOrThrow(threadId, accountId)
   }
 
   const preference = await upsertThreadPreference(threadId, {
@@ -1415,7 +1468,7 @@ async function runCodexWithAccountLock(
     state.primed && state.accountId === account.id && state.runtime === runtime
   if (!usePrimedThread) {
     codexRuntimeService.stopRuntime(account.id)
-    await hydrateThreadForAccount(threadId, account.id)
+    await hydrateThreadForAccountOrThrow(threadId, account.id)
     runtime = runtimeForAccount(account)
   }
   state.permissionMode = permissionMode
@@ -1781,9 +1834,17 @@ async function autoRotateChatAccountIfNeeded(
   if (accountAvailabilityScore(snapshots.get(bestAccount.id)) < 0) {
     return chat
   }
-  await syncThreadFromAccountBestEffort(chat.id, chat.accountId)
-  codexRuntimeService.stopRuntime(bestAccount.id)
-  await hydrateThreadForAccount(chat.id, bestAccount.id)
+  try {
+    await syncThreadFromAccountOrThrow(chat.id, chat.accountId)
+    codexRuntimeService.stopRuntime(bestAccount.id)
+    await hydrateThreadForAccountOrThrow(chat.id, bestAccount.id)
+  } catch (error) {
+    console.warn(
+      "Failed to auto rotate chat history.",
+      error instanceof Error ? error.message : error,
+    )
+    return chat
+  }
   const preference = await upsertThreadPreference(chat.id, {
     accountId: bestAccount.id,
   })
