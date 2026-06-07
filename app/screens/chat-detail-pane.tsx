@@ -37,6 +37,7 @@ import type {
   ProposedPlanRevisionAction,
   QueuedMessageAction,
 } from "@/components/timeline/chat-timeline"
+import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Textarea } from "@/components/ui/textarea"
 import {
@@ -51,7 +52,11 @@ import {
   updateAccountRuntimeSettings,
   updateChat,
 } from "@/lib/api"
-import { applyChatEvent, mergeMessagePage } from "@/lib/chat-events"
+import {
+  applyChatEvent,
+  highestSequence,
+  mergeMessagePage,
+} from "@/lib/chat-events"
 import { connectChatEventSocket } from "@/lib/socket"
 import { cn } from "@/lib/utils"
 import { useShellContext } from "@/screens/shell-context"
@@ -118,6 +123,7 @@ export function ChatDetailPane() {
   } = useShellContext()
   const [content, setContent] = useState("")
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
+  const [olderMessagesPending, setOlderMessagesPending] = useState(false)
   const [contextWindowUsage, setContextWindowUsage] =
     useState<ContextWindowUsagePayload | null>(null)
   const scrollViewportRef = useRef<HTMLDivElement | null>(null)
@@ -139,14 +145,18 @@ export function ChatDetailPane() {
     enabled: !!chatId,
     queryKey: chatQueryKey,
     queryFn: () => getChat(session, chatId!),
-    refetchInterval: 2_500,
+    refetchInterval: (query) =>
+      query.state.data?.status === "RUNNING" ? 2_500 : false,
   })
 
   const messagesQuery = useQuery({
     enabled: !!chatId,
     queryKey: messagesQueryKey,
-    queryFn: () => getChatMessages(session, chatId!, 0),
-    refetchInterval: 2_500,
+    queryFn: () => getChatMessages(session, chatId!),
+    refetchInterval: () =>
+      queryClient.getQueryData<ChatResponse>(chatQueryKey)?.status === "RUNNING"
+        ? 2_500
+        : false,
     structuralSharing: (previous, next) =>
       mergeMessagePage(
         previous as MessagePageResponse | undefined,
@@ -170,6 +180,7 @@ export function ChatDetailPane() {
     () => messagesQuery.data?.data ?? [],
     [messagesQuery.data],
   )
+  const hasMoreMessagesBefore = messagesQuery.data?.hasMoreBefore ?? false
   const loadedChat = chatQuery.data
   useEffect(() => {
     if (!loadedChat) {
@@ -253,6 +264,47 @@ export function ChatDetailPane() {
     }
     element.scrollTo({ behavior, top: element.scrollHeight })
   }, [])
+
+  const loadEarlierMessages = useCallback(() => {
+    if (
+      !chatId ||
+      olderMessagesPending ||
+      !hasMoreMessagesBefore ||
+      !messages.length
+    ) {
+      return
+    }
+    const beforeSequence = messages[0].sequence
+    const viewport = scrollViewportRef.current
+    const previousScrollHeight = viewport?.scrollHeight ?? 0
+    stickToBottomRef.current = false
+    setOlderMessagesPending(true)
+    void getChatMessages(session, chatId, { beforeSequence })
+      .then((next) => {
+        queryClient.setQueryData<MessagePageResponse | undefined>(
+          messagesQueryKey,
+          (page) => mergeMessagePage(page, next),
+        )
+        requestAnimationFrame(() => {
+          const currentViewport = scrollViewportRef.current
+          if (!currentViewport) {
+            return
+          }
+          currentViewport.scrollTop +=
+            currentViewport.scrollHeight - previousScrollHeight
+        })
+      })
+      .catch((caught) => toast.error(readError(caught)))
+      .finally(() => setOlderMessagesPending(false))
+  }, [
+    chatId,
+    hasMoreMessagesBefore,
+    messages,
+    messagesQueryKey,
+    olderMessagesPending,
+    queryClient,
+    session,
+  ])
 
   const modelsQuery = useQuery({
     enabled: !!loadedAccount?.id && loadedAccount.status === "CONNECTED",
@@ -542,7 +594,16 @@ export function ChatDetailPane() {
       payload: ChatEventPayloads[TType],
     ) => {
       if (type === "chat.updated") {
-        applyChatSnapshot(payload as ChatResponse)
+        const previousChat =
+          queryClient.getQueryData<ChatResponse>(chatQueryKey)
+        const updatedChat = payload as ChatResponse
+        applyChatSnapshot(updatedChat)
+        if (
+          previousChat &&
+          previousChat.lastActivityAt !== updatedChat.lastActivityAt
+        ) {
+          void queryClient.invalidateQueries({ queryKey: messagesQueryKey })
+        }
         return
       }
       if (type === "context.updated") {
@@ -564,16 +625,19 @@ export function ChatDetailPane() {
       onError: (caught) => toast.error(readError(caught)),
       onEvent: applyEvent,
       onOpen: () => {
-        void getChatMessages(session, chatId, 0)
+        const currentPage =
+          queryClient.getQueryData<MessagePageResponse>(messagesQueryKey)
+        const afterSequence = highestSequence(currentPage)
+        if (afterSequence <= 0) {
+          return
+        }
+        void getChatMessages(session, chatId, { afterSequence })
           .then((next) => {
             queryClient.setQueryData<MessagePageResponse | undefined>(
               messagesQueryKey,
               (page) => mergeMessagePage(page, next),
             )
           })
-          .catch((caught) => toast.error(readError(caught)))
-        void getChat(session, chatId)
-          .then(applyChatSnapshot)
           .catch((caught) => toast.error(readError(caught)))
       },
     })
@@ -669,6 +733,25 @@ export function ChatDetailPane() {
           }}
         >
           <div className="mx-auto flex w-full min-w-0 max-w-3xl flex-col gap-5 overflow-hidden px-4 pb-12 pt-6">
+            {hasMoreMessagesBefore ? (
+              <div className="flex justify-center">
+                <Button
+                  disabled={olderMessagesPending}
+                  size="sm"
+                  variant="outline"
+                  onClick={loadEarlierMessages}
+                >
+                  {olderMessagesPending ? (
+                    <>
+                      <Loader2 className="size-3 animate-spin" />
+                      Loading
+                    </>
+                  ) : (
+                    "Load earlier"
+                  )}
+                </Button>
+              </div>
+            ) : null}
             {messages.length ? (
               <ChatTimeline
                 chatId={chatId}

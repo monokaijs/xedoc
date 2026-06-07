@@ -438,11 +438,25 @@ export async function archiveChat(
 export async function getChatMessages(
   session: ApiSession,
   chatId: string,
-  afterSequence = 0,
+  options: number | {
+    afterSequence?: number
+    beforeSequence?: number
+    limit?: number
+  } = {},
 ): Promise<MessagePageResponse> {
+  const normalized =
+    typeof options === "number" ? { afterSequence: options } : options
+  const query = new URLSearchParams()
+  query.set("limit", String(normalized.limit ?? 200))
+  if (normalized.afterSequence) {
+    query.set("afterSequence", String(normalized.afterSequence))
+  }
+  if (normalized.beforeSequence) {
+    query.set("beforeSequence", String(normalized.beforeSequence))
+  }
   return fetchJson<MessagePageResponse>(
     session.serverUrl,
-    `/api/chats/${chatId}/messages?afterSequence=${afterSequence}&limit=200`,
+    `/api/chats/${chatId}/messages?${query.toString()}`,
     { token: session.token },
   )
 }
@@ -699,10 +713,15 @@ export function appendMessage(
 ): MessagePageResponse {
   const existing = page?.data ?? []
   const withoutDuplicate = existing.filter((entry) => entry.id !== message.id)
+  const data = [...withoutDuplicate, message].sort(
+    (a, b) => a.sequence - b.sequence,
+  )
+  const firstSequence = data[0]?.sequence ?? null
+  const lastSequence = data[data.length - 1]?.sequence ?? null
   return {
-    data: [...withoutDuplicate, message].sort(
-      (a, b) => a.sequence - b.sequence,
-    ),
-    nextCursor: Math.max(message.sequence, page?.nextCursor ?? 0),
+    data,
+    hasMoreBefore: page?.hasMoreBefore ?? false,
+    nextCursor: Math.max(lastSequence ?? 0, page?.nextCursor ?? 0) || null,
+    previousCursor: firstSequence,
   }
 }

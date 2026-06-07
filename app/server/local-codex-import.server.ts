@@ -102,6 +102,10 @@ type LocalSessionMessageContext = {
 
 type OrderedImportedLocalMessage = ImportedLocalMessage & { order: number }
 
+type LocalHistoryReadOptions = {
+  refresh?: boolean
+}
+
 type LocalFunctionCallOutput = {
   output: string
   timestamp: Date
@@ -222,7 +226,7 @@ export async function hydrateThreadForAccount(
   threadId: string,
   accountId: string,
 ): Promise<boolean> {
-  await ensureCanonicalHistoryImported()
+  await ensureCanonicalHistoryHome()
   return withThreadHistoryLock(threadId, () =>
     hydrateCanonicalThreadToAccount(threadId, accountId),
   )
@@ -232,7 +236,7 @@ export async function syncThreadFromAccount(
   threadId: string,
   accountId: string,
 ): Promise<boolean> {
-  await ensureCanonicalHistoryImported()
+  await ensureCanonicalHistoryHome()
   return withThreadHistoryLock(threadId, async () =>
     syncThreadFromCodexHome(threadId, ensureAccountCodexHome(accountId)),
   )
@@ -305,6 +309,16 @@ async function ensureCanonicalHistoryImported(
       })
   }
   await canonicalHistoryImportPromise
+}
+
+async function ensureCanonicalHistoryForRead(
+  options: LocalHistoryReadOptions = {},
+): Promise<void> {
+  if (options.refresh === false) {
+    await ensureCanonicalHistoryHome()
+    return
+  }
+  await ensureCanonicalHistoryImported()
 }
 
 async function importCanonicalCodexHistory(): Promise<void> {
@@ -1057,9 +1071,10 @@ function jsonStringifyReplacer(_key: string, value: unknown): unknown {
 export async function readLocalCodexSessionTranscriptForChat(
   chatId: string,
   threadId: string,
+  options: LocalHistoryReadOptions = {},
 ): Promise<ParsedLocalCodexSession | null> {
   void chatId
-  const sessionPath = await findLocalCodexSessionPath(threadId)
+  const sessionPath = await findLocalCodexSessionPath(threadId, options)
   return sessionPath
     ? readLocalCodexSessionTranscriptFile(sessionPath, threadId)
     : null
@@ -1068,9 +1083,10 @@ export async function readLocalCodexSessionTranscriptForChat(
 export async function readLatestLocalCodexContextUsageForChat(
   chatId: string,
   threadId: string,
+  options: LocalHistoryReadOptions = {},
 ): Promise<ContextWindowUsagePayload | null> {
   void chatId
-  const sessionPath = await findLocalCodexSessionPath(threadId)
+  const sessionPath = await findLocalCodexSessionPath(threadId, options)
   return sessionPath
     ? readLatestLocalCodexContextUsageFile(sessionPath, threadId)
     : null
@@ -1078,8 +1094,9 @@ export async function readLatestLocalCodexContextUsageForChat(
 
 export async function readLocalCodexSessionTranscript(
   threadId: string,
+  options: LocalHistoryReadOptions = {},
 ): Promise<ParsedLocalCodexSession | null> {
-  const sessionPath = await findLocalCodexSessionPath(threadId)
+  const sessionPath = await findLocalCodexSessionPath(threadId, options)
   return sessionPath
     ? readLocalCodexSessionTranscriptFile(sessionPath, threadId)
     : null
@@ -1087,11 +1104,12 @@ export async function readLocalCodexSessionTranscript(
 
 export async function readLocalCodexSessionActivity(
   threadId: string,
+  options: LocalHistoryReadOptions = {},
 ): Promise<Pick<
   ParsedLocalCodexSession,
   "activeStartedAt" | "activeTurnId" | "status"
 > | null> {
-  const session = await readLocalCodexSessionTranscript(threadId)
+  const session = await readLocalCodexSessionTranscript(threadId, options)
   return session
     ? {
         activeStartedAt: session.activeStartedAt,
@@ -1103,8 +1121,9 @@ export async function readLocalCodexSessionActivity(
 
 export async function readLatestLocalCodexContextUsage(
   threadId: string,
+  options: LocalHistoryReadOptions = {},
 ): Promise<ContextWindowUsagePayload | null> {
-  const sessionPath = await findLocalCodexSessionPath(threadId)
+  const sessionPath = await findLocalCodexSessionPath(threadId, options)
   return sessionPath
     ? readLatestLocalCodexContextUsageFile(sessionPath, threadId)
     : null
@@ -1112,8 +1131,9 @@ export async function readLatestLocalCodexContextUsage(
 
 export async function readLocalCodexSessionMetadata(
   threadId: string,
+  options: LocalHistoryReadOptions = {},
 ): Promise<LocalCodexSessionSummary | null> {
-  await ensureCanonicalHistoryImported()
+  await ensureCanonicalHistoryForRead(options)
   const record = await readCanonicalThreadRecord(threadId)
   if (!record) {
     return null
@@ -1121,10 +1141,10 @@ export async function readLocalCodexSessionMetadata(
   return summaryFromCodexStateThread(record.state, record.index?.title ?? null)
 }
 
-export async function listLocalCodexSessionSummaries(): Promise<
-  LocalCodexSessionSummary[]
-> {
-  await ensureCanonicalHistoryImported()
+export async function listLocalCodexSessionSummaries(
+  options: LocalHistoryReadOptions = {},
+): Promise<LocalCodexSessionSummary[]> {
+  await ensureCanonicalHistoryForRead(options)
   return (await readCanonicalThreadRecords())
     .map((record) =>
       summaryFromCodexStateThread(
@@ -2781,8 +2801,11 @@ async function existingSessionRoots(): Promise<string[]> {
   return existing
 }
 
-async function findLocalCodexSessionPath(threadId: string): Promise<string | null> {
-  await ensureCanonicalHistoryImported()
+async function findLocalCodexSessionPath(
+  threadId: string,
+  options: LocalHistoryReadOptions = {},
+): Promise<string | null> {
+  await ensureCanonicalHistoryForRead(options)
   const record = await readCanonicalThreadRecord(threadId)
   if (!record) {
     return null

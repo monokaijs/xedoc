@@ -102,7 +102,10 @@ export function AppShell() {
     enabled: !!session,
     queryKey: ["chats"],
     queryFn: () => listChats(session!),
-    refetchInterval: 5_000,
+    refetchInterval: (query) =>
+      query.state.data?.some((chat) => chat.status === "RUNNING")
+        ? 5_000
+        : false,
   })
 
   const accounts = useMemo(() => accountsQuery.data ?? [], [accountsQuery.data])

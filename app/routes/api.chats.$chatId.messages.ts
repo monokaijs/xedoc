@@ -30,8 +30,11 @@ export async function loader({ request, params }: RouteArgs) {
     return jsonResponse(
       await listMessages(
         requireParam(params, "chatId"),
-        readNumberQuery(url, "afterSequence", 0),
-        readNumberQuery(url, "limit", 50),
+        {
+          afterSequence: readNumberQuery(url, "afterSequence", 0),
+          beforeSequence: readNumberQuery(url, "beforeSequence", 0),
+          limit: readNumberQuery(url, "limit", 50),
+        },
       ),
     )
   } catch (error) {

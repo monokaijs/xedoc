@@ -59,18 +59,36 @@ export function mergeMessagePage(
       merged.push(message)
     }
   }
+  const data = merged.sort(compareMessages)
+  const previousMinSequence = minSequence(previous.data)
+  const nextMinSequence = minSequence(next.data)
+  const loadedOlderPage =
+    previousMinSequence !== null &&
+    nextMinSequence !== null &&
+    nextMinSequence < previousMinSequence
 
   const nextCursor = Math.max(
     0,
     previous.nextCursor ?? 0,
     next.nextCursor ?? 0,
-    ...merged.map((message) => message.sequence),
+    ...data.map((message) => message.sequence),
   )
+  const previousCursor = minSequence(data)
 
   return {
-    data: merged.sort(compareMessages),
+    data,
+    hasMoreBefore: loadedOlderPage
+      ? next.hasMoreBefore ?? false
+      : previous.hasMoreBefore ?? next.hasMoreBefore ?? false,
     nextCursor: nextCursor || null,
+    previousCursor,
   }
+}
+
+function minSequence(messages: ChatMessageResponse[]): number | null {
+  return messages.length
+    ? Math.min(...messages.map((message) => message.sequence))
+    : null
 }
 
 function messageIsRepresented(

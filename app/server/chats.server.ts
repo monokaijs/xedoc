@@ -154,9 +154,15 @@ const runProjectionQueues = new Map<string, Promise<void>>()
 const timelineMessageLocks = new Map<string, Promise<void>>()
 const commandOutputUpdateEmittedAt = new Map<string, number>()
 const cancelledThreadActivity = new Map<string, number>()
+const backgroundThreadSyncs = new Map<
+  string,
+  { promise?: Promise<void>; startedAt: number }
+>()
 const DEFAULT_CHAT_TITLE = "New Thread"
+const BACKGROUND_THREAD_SYNC_INTERVAL_MS = 30_000
 const CANCELLED_ACTIVITY_IGNORE_MS = 10 * 60 * 1000
 const COMMAND_OUTPUT_UPDATE_INTERVAL_MS = 500
+const FAST_HISTORY_READ = { refresh: false } as const
 
 async function syncThreadFromAccountBestEffort(
   threadId: string,
@@ -172,6 +178,60 @@ async function syncThreadFromAccountBestEffort(
     )
     return false
   })
+}
+
+function scheduleAccountHistorySync(): void {
+  void syncAccountCodexHistories().catch((error) => {
+    console.warn(
+      "Failed to refresh Codex account history.",
+      error instanceof Error ? error.message : error,
+    )
+  })
+}
+
+function scheduleThreadSyncFromAccount(
+  threadId: string,
+  accountId: string | null | undefined,
+): void {
+  if (!accountId) {
+    return
+  }
+  const key = `${threadId}:${accountId}`
+  const current = backgroundThreadSyncs.get(key)
+  const now = Date.now()
+  if (
+    current?.promise ||
+    (current && now - current.startedAt < BACKGROUND_THREAD_SYNC_INTERVAL_MS)
+  ) {
+    return
+  }
+
+  const state = {
+    startedAt: now,
+  } as { promise?: Promise<void>; startedAt: number }
+  const promise = syncThreadFromAccountBestEffort(threadId, accountId)
+    .then(async (synced) => {
+      if (!synced) {
+        return
+      }
+      const preference = await getThreadPreference(threadId)
+      const snapshot = await readThreadSnapshot(threadId)
+      if (preference || snapshot || runtimeStates.has(threadId)) {
+        emit(
+          threadId,
+          "chat.updated",
+          await buildChatResponse(threadId, preference, snapshot),
+        )
+      }
+    })
+    .finally(() => {
+      const latest = backgroundThreadSyncs.get(key)
+      if (latest?.promise === promise) {
+        latest.promise = undefined
+      }
+    })
+  state.promise = promise
+  backgroundThreadSyncs.set(key, state)
 }
 
 async function syncThreadFromAccountOrThrow(
@@ -265,12 +325,7 @@ export async function createChat(dto: CreateChatRequest): Promise<ChatResponse> 
 }
 
 export async function listChats(): Promise<ChatResponse[]> {
-  await syncAccountCodexHistories().catch((error) => {
-    console.warn(
-      "Failed to refresh Codex account history.",
-      error instanceof Error ? error.message : error,
-    )
-  })
+  scheduleAccountHistorySync()
   const [preferences, snapshots] = await Promise.all([
     listThreadPreferences(),
     readThreadSnapshots(),
@@ -304,7 +359,7 @@ export async function listChats(): Promise<ChatResponse[]> {
 
 export async function getChat(threadId: string): Promise<ChatResponse> {
   const preference = await getThreadPreference(threadId)
-  await syncThreadFromAccountBestEffort(threadId, preference?.accountId)
+  scheduleThreadSyncFromAccount(threadId, preference?.accountId)
   const snapshot = await readThreadSnapshot(threadId)
   if (!preference && !snapshot && !runtimeStates.has(threadId)) {
     throw new HttpError(404, "Chat not found.")
@@ -417,29 +472,68 @@ export async function archiveChat(threadId: string): Promise<ChatResponse> {
 
 export async function listMessages(
   threadId: string,
-  afterSequence = 0,
-  limit = 50,
+  options: {
+    afterSequence?: number
+    beforeSequence?: number
+    limit?: number
+  } = {},
 ) {
   const chat = await getChat(threadId)
-  const safeLimit = Math.min(Math.max(limit, 1), 200)
+  const afterSequence = Math.max(options.afterSequence ?? 0, 0)
+  const beforeSequence = Math.max(options.beforeSequence ?? 0, 0)
+  const safeLimit = Math.min(Math.max(options.limit ?? 50, 1), 200)
   const sourceMessages = await readCodexTranscriptMessages(threadId)
   const sourceResponses = sourceMessages.map((source, index) =>
     sourceTranscriptResponse(threadId, chat, source, index, index + 1),
   )
   const overlay = overlayMessagesForList(threadId, sourceResponses)
-  const messages = [...sourceResponses, ...overlay]
-    .sort((left, right) => left.sequence - right.sequence)
-    .filter((message) => message.sequence > afterSequence)
-    .slice(0, safeLimit)
+  const ordered = [...sourceResponses, ...overlay].sort(
+    (left, right) => left.sequence - right.sequence,
+  )
+  const messages = pageMessages(ordered, {
+    afterSequence,
+    beforeSequence,
+    limit: safeLimit,
+  })
+  const firstSequence = messages[0]?.sequence ?? null
+  const lastSequence = messages[messages.length - 1]?.sequence ?? null
   return {
     data: messages,
-    nextCursor: messages.length ? messages[messages.length - 1].sequence : null,
+    hasMoreBefore:
+      firstSequence === null
+        ? false
+        : ordered.some((message) => message.sequence < firstSequence),
+    nextCursor: lastSequence,
+    previousCursor: firstSequence,
   }
 }
 
 export async function readChatContext(threadId: string) {
   await getChat(threadId)
-  return { usage: await readLatestLocalCodexContextUsage(threadId) }
+  return {
+    usage: await readLatestLocalCodexContextUsage(threadId, FAST_HISTORY_READ),
+  }
+}
+
+function pageMessages(
+  ordered: ChatMessageResponse[],
+  options: {
+    afterSequence: number
+    beforeSequence: number
+    limit: number
+  },
+): ChatMessageResponse[] {
+  if (options.beforeSequence > 0) {
+    return ordered
+      .filter((message) => message.sequence < options.beforeSequence)
+      .slice(-options.limit)
+  }
+  if (options.afterSequence > 0) {
+    return ordered
+      .filter((message) => message.sequence > options.afterSequence)
+      .slice(0, options.limit)
+  }
+  return ordered.slice(-options.limit)
 }
 
 export async function respondToCodexServerRequest(
@@ -493,6 +587,9 @@ export async function executeMessage(
     throw new HttpError(400, "Choose a Codex account before sending messages.")
   }
   const account = await readConnectedAccount(accountId)
+  if (chat.status !== "RUNNING") {
+    await syncThreadFromAccountBestEffort(threadId, account.id)
+  }
   if (!chat.workingDirectory) {
     throw new HttpError(400, "Select a working directory before sending messages.")
   }
@@ -789,14 +886,17 @@ async function resolveUpdatedChatAccountId(
 }
 
 async function readThreadSnapshots(): Promise<Map<string, ThreadSnapshot>> {
-  const sessions = await listLocalCodexSessionSummaries()
+  const sessions = await listLocalCodexSessionSummaries(FAST_HISTORY_READ)
   const snapshots = new Map<string, ThreadSnapshot>()
   for (const session of sessions) {
     snapshots.set(session.externalThreadId, snapshotFromSession(session))
   }
   await Promise.all(
     sessions.slice(0, 8).map(async (session) => {
-      const activity = await readLocalCodexSessionActivity(session.externalThreadId)
+      const activity = await readLocalCodexSessionActivity(
+        session.externalThreadId,
+        FAST_HISTORY_READ,
+      )
       const snapshot = snapshots.get(session.externalThreadId)
       if (
         snapshot &&
@@ -813,7 +913,7 @@ async function readThreadSnapshots(): Promise<Map<string, ThreadSnapshot>> {
 async function readThreadSnapshot(
   threadId: string,
 ): Promise<ThreadSnapshot | null> {
-  const session = await readLocalCodexSessionMetadata(threadId)
+  const session = await readLocalCodexSessionMetadata(threadId, FAST_HISTORY_READ)
   if (!session) {
     return null
   }
@@ -849,7 +949,7 @@ async function buildChatResponse(
   const resolvedSnapshot = snapshot === undefined ? await readThreadSnapshot(threadId) : snapshot
   const state = runtimeStates.get(threadId)
   const externalActivity = options.includeExternalActivity
-    ? await readLocalCodexSessionActivity(threadId)
+    ? await readLocalCodexSessionActivity(threadId, FAST_HISTORY_READ)
     : null
   const running =
     state?.status === "RUNNING" ||
@@ -910,7 +1010,7 @@ function recentlyCancelledThreadActivity(threadId: string): boolean {
 async function readCodexTranscriptMessages(
   threadId: string,
 ): Promise<SourceTranscriptMessage[]> {
-  const session = await readLocalCodexSessionTranscript(threadId)
+  const session = await readLocalCodexSessionTranscript(threadId, FAST_HISTORY_READ)
   return session
     ? session.messages.map((message) => sourceMessageFromLocalSession(message))
     : []
@@ -1037,7 +1137,9 @@ async function ensureRuntimeState(threadId: string): Promise<RuntimeThreadState>
   if (existing) {
     return existing
   }
-  const sourceCount = (await readLocalCodexSessionTranscript(threadId))?.messages.length ?? 0
+  const sourceCount =
+    (await readLocalCodexSessionTranscript(threadId, FAST_HISTORY_READ))?.messages
+      .length ?? 0
   const state: RuntimeThreadState = {
     interruptRequested: false,
     messageKeys: new Map(),

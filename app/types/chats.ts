@@ -89,7 +89,9 @@ export interface ChatMessageResponse {
 
 export interface MessagePageResponse {
   data: ChatMessageResponse[];
+  hasMoreBefore?: boolean;
   nextCursor?: number | null;
+  previousCursor?: number | null;
 }
 
 export interface ExecuteChatRequest {
