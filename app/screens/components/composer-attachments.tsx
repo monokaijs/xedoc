@@ -64,19 +64,13 @@ export function imageFilesFromClipboard(data: DataTransfer): File[] {
   const files = Array.from(data.files).filter((file) =>
     file.type.startsWith("image/"),
   )
-  const itemFiles = Array.from(data.items)
+  if (files.length) {
+    return files
+  }
+  return Array.from(data.items)
     .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
     .map((item) => item.getAsFile())
     .filter((file): file is File => !!file)
-  const seen = new Set<string>()
-  return [...files, ...itemFiles].filter((file) => {
-    const key = `${file.name}:${file.size}:${file.lastModified}`
-    if (seen.has(key)) {
-      return false
-    }
-    seen.add(key)
-    return true
-  })
 }
 
 export function readFileAsDataUrl(file: File): Promise<string> {

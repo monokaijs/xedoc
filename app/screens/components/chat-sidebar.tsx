@@ -10,7 +10,7 @@ import {
   Pencil,
   Plus,
 } from "lucide-react"
-import { useMemo, useRef, useState } from "react"
+import { useMemo, useState } from "react"
 import { useNavigate, useParams } from "react-router"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
@@ -75,7 +75,6 @@ export function ChatSidebar({
   const navigate = useNavigate()
   const { chatId } = useParams()
   const queryClient = useQueryClient()
-  const chatOrderRef = useRef<Map<string, number>>(new Map())
   const [renameTarget, setRenameTarget] = useState<ChatResponse | null>(null)
   const [renameTitle, setRenameTitle] = useState("")
   const [archiveTarget, setArchiveTarget] = useState<ChatResponse | null>(null)
@@ -86,13 +85,13 @@ export function ChatSidebar({
     () => new Set(),
   )
 
-  const stableChats = useMemo(
-    () => sortChatsByStableOrder(chats, chatOrderRef.current),
+  const orderedChats = useMemo(
+    () => [...chats].sort(compareChatsByActivity),
     [chats],
   )
   const chatItems = useMemo(
     () =>
-      stableChats.map((chat, index) => ({
+      orderedChats.map((chat, index) => ({
         chat,
         dateLabel: formatChatListDate(chat.lastActivityAt),
         folderKey: chatFolderKey(chat.workingDirectory),
@@ -100,7 +99,7 @@ export function ChatSidebar({
         folderPath: chatFolderPath(chat.workingDirectory),
         order: index,
       })),
-    [stableChats],
+    [orderedChats],
   )
   const chatGroups = useMemo<ChatSidebarGroup[]>(() => {
     const groups = new Map<string, ChatSidebarGroup>()
@@ -424,33 +423,11 @@ function ChatStatusIcon({ status }: { status: ChatStatus }) {
   )
 }
 
-function sortChatsByStableOrder(
-  chats: ChatResponse[],
-  order: Map<string, number>,
-): ChatResponse[] {
-  const chatIds = new Set(chats.map((chat) => chat.id))
-  for (const chatId of Array.from(order.keys())) {
-    if (!chatIds.has(chatId)) {
-      order.delete(chatId)
-    }
-  }
-
-  if (!order.size) {
-    chats.forEach((chat, index) => order.set(chat.id, index))
-  } else {
-    const newChats = chats.filter((chat) => !order.has(chat.id))
-    if (newChats.length) {
-      const firstOrder = Math.min(...order.values())
-      newChats.forEach((chat, index) =>
-        order.set(chat.id, firstOrder - newChats.length + index),
-      )
-    }
-  }
-
-  return [...chats].sort(
-    (left, right) =>
-      (order.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
-      (order.get(right.id) ?? Number.MAX_SAFE_INTEGER),
+function compareChatsByActivity(left: ChatResponse, right: ChatResponse) {
+  return (
+    new Date(right.lastActivityAt).getTime() -
+      new Date(left.lastActivityAt).getTime() ||
+    new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()
   )
 }
 

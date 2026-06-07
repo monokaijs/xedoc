@@ -248,6 +248,9 @@ async function syncThreadFromAccountOrThrow(
     )
   })
   if (!synced) {
+    if (await readThreadSnapshot(threadId)) {
+      return
+    }
     throw new HttpError(
       409,
       "Chat history is not available in the current Codex account.",
