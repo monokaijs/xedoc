@@ -45,6 +45,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { appendMessage, respondToServerRequest } from "@/lib/api"
+import { normalizeCommandOutput } from "@/lib/command-output"
 import type { WebSession } from "@/lib/session-storage"
 import { cn } from "@/lib/utils"
 import {
@@ -1053,8 +1054,10 @@ function TimelineContent({
         />
       )
     case "TOOL_ACTIVITY":
-    default:
-      return <SystemText text={message.content} />
+    default: {
+      const output = normalizeCommandOutput(message.content).output
+      return output.trim() ? <SystemText text={output} /> : null
+    }
   }
 }
 
@@ -1637,12 +1640,25 @@ function CommandBlock({
 }) {
   const status = metadata?.status ?? "running"
   const isRunning = message.status === "STREAMING" || message.status === "PENDING"
+  const commandOutput = normalizeCommandOutput(metadata?.output)
+  const exitCode = metadata?.exitCode ?? commandOutput.exitCode
+  const durationMs = metadata?.durationMs ?? commandOutput.durationMs
+  const resolvedMetadata: ChatCommandMetadata | undefined =
+    metadata || commandOutput.wrapperDetected
+      ? {
+          ...metadata,
+          durationMs,
+          exitCode,
+          kind: "command",
+          output: commandOutput.output,
+        }
+      : undefined
   const failed =
     message.status === "FAILED" ||
     status.toLowerCase().includes("fail") ||
-    (typeof metadata?.exitCode === "number" && metadata.exitCode !== 0)
+    (typeof exitCode === "number" && exitCode !== 0)
   const command = (metadata?.command ?? message.content.trim()) || "command"
-  const output = metadata?.output?.trim() ?? ""
+  const output = commandOutput.output.trim()
   const outputLines = output ? output.split(/\r?\n/) : []
   const [expanded, setExpanded] = useState(false)
   const visibleOutputLines = expanded
@@ -1681,21 +1697,21 @@ function CommandBlock({
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
             <span className="shrink-0 font-medium">
-              {commandActionLabel(message, metadata)}
+              {commandActionLabel(message, resolvedMetadata)}
             </span>
             <code className="min-w-0 max-w-full break-words rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
               {command}
             </code>
-            {metadata?.durationMs ? (
+            {durationMs ? (
               <span className="text-xs text-muted-foreground">
-                {formatDurationCompact(metadata.durationMs)}
+                {formatDurationCompact(durationMs)}
               </span>
             ) : null}
-            {typeof metadata?.exitCode === "number" ? (
+            {typeof exitCode === "number" ? (
               <Badge
-                variant={metadata.exitCode === 0 ? "secondary" : "destructive"}
+                variant={exitCode === 0 ? "secondary" : "destructive"}
               >
-                {metadata.exitCode === 0 ? "ok" : metadata.exitCode}
+                {exitCode === 0 ? "ok" : exitCode}
               </Badge>
             ) : null}
           </div>
@@ -1813,9 +1829,10 @@ function CompactActionRow({ message }: { message: ChatMessageResponse }) {
   >(message.metadata)
   const commandMetadata = metadataAs<ChatCommandMetadata>(message.metadata)
   const label = compactActionLabel(message, metadata)
+  const commandOutput = normalizeCommandOutput(commandMetadata?.output).output
   const detail =
     message.kind === "COMMAND_EXECUTION"
-      ? commandMetadata?.output || commandMetadata?.cwd
+      ? commandOutput || commandMetadata?.cwd
       : message.content.trim()
   return (
     <div className="grid min-w-0 max-w-full grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 overflow-hidden rounded-md bg-muted/35 px-2 py-1.5">

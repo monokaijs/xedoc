@@ -65,6 +65,7 @@ export interface ChatResponse {
   status: ChatStatus;
   externalThreadId?: string | null;
   lastActivityAt: ApiDate;
+  lastSentAt: ApiDate;
   createdAt: ApiDate;
   updatedAt: ApiDate;
 }

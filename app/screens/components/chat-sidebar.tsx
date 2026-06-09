@@ -93,7 +93,7 @@ export function ChatSidebar({
     () =>
       orderedChats.map((chat, index) => ({
         chat,
-        dateLabel: formatChatListDate(chat.lastActivityAt),
+        dateLabel: formatChatListDate(chat.lastSentAt),
         folderKey: chatFolderKey(chat.workingDirectory),
         folderName: chatFolderName(chat.workingDirectory),
         folderPath: chatFolderPath(chat.workingDirectory),
@@ -425,6 +425,7 @@ function ChatStatusIcon({ status }: { status: ChatStatus }) {
 
 function compareChatsByActivity(left: ChatResponse, right: ChatResponse) {
   return (
+    new Date(right.lastSentAt).getTime() - new Date(left.lastSentAt).getTime() ||
     new Date(right.lastActivityAt).getTime() -
       new Date(left.lastActivityAt).getTime() ||
     new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()

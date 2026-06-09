@@ -9,6 +9,7 @@ import type {
 } from "@/types"
 import { Code2, ListChecks, LockKeyhole, Terminal } from "lucide-react"
 import type { ReactNode } from "react"
+import { normalizeCommandOutput } from "@/lib/command-output"
 
 export type TimelineEntry =
   | {
@@ -495,13 +496,21 @@ function compactCommandOutputMessages(
     }
     consumedIds.add(output.id)
     const metadata = metadataAs<ChatCommandMetadata>(message.metadata)
+    const commandOutput = normalizeCommandOutput(output.content)
+    const outputMetadata = metadataAs<ChatCommandMetadata>(output.metadata)
     return {
       ...message,
       metadata: {
         ...metadata,
         callId,
+        durationMs:
+          metadata?.durationMs ??
+          commandOutput.durationMs ??
+          outputMetadata?.durationMs,
+        exitCode:
+          metadata?.exitCode ?? commandOutput.exitCode ?? outputMetadata?.exitCode,
         kind: "command" as const,
-        output: output.content,
+        output: commandOutput.output,
       },
     }
   })

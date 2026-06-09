@@ -27,6 +27,7 @@ import {
   resolveCodexHistoryHome,
   resolveCodexSharedChatHome,
 } from "./codex-runtime.server"
+import { normalizeCommandOutput } from "@/lib/command-output"
 import { asJsonObject, readString } from "./json.server"
 import { prisma } from "./prisma.server"
 
@@ -49,6 +50,7 @@ export type ParsedLocalCodexSession = {
   activeTurnId?: string
   createdAt: Date
   externalThreadId: string
+  lastUserMessageAt?: Date | null
   messages: ImportedLocalMessage[]
   originator?: string
   path: string
@@ -63,6 +65,7 @@ export type LocalCodexSessionSummary = {
   createdAt: Date
   externalThreadId: string
   firstUserMessage?: string | null
+  lastUserMessageAt?: Date | null
   path: string
   preview?: string | null
   title: string | null
@@ -76,6 +79,7 @@ type LocalCodexSessionFile = {
 }
 
 export type LocalCodexSessionIndexMetadata = {
+  lastUserMessageAt?: Date | null
   title: string | null
   updatedAt: Date | null
 }
@@ -816,6 +820,12 @@ function readCanonicalIndexMetadata(
     return null
   }
   return {
+    lastUserMessageAt:
+      readDate(object.lastUserMessageAt) ??
+      readDate(object.last_user_message_at) ??
+      readDate(object.lastSentAt) ??
+      readDate(object.last_sent_at) ??
+      null,
     title: normalizeImportedTitle(readString(object.title)),
     updatedAt: readDate(object.updatedAt) ?? null,
   }
@@ -842,6 +852,14 @@ async function upsertSessionIndexRecord(
       id: threadId,
       threadId,
       thread_id: threadId,
+      ...(metadata?.lastUserMessageAt
+        ? {
+            lastSentAt: metadata.lastUserMessageAt.toISOString(),
+            lastUserMessageAt: metadata.lastUserMessageAt.toISOString(),
+            last_sent_at: metadata.lastUserMessageAt.toISOString(),
+            last_user_message_at: metadata.lastUserMessageAt.toISOString(),
+          }
+        : {}),
       ...(metadata?.title ? { thread_name: metadata.title, title: metadata.title } : {}),
       ...(metadata?.updatedAt
         ? { updatedAt: metadata.updatedAt.toISOString(), updated_at: metadata.updatedAt.toISOString() }
@@ -927,6 +945,11 @@ function mergeSessionIndexMetadata(
   fallbackUpdatedAt: Date,
 ): LocalCodexSessionIndexMetadata {
   return {
+    lastUserMessageAt:
+      primary?.lastUserMessageAt ??
+      secondary?.lastUserMessageAt ??
+      parsed?.lastUserMessageAt ??
+      null,
     title:
       normalizeImportedTitle(primary?.title) ??
       normalizeImportedTitle(secondary?.title) ??
@@ -945,6 +968,8 @@ function sameSessionIndexMetadata(
   right: LocalCodexSessionIndexMetadata | null,
 ): boolean {
   return (
+    (left?.lastUserMessageAt?.getTime() ?? null) ===
+      (right?.lastUserMessageAt?.getTime() ?? null) &&
     (left?.title ?? null) === (right?.title ?? null) &&
     (left?.updatedAt?.getTime() ?? null) === (right?.updatedAt?.getTime() ?? null)
   )
@@ -1138,22 +1163,21 @@ export async function readLocalCodexSessionMetadata(
   if (!record) {
     return null
   }
-  return summaryFromCodexStateThread(record.state, record.index?.title ?? null)
+  return summaryFromCanonicalThreadRecord(record)
 }
 
 export async function listLocalCodexSessionSummaries(
   options: LocalHistoryReadOptions = {},
 ): Promise<LocalCodexSessionSummary[]> {
   await ensureCanonicalHistoryForRead(options)
-  return (await readCanonicalThreadRecords())
-    .map((record) =>
-      summaryFromCodexStateThread(
-        record.state,
-        record.index?.title ?? null,
-      ),
-    )
+  return (await Promise.all(
+    (await readCanonicalThreadRecords()).map(summaryFromCanonicalThreadRecord),
+  ))
     .sort(
-      (left, right) => right.updatedAt.getTime() - left.updatedAt.getTime(),
+      (left, right) =>
+        (right.lastUserMessageAt ?? right.createdAt).getTime() -
+          (left.lastUserMessageAt ?? left.createdAt).getTime() ||
+        right.updatedAt.getTime() - left.updatedAt.getTime(),
     )
 }
 
@@ -1367,6 +1391,9 @@ function parseLocalCodexSessionJsonl(
   }
 
   const firstUserMessage = messages.find((message) => message.role === "USER")
+  const lastUserMessage = [...messages]
+    .reverse()
+    .find((message) => message.role === "USER")
   const title =
     fallbackChatTitle(firstUserMessage?.content ?? "") ??
     fallbackChatTitle(messages[0]?.content ?? "") ??
@@ -1377,6 +1404,7 @@ function parseLocalCodexSessionJsonl(
     activeTurnId,
     createdAt: createdAt ?? fallbackTimestamp,
     externalThreadId,
+    lastUserMessageAt: lastUserMessage?.createdAt ?? null,
     messages,
     originator,
     path,
@@ -1675,18 +1703,20 @@ function importedToolOutputResponseMessage(
   if (callId && session.suppressedToolOutputCallIds?.has(callId)) {
     return null
   }
-  const output = outputPayloadText(payload.output)
-  if (!output.trim()) {
+  const commandOutput = normalizeCommandOutput(outputPayloadText(payload.output))
+  if (!commandOutput.output.trim() && !commandOutput.wrapperDetected) {
     return null
   }
   return {
-    content: output,
+    content: commandOutput.output,
     createdAt: timestamp,
     itemId: responseItemOutputId(payload),
     kind: "TOOL_ACTIVITY",
     metadata: {
       ...importedMessageMetadata(payload, session),
       callId: readCallId(payload),
+      durationMs: commandOutput.durationMs,
+      exitCode: commandOutput.exitCode,
       kind: "localCodexToolOutput",
       responseItemType: readString(payload.type),
       status: readString(payload.status) ?? "completed",
@@ -2468,8 +2498,16 @@ function readSessionIndex(
       readDate(record.modified_at) ??
       readDate(record.modifiedAt) ??
       null
+    const lastUserMessageAt =
+      readDate(record.last_user_message_at) ??
+      readDate(record.lastUserMessageAt) ??
+      readDate(record.last_sent_at) ??
+      readDate(record.lastSentAt) ??
+      null
     const existing = entries.get(rowId)
     entries.set(rowId, {
+      lastUserMessageAt:
+        lastUserMessageAt ?? existing?.lastUserMessageAt ?? null,
       title: rowTitle ?? existing?.title ?? null,
       updatedAt: updatedAt ?? existing?.updatedAt ?? null,
     })
@@ -2698,7 +2736,7 @@ function stateDatabaseVersion(name: string): number {
 
 function summaryFromCodexStateThread(
   row: CodexStateThreadRow,
-  indexedTitle?: string | null,
+  index?: LocalCodexSessionIndexMetadata | null,
 ): LocalCodexSessionSummary {
   const updatedAt = codexStateUpdatedAt(row)
   const createdAt = codexStateCreatedAt(row, updatedAt)
@@ -2711,11 +2749,37 @@ function summaryFromCodexStateThread(
     createdAt,
     externalThreadId: row.id,
     firstUserMessage,
+    lastUserMessageAt: index?.lastUserMessageAt ?? null,
     path,
     preview,
-    title: codexStateThreadDisplayTitle(row, firstUserMessage, preview, indexedTitle),
+    title: codexStateThreadDisplayTitle(
+      row,
+      firstUserMessage,
+      preview,
+      index?.title,
+    ),
     updatedAt,
     workingDirectory: row.cwd ?? undefined,
+  }
+}
+
+async function summaryFromCanonicalThreadRecord(
+  record: CanonicalThreadRecord,
+): Promise<LocalCodexSessionSummary> {
+  const summary = summaryFromCodexStateThread(record.state, record.index)
+  if (summary.lastUserMessageAt) {
+    return summary
+  }
+  const sessionPath = record.state.rolloutPath?.trim()
+    ? record.state.rolloutPath
+    : canonicalSessionPath(record.sessionRelativePath)
+  const parsed = await readLocalCodexSessionTranscriptFile(
+    sessionPath,
+    record.state.id,
+  )
+  return {
+    ...summary,
+    lastUserMessageAt: parsed?.lastUserMessageAt ?? null,
   }
 }
 

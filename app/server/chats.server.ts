@@ -32,6 +32,7 @@ import {
 import { normalizeEnvironment } from "./env.server"
 import { HttpError } from "./http.server"
 import { asJsonObject, readString } from "./json.server"
+import { normalizeCommandOutput } from "@/lib/command-output"
 import { selectRateLimitSnapshot } from "@/lib/rate-limits"
 import {
   hydrateThreadForAccount,
@@ -138,6 +139,7 @@ type RuntimeThreadState = {
 type ThreadSnapshot = {
   createdAt: Date
   firstUserMessage?: string | null
+  lastSentAt?: Date | null
   preview?: string | null
   status?: ChatResponse["status"]
   threadId: string
@@ -354,6 +356,8 @@ export async function listChats(): Promise<ChatResponse[]> {
     .filter((chat) => chat.status !== "ARCHIVED")
     .sort(
       (left, right) =>
+        new Date(right.lastSentAt).getTime() -
+          new Date(left.lastSentAt).getTime() ||
         new Date(right.lastActivityAt).getTime() -
           new Date(left.lastActivityAt).getTime() ||
         new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
@@ -923,6 +927,7 @@ async function readThreadSnapshot(
   return {
     createdAt: session.createdAt,
     firstUserMessage: session.firstUserMessage ?? null,
+    lastSentAt: session.lastUserMessageAt ?? null,
     preview: session.preview ?? null,
     threadId,
     title: session.title,
@@ -935,6 +940,7 @@ function snapshotFromSession(session: LocalCodexSessionSummary): ThreadSnapshot 
   return {
     createdAt: session.createdAt,
     firstUserMessage: session.firstUserMessage ?? null,
+    lastSentAt: session.lastUserMessageAt ?? null,
     preview: session.preview ?? null,
     threadId: session.externalThreadId,
     title: session.title,
@@ -971,6 +977,10 @@ async function buildChatResponse(
     resolvedSnapshot?.updatedAt ??
     preference?.updatedAt ??
     createdAt
+  const lastSentAt =
+    latestUserMessageAt(state?.messages ?? []) ??
+    resolvedSnapshot?.lastSentAt ??
+    createdAt
   const title = resolveChatDisplayTitle({
     preferenceTitle: preference?.title,
     preview: resolvedSnapshot?.preview,
@@ -985,6 +995,7 @@ async function buildChatResponse(
     id: threadId,
     externalThreadId: threadId,
     lastActivityAt: updatedAt,
+    lastSentAt,
     status: preference?.archivedAt
       ? "ARCHIVED"
       : running
@@ -3057,13 +3068,15 @@ async function projectCommandEvent(
   const itemId = eventItemId(event) ?? `command:${eventTurnId(event) ?? "turn"}`
   const bufferKey = `COMMAND:${itemId}`
   const delta = eventTextDelta(event)
-  const output = delta
+  const rawOutput = delta
     ? `${context.streamBuffers.get(bufferKey) ?? ""}${delta}`
     : readText(payload.output) ??
       readText(payload.aggregatedOutput) ??
       readText(payload.aggregated_output) ??
       context.streamBuffers.get(bufferKey) ??
       ""
+  const commandOutput = normalizeCommandOutput(rawOutput)
+  const output = commandOutput.output
   context.streamBuffers.set(bufferKey, output)
   const command = readString(payload.command) ?? readString(params.command) ?? "command"
   const status = itemStatus(payload, event.method ?? "")
@@ -3079,8 +3092,14 @@ async function projectCommandEvent(
       actions: readJsonArray(payload.actions) ?? readJsonArray(payload.commandActions),
       command,
       cwd: readString(payload.cwd) ?? readString(params.cwd),
-      durationMs: readNumber(payload.durationMs) ?? readNumber(payload.duration_ms),
-      exitCode: readNumber(payload.exitCode) ?? readNumber(payload.exit_code),
+      durationMs:
+        readNumber(payload.durationMs) ??
+        readNumber(payload.duration_ms) ??
+        commandOutput.durationMs,
+      exitCode:
+        readNumber(payload.exitCode) ??
+        readNumber(payload.exit_code) ??
+        commandOutput.exitCode,
       kind: "command",
       output,
       status,
@@ -4414,6 +4433,13 @@ function lastUserMessageContent(messages: ChatMessageResponse[]): string | null 
       .find((message) => message.role === "USER" && message.content.trim())
       ?.content ?? null
   )
+}
+
+function latestUserMessageAt(messages: ChatMessageResponse[]): Date | null {
+  const latest = [...messages]
+    .reverse()
+    .find((message) => message.role === "USER")
+  return latest ? new Date(latest.createdAt) : null
 }
 
 function emit<TType extends ChatEventType>(
