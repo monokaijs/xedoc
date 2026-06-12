@@ -41,6 +41,7 @@ import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Sheet, SheetContent } from "@/components/ui/sheet"
 import { Textarea } from "@/components/ui/textarea"
+import { useIsMobile } from "@/hooks/use-mobile"
 import {
   appendMessage,
   executeChatMessage,
@@ -133,6 +134,7 @@ export function ChatDetailPane() {
   const scrollViewportRef = useRef<HTMLDivElement | null>(null)
   const imageInputRef = useRef<HTMLInputElement | null>(null)
   const stickToBottomRef = useRef(true)
+  const isMobile = useIsMobile()
   const notifiedRunIdsRef = useRef(new Set<string>())
   const notifiedRequestIdsRef = useRef(new Set<string>())
   const queryClient = useQueryClient()
@@ -1127,7 +1129,7 @@ export function ChatDetailPane() {
           </aside>
         ) : null}
       </div>
-      {chat ? (
+      {chat && isMobile ? (
         <Sheet open={gitOpen} onOpenChange={setGitOpen}>
           <SheetContent
             className="w-[min(100vw,46rem)] max-w-none gap-0 p-0 md:hidden [&>button]:hidden"
