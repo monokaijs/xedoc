@@ -400,9 +400,9 @@ function NewChatSplitButton({
   onNewChat: (workingDirectory?: string) => void
 }) {
   return (
-    <div className="flex w-full min-w-0 items-center">
+    <div className="flex h-8 w-full min-w-0 items-center overflow-hidden rounded-lg border border-sidebar-border bg-background">
       <Button
-        className="min-w-0 flex-1 justify-start rounded-r-none border-sidebar-border"
+        className="h-full min-w-0 flex-1 justify-start rounded-none border-0 bg-transparent"
         variant="ghost"
         onClick={() => onNewChat()}
       >
@@ -414,8 +414,7 @@ function NewChatSplitButton({
           render={
             <Button
               aria-label="New chat in recent folder"
-              className="w-8 shrink-0 rounded-l-none border-l border-sidebar-border px-0"
-              size="icon-sm"
+              className="h-full w-8 shrink-0 rounded-none border-0 border-l border-sidebar-border bg-transparent px-0"
               variant="ghost"
             />
           }
