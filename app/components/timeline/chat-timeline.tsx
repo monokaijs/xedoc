@@ -26,10 +26,11 @@ import {
   PencilLine,
   Search,
   Terminal,
+  Trash2,
   UserRound,
 } from "lucide-react"
 import type { ReactNode } from "react"
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import "highlight.js/styles/github.css"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
@@ -92,6 +93,7 @@ export function ChatTimeline({
   hiddenMessageIds,
   messages,
   onImplementPlan,
+  onRemoveQueuedMessage,
   onRevisePlan,
   onReviewFileChanges,
   onUndoFileChanges,
@@ -102,6 +104,7 @@ export function ChatTimeline({
   planActionPending,
   queuedMessageActionDisabled,
   queuedMessageActionPendingId,
+  queuedMessageRemovePendingId,
   showProcessingTail,
   session,
 }: {
@@ -111,6 +114,7 @@ export function ChatTimeline({
   hiddenMessageIds?: string[]
   messages: ChatMessageResponse[]
   onSteerQueuedMessage?: (action: QueuedMessageAction) => void
+  onRemoveQueuedMessage?: (action: QueuedMessageAction) => void
   onReviewFileChanges?: (action: FileChangePromptAction) => void
   onUndoFileChanges?: (action: FileChangePromptAction) => void
   onImplementPlan?: (action: ProposedPlanAction) => void
@@ -119,6 +123,7 @@ export function ChatTimeline({
   planActionPending?: boolean
   queuedMessageActionDisabled?: boolean
   queuedMessageActionPendingId?: string | null
+  queuedMessageRemovePendingId?: string | null
   showProcessingTail?: boolean
   session: WebSession
 }) {
@@ -152,6 +157,7 @@ export function ChatTimeline({
           key={entry.id}
           latestProposedPlanMessageId={latestProposedPlanMessageId}
           onImplementPlan={onImplementPlan}
+          onRemoveQueuedMessage={onRemoveQueuedMessage}
           onRevisePlan={onRevisePlan}
           onReviewFileChanges={onReviewFileChanges}
           onSteerQueuedMessage={onSteerQueuedMessage}
@@ -160,6 +166,7 @@ export function ChatTimeline({
           planActionPending={planActionPending}
           queuedMessageActionDisabled={queuedMessageActionDisabled}
           queuedMessageActionPendingId={queuedMessageActionPendingId}
+          queuedMessageRemovePendingId={queuedMessageRemovePendingId}
           session={session}
         />
       ))}
@@ -314,13 +321,17 @@ export function PinnedPlanTasksPanel({
 export function QueuedMessagesPanel({
   disabled,
   messages,
+  onRemoveQueuedMessage,
   onSteerQueuedMessage,
   pendingQueueId,
+  pendingRemoveQueueId,
 }: {
   disabled?: boolean
   messages: ChatMessageResponse[]
+  onRemoveQueuedMessage?: (action: QueuedMessageAction) => void
   onSteerQueuedMessage?: (action: QueuedMessageAction) => void
   pendingQueueId?: string | null
+  pendingRemoveQueueId?: string | null
 }) {
   if (!messages.length) {
     return null
@@ -342,6 +353,7 @@ export function QueuedMessagesPanel({
               const delivery = userDeliveryState(message)
               const queueId = delivery?.queueId
               const pending = pendingQueueId === queueId
+              const removePending = pendingRemoveQueueId === queueId
               return (
                 <div
                   className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-md bg-background px-2 py-1.5 text-xs"
@@ -356,27 +368,54 @@ export function QueuedMessagesPanel({
                       Queued after the current task
                     </div>
                   </div>
-                  <Button
-                    className="h-7 shrink-0 px-2 text-xs"
-                    disabled={
-                      disabled || pending || !queueId || !onSteerQueuedMessage
-                    }
-                    size="sm"
-                    type="button"
-                    variant="outline"
-                    onClick={() => {
-                      if (queueId) {
-                        onSteerQueuedMessage?.({ message, queueId })
+                  <div className="flex shrink-0 items-center gap-1">
+                    <Button
+                      className="size-7"
+                      disabled={
+                        removePending || !queueId || !onRemoveQueuedMessage
                       }
-                    }}
-                  >
-                    {pending ? (
-                      <Loader2 className="animate-spin" />
-                    ) : (
-                      <ArrowRight />
-                    )}
-                    Steer
-                  </Button>
+                      size="icon"
+                      title="Remove queued message"
+                      type="button"
+                      variant="ghost"
+                      onClick={() => {
+                        if (queueId) {
+                          onRemoveQueuedMessage?.({ message, queueId })
+                        }
+                      }}
+                    >
+                      {removePending ? (
+                        <Loader2 className="animate-spin" />
+                      ) : (
+                        <Trash2 />
+                      )}
+                    </Button>
+                    <Button
+                      className="h-7 px-2 text-xs"
+                      disabled={
+                        disabled ||
+                        pending ||
+                        removePending ||
+                        !queueId ||
+                        !onSteerQueuedMessage
+                      }
+                      size="sm"
+                      type="button"
+                      variant="outline"
+                      onClick={() => {
+                        if (queueId) {
+                          onSteerQueuedMessage?.({ message, queueId })
+                        }
+                      }}
+                    >
+                      {pending ? (
+                        <Loader2 className="animate-spin" />
+                      ) : (
+                        <ArrowRight />
+                      )}
+                      Steer
+                    </Button>
+                  </div>
                 </div>
               )
             })}
@@ -428,9 +467,11 @@ type FileChangeActionHandlers = {
 }
 
 type QueuedMessageActionHandlers = {
+  onRemoveQueuedMessage?: (action: QueuedMessageAction) => void
   onSteerQueuedMessage?: (action: QueuedMessageAction) => void
   queuedMessageActionDisabled?: boolean
   queuedMessageActionPendingId?: string | null
+  queuedMessageRemovePendingId?: string | null
 }
 
 function TimelineEntryRow({
@@ -440,6 +481,7 @@ function TimelineEntryRow({
   fileChangeActionPending,
   latestProposedPlanMessageId,
   onImplementPlan,
+  onRemoveQueuedMessage,
   onRevisePlan,
   onReviewFileChanges,
   onSteerQueuedMessage,
@@ -448,6 +490,7 @@ function TimelineEntryRow({
   planActionPending,
   queuedMessageActionDisabled,
   queuedMessageActionPendingId,
+  queuedMessageRemovePendingId,
   session,
 }: {
   chatId: string
@@ -462,6 +505,8 @@ function TimelineEntryRow({
         message={entry.message}
         queuedMessageActionDisabled={queuedMessageActionDisabled}
         queuedMessageActionPendingId={queuedMessageActionPendingId}
+        queuedMessageRemovePendingId={queuedMessageRemovePendingId}
+        onRemoveQueuedMessage={onRemoveQueuedMessage}
         onSteerQueuedMessage={onSteerQueuedMessage}
       />
     )
@@ -696,9 +741,11 @@ function CodexRenderItemContent({
 
 function UserMessageRow({
   message,
+  onRemoveQueuedMessage,
   onSteerQueuedMessage,
   queuedMessageActionDisabled,
   queuedMessageActionPendingId,
+  queuedMessageRemovePendingId,
 }: {
   message: ChatMessageResponse
 } & QueuedMessageActionHandlers) {
@@ -780,6 +827,16 @@ function UserMessageRow({
                 delivery={delivery}
                 disabled={queuedMessageActionDisabled}
                 pending={queuedMessageActionPendingId === delivery.queueId}
+                removePending={queuedMessageRemovePendingId === delivery.queueId}
+                onRemoveQueuedMessage={
+                  delivery.queueId
+                    ? () =>
+                        onRemoveQueuedMessage?.({
+                          message,
+                          queueId: delivery.queueId!,
+                        })
+                    : undefined
+                }
                 onSteerQueuedMessage={
                   delivery.queueId
                     ? () =>
@@ -835,6 +892,7 @@ function ProcessingTail() {
 
 type UserDeliveryState = {
   badgeVariant: "default" | "secondary" | "destructive" | "outline"
+  canRemove: boolean
   canSteer: boolean
   detail: string
   label: string
@@ -844,31 +902,62 @@ type UserDeliveryState = {
 function UserDeliveryFooter({
   delivery,
   disabled,
+  onRemoveQueuedMessage,
   onSteerQueuedMessage,
   pending,
+  removePending,
 }: {
   delivery: UserDeliveryState
   disabled?: boolean
+  onRemoveQueuedMessage?: () => void
   onSteerQueuedMessage?: () => void
   pending?: boolean
+  removePending?: boolean
 }) {
   const canSteer =
-    delivery.canSteer && !!onSteerQueuedMessage && !disabled && !pending
+    delivery.canSteer &&
+    !!onSteerQueuedMessage &&
+    !disabled &&
+    !pending &&
+    !removePending
+  const canRemove =
+    delivery.canRemove && !!onRemoveQueuedMessage && !removePending && !pending
   return (
     <div className="mt-2 flex min-w-0 flex-wrap items-center justify-between gap-2 border-t pt-2 text-xs text-muted-foreground">
       <span className="min-w-0 break-words leading-5">{delivery.detail}</span>
-      {delivery.canSteer ? (
-        <Button
-          className="h-7 shrink-0 px-2 text-xs"
-          disabled={!canSteer}
-          size="sm"
-          type="button"
-          variant="outline"
-          onClick={onSteerQueuedMessage}
-        >
-          {pending ? <Loader2 className="animate-spin" /> : <ArrowRight />}
-          Steer
-        </Button>
+      {delivery.canSteer || delivery.canRemove ? (
+        <div className="flex shrink-0 items-center gap-1">
+          {delivery.canRemove ? (
+            <Button
+              className="size-7"
+              disabled={!canRemove}
+              size="icon"
+              title="Remove queued message"
+              type="button"
+              variant="ghost"
+              onClick={onRemoveQueuedMessage}
+            >
+              {removePending ? (
+                <Loader2 className="animate-spin" />
+              ) : (
+                <Trash2 />
+              )}
+            </Button>
+          ) : null}
+          {delivery.canSteer ? (
+            <Button
+              className="h-7 px-2 text-xs"
+              disabled={!canSteer}
+              size="sm"
+              type="button"
+              variant="outline"
+              onClick={onSteerQueuedMessage}
+            >
+              {pending ? <Loader2 className="animate-spin" /> : <ArrowRight />}
+              Steer
+            </Button>
+          ) : null}
+        </div>
       ) : null}
     </div>
   )
@@ -888,6 +977,7 @@ function userDeliveryState(
     if (status === "failed") {
       return {
         badgeVariant: "destructive",
+        canRemove: false,
         canSteer: false,
         detail: error ? `Queue failed: ${error}` : "Queued message failed.",
         label: "failed",
@@ -897,6 +987,7 @@ function userDeliveryState(
     if (status === "running") {
       return {
         badgeVariant: "secondary",
+        canRemove: false,
         canSteer: false,
         detail: "Queued message is now running.",
         label: "running",
@@ -906,14 +997,26 @@ function userDeliveryState(
     if (status === "steered" || delivery === "steer") {
       return {
         badgeVariant: "secondary",
+        canRemove: false,
         canSteer: false,
         detail: "Steered into the active task.",
         label: "steered",
         queueId,
       }
     }
+    if (status === "cancelled") {
+      return {
+        badgeVariant: "secondary",
+        canRemove: false,
+        canSteer: false,
+        detail: "Removed from the queue.",
+        label: "removed",
+        queueId,
+      }
+    }
     return {
       badgeVariant: "outline",
+      canRemove: !!queueId,
       canSteer: !!queueId,
       detail: "Queued after the current task.",
       label: "queued",
@@ -924,6 +1027,7 @@ function userDeliveryState(
   if (delivery === "steer") {
     return {
       badgeVariant: "secondary",
+      canRemove: false,
       canSteer: false,
       detail: "Steered into the active task.",
       label: "steered",
@@ -989,8 +1093,6 @@ function TimelineContent({
           planActionDisabled={planActionDisabled}
           planActionPending={planActionPending}
         />
-      ) : message.status === "STREAMING" || message.status === "PENDING" ? (
-        <ProcessingDots />
       ) : null
     case "THINKING":
       return <ThinkingBlock message={message} />
@@ -1059,23 +1161,6 @@ function TimelineContent({
       return output.trim() ? <SystemText text={output} /> : null
     }
   }
-}
-
-function ProcessingDots() {
-  return (
-    <div
-      aria-label="Codex is thinking"
-      className="flex items-center gap-1 px-1 py-2"
-    >
-      {[0, 1, 2].map((index) => (
-        <span
-          className="size-1.5 animate-bounce rounded-full bg-muted-foreground"
-          key={index}
-          style={{ animationDelay: `${index * 120}ms` }}
-        />
-      ))}
-    </div>
-  )
 }
 
 function ThinkingBlock({ message }: { message: ChatMessageResponse }) {
@@ -1660,8 +1745,9 @@ function CommandBlock({
   const command = (metadata?.command ?? message.content.trim()) || "command"
   const output = commandOutput.output.trim()
   const outputLines = output ? output.split(/\r?\n/) : []
-  const [expanded, setExpanded] = useState(false)
-  const visibleOutputLines = expanded
+  const [detailsOpen, setDetailsOpen] = useState(isRunning)
+  const [outputExpanded, setOutputExpanded] = useState(false)
+  const visibleOutputLines = outputExpanded
     ? outputLines
     : outputLines.slice(0, COMMAND_OUTPUT_VISIBLE_LINES)
   const hiddenOutputLineCount = Math.max(
@@ -1669,32 +1755,30 @@ function CommandBlock({
     outputLines.length - visibleOutputLines.length,
   )
 
-  if (isRunning) {
-    return (
-      <div className="flex min-w-0 items-center gap-2 px-1 py-1 text-xs text-muted-foreground/80">
-        <Terminal className="size-3.5 shrink-0" />
-        <span className="shrink-0">Running</span>
-        <code className="min-w-0 truncate rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground/80">
-          {command}
-        </code>
-      </div>
-    )
-  }
+  useEffect(() => {
+    setDetailsOpen(isRunning)
+    setOutputExpanded(false)
+  }, [isRunning, message.id])
 
   return (
     <div className="min-w-0 max-w-full overflow-hidden py-1 text-sm">
-      <div className="flex min-w-0 items-start gap-2">
-        <span
+      <button
+        className="flex min-w-0 max-w-full items-start gap-2 text-left"
+        type="button"
+        onClick={() => setDetailsOpen((current) => !current)}
+      >
+        <ChevronDown
           className={cn(
-            "mt-2 size-1.5 shrink-0 rounded-full",
-            failed
-              ? "bg-destructive"
-              : isRunning
-                ? "animate-pulse bg-primary"
-                : "bg-muted-foreground/70",
+            "mt-0.5 size-3.5 shrink-0 text-muted-foreground transition-transform",
+            detailsOpen ? "rotate-0" : "-rotate-90",
           )}
         />
-        <div className="min-w-0 flex-1">
+        <CommandStatusIcon
+          exitCode={exitCode}
+          failed={failed}
+          isRunning={isRunning}
+        />
+        <div className="min-w-0 flex-1 overflow-hidden">
           <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
             <span className="shrink-0 font-medium">
               {commandActionLabel(message, resolvedMetadata)}
@@ -1707,14 +1791,11 @@ function CommandBlock({
                 {formatDurationCompact(durationMs)}
               </span>
             ) : null}
-            {typeof exitCode === "number" ? (
-              <Badge
-                variant={exitCode === 0 ? "secondary" : "destructive"}
-              >
-                {exitCode === 0 ? "ok" : exitCode}
-              </Badge>
-            ) : null}
           </div>
+        </div>
+      </button>
+      {detailsOpen ? (
+        <div className="min-w-0 pl-10">
           {metadata?.cwd ? (
             <div className="mt-1 truncate text-xs text-muted-foreground">
               {metadata.cwd}
@@ -1735,15 +1816,52 @@ function CommandBlock({
               size="sm"
               type="button"
               variant="ghost"
-              onClick={() => setExpanded(true)}
+              onClick={() => setOutputExpanded(true)}
             >
               Show {hiddenOutputLineCount} more{" "}
               {hiddenOutputLineCount === 1 ? "line" : "lines"}
             </Button>
           ) : null}
         </div>
-      </div>
+      ) : null}
     </div>
+  )
+}
+
+function CommandStatusIcon({
+  exitCode,
+  failed,
+  isRunning,
+}: {
+  exitCode?: number
+  failed: boolean
+  isRunning: boolean
+}) {
+  if (isRunning) {
+    return (
+      <Loader2
+        aria-label="Running"
+        className="mt-0.5 size-3.5 shrink-0 animate-spin text-muted-foreground"
+      />
+    )
+  }
+  if (failed) {
+    const label =
+      typeof exitCode === "number"
+        ? `Failed with exit code ${exitCode}`
+        : "Failed"
+    return (
+      <AlertTriangle
+        aria-label={label}
+        className="mt-0.5 size-3.5 shrink-0 text-destructive"
+      />
+    )
+  }
+  return (
+    <Check
+      aria-label="Completed"
+      className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+    />
   )
 }
 
@@ -1845,7 +1963,7 @@ function CompactActionRow({ message }: { message: ChatMessageResponse }) {
           </div>
         ) : null}
       </div>
-      <Badge variant="secondary">{message.status.toLowerCase()}</Badge>
+      <MessageStatusIcon status={message.status} />
     </div>
   )
 }
@@ -1865,11 +1983,46 @@ function ActionSummaryRow({
           `${messages.length} ${messages.length === 1 ? "tool call" : "tool calls"}`}
       </span>
       {status && status !== "COMPLETED" ? (
-        <Badge className="shrink-0" variant="secondary">
-          {status.toLowerCase()}
-        </Badge>
+        <MessageStatusIcon status={status} />
       ) : null}
     </div>
+  )
+}
+
+function MessageStatusIcon({
+  status,
+}: {
+  status: ChatMessageResponse["status"]
+}) {
+  if (status === "STREAMING" || status === "PENDING") {
+    return (
+      <Loader2
+        aria-label="Running"
+        className="size-3.5 shrink-0 animate-spin text-muted-foreground"
+      />
+    )
+  }
+  if (status === "FAILED") {
+    return (
+      <AlertTriangle
+        aria-label="Failed"
+        className="size-3.5 shrink-0 text-destructive"
+      />
+    )
+  }
+  if (status === "COMPLETED") {
+    return (
+      <Check
+        aria-label="Completed"
+        className="size-3.5 shrink-0 text-muted-foreground"
+      />
+    )
+  }
+  return (
+    <Clock
+      aria-label="Status"
+      className="size-3.5 shrink-0 text-muted-foreground"
+    />
   )
 }
 

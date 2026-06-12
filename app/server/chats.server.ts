@@ -181,6 +181,22 @@ async function syncThreadFromAccountBestEffort(
   })
 }
 
+async function hydrateThreadForAccountBestEffort(
+  threadId: string,
+  accountId: string | null | undefined,
+): Promise<boolean> {
+  if (!accountId) {
+    return false
+  }
+  return hydrateThreadForAccount(threadId, accountId).catch((error) => {
+    console.warn(
+      "Failed to hydrate Codex session history.",
+      error instanceof Error ? error.message : error,
+    )
+    return false
+  })
+}
+
 function scheduleAccountHistorySync(): void {
   void syncAccountCodexHistories().catch((error) => {
     console.warn(
@@ -424,8 +440,8 @@ export async function updateChat(
       : resolveDirectory(dto.workingDirectory)
 
   if (accountId && accountId !== chat.accountId) {
-    await syncThreadFromAccountOrThrow(threadId, chat.accountId)
-    await hydrateThreadForAccountOrThrow(threadId, accountId)
+    await syncThreadFromAccountBestEffort(threadId, chat.accountId)
+    await hydrateThreadForAccountBestEffort(threadId, accountId)
   }
 
   const preference = await upsertThreadPreference(threadId, {
@@ -484,6 +500,7 @@ export async function listMessages(
   } = {},
 ) {
   const chat = await getChat(threadId)
+  await syncThreadFromAccountBestEffort(threadId, chat.accountId)
   const afterSequence = Math.max(options.afterSequence ?? 0, 0)
   const beforeSequence = Math.max(options.beforeSequence ?? 0, 0)
   const safeLimit = Math.min(Math.max(options.limit ?? 50, 1), 200)
@@ -854,6 +871,44 @@ export async function steerQueuedMessage(
   })
   if (!updated) {
     throw new HttpError(410, "Queued message is no longer available.")
+  }
+
+  emit(threadId, "chat.updated", await getChat(threadId))
+  emit(threadId, "message.updated", updated)
+  return updated
+}
+
+export async function removeQueuedMessage(
+  threadId: string,
+  queueId: string,
+): Promise<ChatMessageResponse> {
+  await getChat(threadId)
+  const state = runtimeStates.get(threadId)
+  const queueIndex =
+    state?.queuedTurns.findIndex((turn) => turn.id === queueId) ?? -1
+  if (!state || queueIndex < 0) {
+    throw new HttpError(410, "Queued message is no longer pending.")
+  }
+
+  const [queuedTurn] = state.queuedTurns.splice(queueIndex, 1)
+  const cancelledAt = new Date()
+  const updated = updateRuntimeMessage(threadId, queuedTurn.messageId, {
+    completedAt: cancelledAt,
+    metadataPatch: {
+      cancelledAt: cancelledAt.toISOString(),
+      queueStatus: "cancelled",
+    },
+  })
+  if (!updated) {
+    throw new HttpError(410, "Queued message is no longer available.")
+  }
+
+  if (
+    state.queuedTurns.length &&
+    state.status !== "RUNNING" &&
+    state.status !== "QUEUED"
+  ) {
+    scheduleQueuedTurnFlush(threadId)
   }
 
   emit(threadId, "chat.updated", await getChat(threadId))
@@ -1579,7 +1634,7 @@ async function runCodexForThread(
   const usePrimedThread =
     state.primed && state.accountId === account.id && state.runtime === runtime
   if (!usePrimedThread) {
-    await hydrateThreadForAccountOrThrow(threadId, account.id)
+    await hydrateThreadForAccountBestEffort(threadId, account.id)
     runtime = runtimeForAccount(account)
   }
   state.permissionMode = permissionMode
@@ -2357,14 +2412,14 @@ async function resolveInFlightTurnId(
   runtime: Pick<CodexRuntimeSession, "request">,
   threadId: string,
 ): Promise<string | null> {
-  const attempts = 3
+  const attempts = 8
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const snapshot = await readThreadTurnStateSnapshot(runtime, threadId)
     if (snapshot.interruptibleTurnId) {
       return snapshot.interruptibleTurnId
     }
     if (snapshot.hasInterruptibleTurnWithoutId && attempt < attempts - 1) {
-      await new Promise((resolve) => setTimeout(resolve, 200))
+      await new Promise((resolve) => setTimeout(resolve, 250))
       continue
     }
     return null

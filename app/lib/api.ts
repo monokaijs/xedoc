@@ -539,6 +539,18 @@ export async function steerQueuedChatMessage(
   )
 }
 
+export async function removeQueuedChatMessage(
+  session: ApiSession,
+  chatId: string,
+  queueId: string,
+): Promise<ChatMessageResponse> {
+  return fetchJson<ChatMessageResponse>(
+    session.serverUrl,
+    `/api/chats/${chatId}/queued/${queueId}`,
+    { method: "DELETE", token: session.token },
+  )
+}
+
 export async function fetchJson<TResponse>(
   serverUrl: string,
   path: string,

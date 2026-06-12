@@ -48,6 +48,7 @@ import {
   getChatMessages,
   interruptChatRun,
   listCodexModels,
+  removeQueuedChatMessage,
   steerQueuedChatMessage,
   updateAccountRuntimeSettings,
   updateChat,
@@ -338,7 +339,9 @@ export function ChatDetailPane() {
     onError: (caught) => toast.error(readError(caught)),
     onSuccess: (chat, input) => {
       queryClient.setQueryData(["chat", chat.id], chat)
-      void queryClient.invalidateQueries({ queryKey: ["chats"] })
+      queryClient.setQueryData<ChatResponse[] | undefined>(["chats"], (chats) =>
+        chats?.map((entry) => (entry.id === chat.id ? chat : entry)),
+      )
       if (input.notify !== false) {
         toast.success("Chat account updated.")
       }
@@ -449,6 +452,27 @@ export function ChatDetailPane() {
       }
       const targetChatId = chatId
       return steerQueuedChatMessage(session, targetChatId, action.queueId).then(
+        (message) => ({ chatId: targetChatId, message }),
+      )
+    },
+    onError: (caught) => toast.error(readError(caught)),
+    onSuccess: ({ chatId: targetChatId, message }) => {
+      queryClient.setQueryData<MessagePageResponse | undefined>(
+        ["messages", targetChatId],
+        (page) => appendMessage(page, message),
+      )
+      void queryClient.invalidateQueries({ queryKey: ["chat", targetChatId] })
+      void queryClient.invalidateQueries({ queryKey: ["chats"] })
+    },
+  })
+
+  const removeQueuedMessageMutation = useMutation({
+    mutationFn: async (action: QueuedMessageAction) => {
+      if (!chatId) {
+        throw new Error("Chat is not available.")
+      }
+      const targetChatId = chatId
+      return removeQueuedChatMessage(session, targetChatId, action.queueId).then(
         (message) => ({ chatId: targetChatId, message }),
       )
     },
@@ -786,6 +810,9 @@ export function ChatDetailPane() {
                 hiddenMessageIds={hiddenTimelineMessageIds}
                 messages={messages}
                 onImplementPlan={implementPlan}
+                onRemoveQueuedMessage={(action) =>
+                  removeQueuedMessageMutation.mutate(action)
+                }
                 onRevisePlan={revisePlan}
                 onReviewFileChanges={reviewFileChanges}
                 onSteerQueuedMessage={(action) =>
@@ -795,10 +822,13 @@ export function ChatDetailPane() {
                 planActionDisabled={isRunning}
                 planActionPending={sendMutation.isPending}
                 queuedMessageActionDisabled={
-                  !isRunning || steerQueuedMessageMutation.isPending
+                  steerQueuedMessageMutation.isPending
                 }
                 queuedMessageActionPendingId={
                   steerQueuedMessageMutation.variables?.queueId ?? null
+                }
+                queuedMessageRemovePendingId={
+                  removeQueuedMessageMutation.variables?.queueId ?? null
                 }
                 session={session}
                 showProcessingTail={
@@ -836,10 +866,16 @@ export function ChatDetailPane() {
             <>
               <PinnedPlanTasksPanel message={pinnedPlanMessage} />
               <QueuedMessagesPanel
-                disabled={!isRunning || steerQueuedMessageMutation.isPending}
+                disabled={steerQueuedMessageMutation.isPending}
                 messages={pendingQueuedMessages}
                 pendingQueueId={
                   steerQueuedMessageMutation.variables?.queueId ?? null
+                }
+                pendingRemoveQueueId={
+                  removeQueuedMessageMutation.variables?.queueId ?? null
+                }
+                onRemoveQueuedMessage={(action) =>
+                  removeQueuedMessageMutation.mutate(action)
                 }
                 onSteerQueuedMessage={(action) =>
                   steerQueuedMessageMutation.mutate(action)
