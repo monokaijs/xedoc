@@ -1,6 +1,6 @@
 {
   "name": "xedoc-cli",
-  "version": "0.1.40",
+  "version": "0.1.41",
   "description": "Local web UI for Codex account, chat, execution, and workspace management.",
   "author": "Edward Nguyen <monokaijs@gmail.com>",
   "type": "module",
