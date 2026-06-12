@@ -150,7 +150,6 @@ type ThreadSnapshot = {
 
 const pendingServerRequests = new Map<string, PendingServerRequest>()
 const runtimeStates = new Map<string, RuntimeThreadState>()
-const accountRunLocks = new Map<string, Promise<void>>()
 const queueFlushLocks = new Map<string, Promise<void>>()
 const runProjectionQueues = new Map<string, Promise<void>>()
 const timelineMessageLocks = new Map<string, Promise<void>>()
@@ -426,7 +425,6 @@ export async function updateChat(
 
   if (accountId && accountId !== chat.accountId) {
     await syncThreadFromAccountOrThrow(threadId, chat.accountId)
-    codexRuntimeService.stopRuntime(accountId)
     await hydrateThreadForAccountOrThrow(threadId, accountId)
   }
 
@@ -781,7 +779,7 @@ async function cancelRuntimeRun(
     }
   }
 
-  if (state.accountId) {
+  if (state.accountId && !accountHasOtherActiveRuntimeState(state.accountId, threadId)) {
     codexRuntimeService.stopRuntime(state.accountId)
   }
   state.interruptRequested = false
@@ -1542,23 +1540,21 @@ async function runCodex(
   collaborationMode: CodexCollaborationMode,
   automaticTitleSeed: string | null,
 ): Promise<void> {
-  return withAccountRunLock(account.id, () =>
-    runCodexWithAccountLock(
-      threadId,
-      runId,
-      assistantMessageId,
-      account,
-      content,
-      metadata,
-      attachments,
-      workingDirectory,
-      collaborationMode,
-      automaticTitleSeed,
-    ),
+  return runCodexForThread(
+    threadId,
+    runId,
+    assistantMessageId,
+    account,
+    content,
+    metadata,
+    attachments,
+    workingDirectory,
+    collaborationMode,
+    automaticTitleSeed,
   )
 }
 
-async function runCodexWithAccountLock(
+async function runCodexForThread(
   threadId: string,
   runId: string,
   assistantMessageId: string,
@@ -1583,7 +1579,6 @@ async function runCodexWithAccountLock(
   const usePrimedThread =
     state.primed && state.accountId === account.id && state.runtime === runtime
   if (!usePrimedThread) {
-    codexRuntimeService.stopRuntime(account.id)
     await hydrateThreadForAccountOrThrow(threadId, account.id)
     runtime = runtimeForAccount(account)
   }
@@ -1952,7 +1947,6 @@ async function autoRotateChatAccountIfNeeded(
   }
   try {
     await syncThreadFromAccountOrThrow(chat.id, chat.accountId)
-    codexRuntimeService.stopRuntime(bestAccount.id)
     await hydrateThreadForAccountOrThrow(chat.id, bestAccount.id)
   } catch (error) {
     console.warn(
@@ -2173,26 +2167,19 @@ function automaticChatTitleSeed(
   return trimmed ? trimmed : null
 }
 
-function withAccountRunLock<T>(
+function accountHasOtherActiveRuntimeState(
   accountId: string,
-  operation: () => Promise<T>,
-): Promise<T> {
-  const previous = accountRunLocks.get(accountId) ?? Promise.resolve()
-  let release!: () => void
-  const current = new Promise<void>((resolve) => {
-    release = resolve
-  })
-  const next = previous.catch(() => undefined).then(() => current)
-  accountRunLocks.set(accountId, next)
-  return previous
-    .catch(() => undefined)
-    .then(operation)
-    .finally(() => {
-      release()
-      if (accountRunLocks.get(accountId) === next) {
-        accountRunLocks.delete(accountId)
-      }
-    })
+  currentThreadId: string,
+): boolean {
+  for (const state of runtimeStates.values()) {
+    if (state.threadId === currentThreadId || state.accountId !== accountId) {
+      continue
+    }
+    if (state.status === "RUNNING" || state.status === "QUEUED" || state.primed) {
+      return true
+    }
+  }
+  return false
 }
 
 function enqueueRunProjection(

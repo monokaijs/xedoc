@@ -58,7 +58,6 @@ export function NewChatPane() {
   const {
     accountRateLimitFetching,
     accountRateLimitSnapshots,
-    accountUsageSummaries,
     connectedAccounts,
     lastOpenedChat,
     openAccountManagement,
@@ -420,7 +419,7 @@ export function NewChatPane() {
                     connectedAccounts={connectedAccounts}
                     disabled={!connectedAccounts.length}
                     selectedAccountId={selectedConnectedAccount?.id ?? ""}
-                    usageSummaries={accountUsageSummaries}
+                    usageSnapshots={accountRateLimitSnapshots}
                     onAutoRotateChange={setAutoRotateAccount}
                     onSelect={(accountId) => {
                       setAutoRotateAccount(false)

@@ -3,6 +3,8 @@ import {
   SquarePen,
   Terminal as TerminalIcon,
   UserRound,
+  Volume2,
+  VolumeX,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
@@ -11,6 +13,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { useAgentSoundsPreference } from "@/lib/agent-sounds"
 import { cn } from "@/lib/utils"
 
 export function HeaderTerminalButton({
@@ -86,5 +89,22 @@ export function HeaderCreateMenu({
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
+  )
+}
+
+export function HeaderAgentSoundButton() {
+  const [enabled, setEnabled] = useAgentSoundsPreference()
+  return (
+    <Button
+      aria-label={enabled ? "Disable agent sounds" : "Enable agent sounds"}
+      aria-pressed={enabled}
+      size="icon"
+      title={enabled ? "Agent sounds on" : "Agent sounds off"}
+      type="button"
+      variant="ghost"
+      onClick={() => setEnabled(!enabled)}
+    >
+      {enabled ? <Volume2 className="size-4" /> : <VolumeX className="size-4" />}
+    </Button>
   )
 }

@@ -35,6 +35,7 @@ import { useTerminalConnection } from "@/hooks/use-terminal-connection"
 import { ChatSidebar } from "@/screens/components/chat-sidebar"
 import { GitStatusChip } from "@/screens/components/git-status"
 import {
+  HeaderAgentSoundButton,
   HeaderCreateMenu,
   HeaderTerminalButton,
 } from "@/screens/components/header-menu"
@@ -323,6 +324,7 @@ export function AppShell() {
                 }
                 onNewChat={() => navigate("/")}
               />
+              <HeaderAgentSoundButton />
               <ThemeSwitcher />
             </div>
           </header>

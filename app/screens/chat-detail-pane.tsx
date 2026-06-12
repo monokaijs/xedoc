@@ -57,6 +57,7 @@ import {
   highestSequence,
   mergeMessagePage,
 } from "@/lib/chat-events"
+import { playAgentSound } from "@/lib/agent-sounds"
 import { connectChatEventSocket } from "@/lib/socket"
 import { cn } from "@/lib/utils"
 import { useShellContext } from "@/screens/shell-context"
@@ -110,7 +111,6 @@ export function ChatDetailPane() {
     accounts,
     accountRateLimitFetching,
     accountRateLimitSnapshots,
-    accountUsageSummaries,
     connectedAccounts,
     openWorkspacePicker,
     session,
@@ -129,6 +129,8 @@ export function ChatDetailPane() {
   const scrollViewportRef = useRef<HTMLDivElement | null>(null)
   const imageInputRef = useRef<HTMLInputElement | null>(null)
   const stickToBottomRef = useRef(true)
+  const notifiedRunIdsRef = useRef(new Set<string>())
+  const notifiedRequestIdsRef = useRef(new Set<string>())
   const queryClient = useQueryClient()
   const chatQueryKey = useMemo(() => ["chat", chatId] as const, [chatId])
   const messagesQueryKey = useMemo(
@@ -139,6 +141,8 @@ export function ChatDetailPane() {
   useEffect(() => {
     setContextWindowUsage(null)
     setAttachments([])
+    notifiedRunIdsRef.current.clear()
+    notifiedRequestIdsRef.current.clear()
   }, [chatId])
 
   const chatQuery = useQuery({
@@ -593,6 +597,17 @@ export function ChatDetailPane() {
       type: TType,
       payload: ChatEventPayloads[TType],
     ) => {
+      if (type === "run.status") {
+        const runStatus = payload as ChatEventPayloads["run.status"]
+        if (
+          runStatus.status === "COMPLETED" &&
+          !notifiedRunIdsRef.current.has(runStatus.runId)
+        ) {
+          notifiedRunIdsRef.current.add(runStatus.runId)
+          playAgentSound("done")
+        }
+        return
+      }
       if (type === "chat.updated") {
         const previousChat =
           queryClient.getQueryData<ChatResponse>(chatQueryKey)
@@ -609,6 +624,17 @@ export function ChatDetailPane() {
       if (type === "context.updated") {
         setContextWindowUsage(payload as ContextWindowUsagePayload)
         return
+      }
+      if (type === "message.created" || type === "message.updated") {
+        const message = payload as ChatMessageResponse
+        const requestKey = message.requestId ?? message.id
+        if (
+          messageRequiresUserResponse(message) &&
+          !notifiedRequestIdsRef.current.has(requestKey)
+        ) {
+          notifiedRequestIdsRef.current.add(requestKey)
+          playAgentSound("question")
+        }
       }
       queryClient.setQueryData<MessagePageResponse | undefined>(
         messagesQueryKey,
@@ -906,7 +932,7 @@ export function ChatDetailPane() {
                         pending={updateAccountMutation.isPending}
                         selectedAccountId={chat?.accountId ?? ""}
                         selectionDisabled={!canSwitchAccount}
-                        usageSummaries={accountUsageSummaries}
+                        usageSnapshots={accountRateLimitSnapshots}
                         onAutoRotateChange={(autoRotateAccount) =>
                           updateRuntimeMutation.mutate({ autoRotateAccount })
                         }
@@ -1066,6 +1092,13 @@ export function ChatDetailPane() {
         </div>
       ) : null}
     </main>
+  )
+}
+
+function messageRequiresUserResponse(message: ChatMessageResponse): boolean {
+  return (
+    message.status === "PENDING" &&
+    (message.kind === "APPROVAL" || message.kind === "USER_INPUT_PROMPT")
   )
 }
 
