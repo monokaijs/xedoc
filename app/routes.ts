@@ -11,7 +11,6 @@ export default [
   layout("routes/app-layout.tsx", [
     index("routes/home.tsx"),
     route("chat/:chatId", "routes/chat.tsx"),
-    route("workflow", "routes/workflow.tsx"),
   ]),
   route("health", "routes/health.ts"),
   route("api/auth/status", "routes/api.auth.status.ts"),
@@ -64,11 +63,6 @@ export default [
   route(
     "api/chats/:chatId/server-requests/:requestId/respond",
     "routes/api.chats.$chatId.server-requests.$requestId.respond.ts",
-  ),
-  route("api/workflow/tasks", "routes/api.workflow.tasks.ts"),
-  route(
-    "api/workflow/tasks/:taskId",
-    "routes/api.workflow.tasks.$taskId.ts",
   ),
   route("api/workspaces/directories", "routes/api.workspaces.directories.ts"),
 ] satisfies RouteConfig

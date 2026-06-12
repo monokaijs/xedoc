@@ -17,7 +17,6 @@ import {
 } from "node:fs"
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve } from "node:path"
-import { fileURLToPath } from "node:url"
 import type {
   CodexEventHandler,
   CodexJsonRpcResponse,
@@ -671,68 +670,30 @@ function resolveHomePath(path: string): string {
 function ensureCodexHome(codexHome: string): void {
   mkdirSync(codexHome, { recursive: true, mode: 0o700 })
   chmodSync(codexHome, 0o700)
-  ensureWorkflowMcpConfig(codexHome)
+  removeLegacyWorkflowMcpConfig(codexHome)
   ensureLocalCodexChatStorage(codexHome)
 }
 
-function ensureWorkflowMcpConfig(codexHome: string): void {
-  const serverPath = resolveWorkflowMcpServerPath()
+function removeLegacyWorkflowMcpConfig(codexHome: string): void {
   const configPath = join(codexHome, "config.toml")
-  const block = workflowMcpConfigBlock(serverPath)
-  const current = pathExists(configPath)
-    ? readFileSync(configPath, "utf8")
-    : ""
-  if (current.includes(block)) {
+  if (!pathExists(configPath)) {
     return
   }
+
+  const current = readFileSync(configPath, "utf8")
+  const trimmedCurrent = current.replace(/\s+$/u, "")
   const cleaned = current
-    .replace(workflowMcpConfigRegex(), "")
+    .replace(legacyWorkflowMcpConfigRegex(), "")
     .replace(/\s+$/u, "")
-  const next = [cleaned, block].filter(Boolean).join("\n\n")
-  writeFileSync(configPath, `${next}\n`, { mode: 0o600 })
+  if (cleaned === trimmedCurrent) {
+    return
+  }
+
+  writeFileSync(configPath, cleaned ? `${cleaned}\n` : "", { mode: 0o600 })
 }
 
-function workflowMcpConfigBlock(serverPath: string): string {
-  const envEntries: Record<string, string> = {
-    DATABASE_URL: process.env.DATABASE_URL ?? "",
-    XEDOC_WORKFLOW_MCP: "1",
-  }
-  if (process.env.CODEX_WORKSPACE_ROOT?.trim()) {
-    envEntries.CODEX_WORKSPACE_ROOT = process.env.CODEX_WORKSPACE_ROOT.trim()
-  }
-  return [
-    "# xedoc workflow mcp start",
-    "[mcp_servers.xedoc_workflow]",
-    'type = "stdio"',
-    `command = ${tomlString(process.execPath)}`,
-    `args = [${tomlString(serverPath)}]`,
-    `env = { ${Object.entries(envEntries)
-      .map(([key, value]) => `${key} = ${tomlString(value)}`)
-      .join(", ")} }`,
-    "startup_timeout_ms = 20_000",
-    "tool_timeout_ms = 120_000",
-    "# xedoc workflow mcp end",
-  ].join("\n")
-}
-
-function workflowMcpConfigRegex(): RegExp {
+function legacyWorkflowMcpConfigRegex(): RegExp {
   return /(?:^|\n)# xedoc workflow mcp start[\s\S]*?# xedoc workflow mcp end\n?/u
-}
-
-function resolveWorkflowMcpServerPath(): string {
-  const configured = process.env.XEDOC_WORKFLOW_MCP_PATH?.trim()
-  if (configured) {
-    return resolve(configured)
-  }
-  const candidates = [
-    join(process.cwd(), "server", "workflow-mcp.mjs"),
-    join(dirname(fileURLToPath(import.meta.url)), "..", "..", "server", "workflow-mcp.mjs"),
-  ]
-  return candidates.find(pathExists) ?? candidates[0]
-}
-
-function tomlString(value: string): string {
-  return JSON.stringify(value)
 }
 
 function ensureLocalCodexChatStorage(codexHome: string): void {

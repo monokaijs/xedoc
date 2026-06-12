@@ -1,8 +1,8 @@
 import type { CodexRateLimitSnapshot } from "@/types"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { ClipboardList, Loader2, Menu, Settings, SquarePen } from "lucide-react"
+import { Loader2, Menu, Settings, SquarePen } from "lucide-react"
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { Navigate, Outlet, useLocation, useNavigate, useParams } from "react-router"
+import { Navigate, Outlet, useNavigate, useParams } from "react-router"
 import {
   ServerSettingsDialog,
   type ServerSettingsTab,
@@ -44,7 +44,6 @@ import type { ShellContext } from "@/screens/shell-context"
 export function AppShell() {
   const { loading, session } = useSession()
   const { chatId } = useParams()
-  const location = useLocation()
   const terminalConnection = useTerminalConnection(session)
   const [activeProjectPath, setActiveProjectPath] = useState("")
   const [lastOpenedChatId, setLastOpenedChatId] = useState<string | null>(null)
@@ -117,7 +116,6 @@ export function AppShell() {
     }
     return chats.find((chat) => chat.id === chatId) ?? null
   }, [chatId, chats])
-  const workflowActive = location.pathname.startsWith("/workflow")
   const activeChatTitle = activeChat?.title ?? null
   useEffect(() => {
     if (chatId) {
@@ -249,22 +247,6 @@ export function AppShell() {
             </Button>
           </SidebarHeader>
           <SidebarContent>
-              <SidebarGroup className="p-0">
-              <SidebarGroupLabel>Workflow</SidebarGroupLabel>
-              <SidebarGroupContent>
-                <Button
-                  className={cn(
-                    "w-full justify-start",
-                    workflowActive && "bg-sidebar-accent",
-                  )}
-                  variant="ghost"
-                  onClick={() => navigate("/workflow")}
-                >
-                  <ClipboardList />
-                  <span>Tasks</span>
-                </Button>
-              </SidebarGroupContent>
-            </SidebarGroup>
             <SidebarGroup className="p-0">
               <SidebarGroupLabel>Chats</SidebarGroupLabel>
               <SidebarGroupContent>
@@ -290,9 +272,7 @@ export function AppShell() {
                 <Menu />
               </SidebarTrigger>
               <h1 className="min-w-0 flex-1 truncate text-sm font-semibold tracking-normal">
-                {workflowActive
-                  ? "Workflow"
-                  : activeChatTitle ?? (chatId ? "Chat" : "New chat")}
+                {activeChatTitle ?? (chatId ? "Chat" : "New chat")}
               </h1>
             </div>
             <div className="flex shrink-0 items-center gap-1">

@@ -13,7 +13,6 @@ import type {
   CodexModelListResponse,
   CodexRateLimitsResponse,
   CreateWorkspaceDirectoryRequest,
-  CreateWorkflowTaskRequest,
   ExecuteChatRequest,
   ExecuteChatResponse,
   ImportAccountsRequest,
@@ -29,7 +28,6 @@ import type {
   ChatContextResponse,
   UpdateAccountRequest,
   UpdateChatRequest,
-  UpdateWorkflowTaskRequest,
   GitActionRequest,
   GitActionResponse,
   GitBranchesResponse,
@@ -38,7 +36,6 @@ import type {
   GitStatusResponse,
   WorkspaceDirectoryResponse,
   WorkspaceFileResponse,
-  WorkflowTaskResponse,
 } from "@/types"
 
 export interface ApiSession {
@@ -314,62 +311,6 @@ export async function listWorkspaceDirectory(
     session.serverUrl,
     `/api/workspaces/directories${query}`,
     { token: session.token },
-  )
-}
-
-export async function listWorkflowTasks(
-  session: ApiSession,
-  filters: {
-    projectPath?: string | null
-    status?: string | null
-  } = {},
-): Promise<WorkflowTaskResponse[]> {
-  const query = new URLSearchParams()
-  if (filters.projectPath) {
-    query.set("projectPath", filters.projectPath)
-  }
-  if (filters.status) {
-    query.set("status", filters.status)
-  }
-  const suffix = query.size ? `?${query.toString()}` : ""
-  return fetchJson<WorkflowTaskResponse[]>(
-    session.serverUrl,
-    `/api/workflow/tasks${suffix}`,
-    { token: session.token },
-  )
-}
-
-export async function createWorkflowTask(
-  session: ApiSession,
-  body: CreateWorkflowTaskRequest,
-): Promise<WorkflowTaskResponse> {
-  return fetchJson<WorkflowTaskResponse>(
-    session.serverUrl,
-    "/api/workflow/tasks",
-    { body, token: session.token },
-  )
-}
-
-export async function updateWorkflowTask(
-  session: ApiSession,
-  taskId: string,
-  body: UpdateWorkflowTaskRequest,
-): Promise<WorkflowTaskResponse> {
-  return fetchJson<WorkflowTaskResponse>(
-    session.serverUrl,
-    `/api/workflow/tasks/${taskId}`,
-    { body, method: "PATCH", token: session.token },
-  )
-}
-
-export async function deleteWorkflowTask(
-  session: ApiSession,
-  taskId: string,
-): Promise<WorkflowTaskResponse> {
-  return fetchJson<WorkflowTaskResponse>(
-    session.serverUrl,
-    `/api/workflow/tasks/${taskId}`,
-    { method: "DELETE", token: session.token },
   )
 }
 

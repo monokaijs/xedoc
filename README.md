@@ -2,7 +2,7 @@
 
 # xedoc
 
-**A local web workspace for running Codex across your projects, accounts, tasks, and file changes.**
+**A local web workspace for running Codex across your projects, accounts, chats, and file changes.**
 
 [![npm](https://img.shields.io/npm/v/xedoc-cli?color=0b7285)](https://www.npmjs.com/package/xedoc-cli)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-339933)](https://nodejs.org/)
@@ -15,7 +15,7 @@
 
 xedoc gives Codex a dedicated local control center in your browser. It keeps
 Codex running on your machine while adding account management, project-aware
-chats, live run tracking, workflow tasks, compact file-change status, and a
+chats, live run tracking, compact file-change status, and a
 cleaner interface for day-to-day development work.
 
 It is designed for people who use Codex often and want a reliable workspace
@@ -46,7 +46,7 @@ the workspace layer around that local runtime:
 | Use multiple Codex accounts | Account state is isolated and selectable per chat. |
 | Track long-running work | Live messages, tool activity, task progress, and queued messages. |
 | Review code edits clearly | Compact active-change status plus detailed timeline diffs. |
-| Keep implementation organized | Plan mode and workflow tasks stay near the chat. |
+| Keep implementation organized | Plan mode stays near the chat. |
 | Avoid silent account failures | Invalidated accounts are surfaced and marked for re-authentication. |
 
 ## Features
@@ -77,11 +77,10 @@ queued messages, and run status without losing the thread.
 While Codex is editing files, xedoc shows a compact change summary above the
 input. The full file-change details and diffs remain available in the timeline.
 
-### Plan Mode and Tasks
+### Plan Mode
 
 Use Plan mode when you want Codex to break work into steps before implementation.
-Active tasks can be collapsed above the input, and the workflow view helps keep
-project tasks organized.
+Active plan steps can be collapsed above the input while work is in progress.
 
 ### Local Terminal Dock
 
@@ -132,7 +131,7 @@ queue the next message so it is delivered when the active run completes.
 
 Use the compact panels above the input for current state:
 
-- Plan tasks show the current implementation checklist and can collapse.
+- Plan steps show the current implementation checklist and can collapse.
 - File changes stay compact while work is active.
 - Queued messages show what will be sent next.
 
