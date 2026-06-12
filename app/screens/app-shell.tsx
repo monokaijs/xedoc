@@ -402,7 +402,7 @@ function NewChatSplitButton({
   return (
     <div className="flex w-full min-w-0 items-center">
       <Button
-        className="min-w-0 flex-1 justify-start rounded-r-none"
+        className="min-w-0 flex-1 justify-start rounded-r-none border-sidebar-border"
         variant="ghost"
         onClick={() => onNewChat()}
       >
