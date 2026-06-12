@@ -39,6 +39,7 @@ import type {
 } from "@/components/timeline/chat-timeline"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { Sheet, SheetContent } from "@/components/ui/sheet"
 import { Textarea } from "@/components/ui/textarea"
 import {
   appendMessage,
@@ -80,7 +81,7 @@ import {
   PlanModeSelector,
   UsageCapacityPill,
 } from "@/screens/components/composer-controls"
-import { GitStatusChip } from "@/screens/components/git-status"
+import { GitPanel, GitStatusChip } from "@/screens/components/git-status"
 import { HeaderTerminalButton } from "@/screens/components/header-menu"
 import {
   appendMessages,
@@ -113,9 +114,11 @@ export function ChatDetailPane() {
     accountRateLimitFetching,
     accountRateLimitSnapshots,
     connectedAccounts,
+    gitOpen,
     openWorkspacePicker,
     session,
     setActiveProjectPath,
+    setGitOpen,
     setTerminalOpen,
     terminalCount,
     terminalOpen,
@@ -771,149 +774,318 @@ export function ChatDetailPane() {
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-sidebar">
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-b-xl bg-background">
-        <ScrollArea
-          className="min-h-0 min-w-0 flex-1 overflow-hidden"
-          viewportRef={scrollViewportRef}
-          viewportProps={{
-            className: "overflow-x-hidden",
-            onScroll: (event) => {
-              stickToBottomRef.current = isNearScrollBottom(event.currentTarget)
-            },
-          }}
-        >
-          <div className="mx-auto flex w-full min-w-0 max-w-3xl flex-col gap-5 overflow-hidden px-4 pb-12 pt-6">
-            {hasMoreMessagesBefore ? (
-              <div className="flex justify-center">
-                <Button
-                  disabled={olderMessagesPending}
-                  size="sm"
-                  variant="outline"
-                  onClick={loadEarlierMessages}
-                >
-                  {olderMessagesPending ? (
-                    <>
-                      <Loader2 className="size-3 animate-spin" />
-                      Loading
-                    </>
-                  ) : (
-                    "Load earlier"
-                  )}
-                </Button>
-              </div>
-            ) : null}
-            {messages.length ? (
-              <ChatTimeline
-                chatId={chatId}
-                fileChangeActionDisabled={isRunning}
-                fileChangeActionPending={sendMutation.isPending}
-                hiddenMessageIds={hiddenTimelineMessageIds}
-                messages={messages}
-                onImplementPlan={implementPlan}
-                onRemoveQueuedMessage={(action) =>
-                  removeQueuedMessageMutation.mutate(action)
-                }
-                onRevisePlan={revisePlan}
-                onReviewFileChanges={reviewFileChanges}
-                onSteerQueuedMessage={(action) =>
-                  steerQueuedMessageMutation.mutate(action)
-                }
-                onUndoFileChanges={undoFileChanges}
-                planActionDisabled={isRunning}
-                planActionPending={sendMutation.isPending}
-                queuedMessageActionDisabled={
-                  steerQueuedMessageMutation.isPending
-                }
-                queuedMessageActionPendingId={
-                  steerQueuedMessageMutation.variables?.queueId ?? null
-                }
-                queuedMessageRemovePendingId={
-                  removeQueuedMessageMutation.variables?.queueId ?? null
-                }
-                session={session}
-                showProcessingTail={
-                  isRunning && !stickyChatContext.pendingRequest
-                }
-              />
-            ) : (
-              <div className="py-20 text-center text-sm text-muted-foreground">
-                No messages yet.
-              </div>
-            )}
-          </div>
-        </ScrollArea>
-
+      <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
         <div
           className={cn(
-            "min-w-0 border-t bg-background",
-            terminalOpen && chat?.workingDirectory
-              ? "overflow-y-auto max-sm:max-h-[calc(100svh-3.5rem)]"
-              : "overflow-hidden",
+            "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-b-xl bg-background",
+            gitOpen && chat && "md:rounded-br-none",
           )}
         >
-          {terminalOpen && chat?.workingDirectory ? (
-            <div className="p-2">
-              <div className="mx-auto max-w-5xl">
-                <TerminalDock
-                  onClosePanel={() => setTerminalOpen(false)}
-                  projectPath={chat.workingDirectory}
-                  socket={terminalSocket}
-                  socketConnected={terminalSocketConnected}
+          <ScrollArea
+            className="min-h-0 min-w-0 flex-1 overflow-hidden"
+            viewportRef={scrollViewportRef}
+            viewportProps={{
+              className: "overflow-x-hidden",
+              onScroll: (event) => {
+                stickToBottomRef.current = isNearScrollBottom(
+                  event.currentTarget,
+                )
+              },
+            }}
+          >
+            <div className="mx-auto flex w-full min-w-0 max-w-3xl flex-col gap-5 overflow-hidden px-4 pb-12 pt-6">
+              {hasMoreMessagesBefore ? (
+                <div className="flex justify-center">
+                  <Button
+                    disabled={olderMessagesPending}
+                    size="sm"
+                    variant="outline"
+                    onClick={loadEarlierMessages}
+                  >
+                    {olderMessagesPending ? (
+                      <>
+                        <Loader2 className="size-3 animate-spin" />
+                        Loading
+                      </>
+                    ) : (
+                      "Load earlier"
+                    )}
+                  </Button>
+                </div>
+              ) : null}
+              {messages.length ? (
+                <ChatTimeline
+                  chatId={chatId}
+                  fileChangeActionDisabled={isRunning}
+                  fileChangeActionPending={sendMutation.isPending}
+                  hiddenMessageIds={hiddenTimelineMessageIds}
+                  messages={messages}
+                  onImplementPlan={implementPlan}
+                  onRemoveQueuedMessage={(action) =>
+                    removeQueuedMessageMutation.mutate(action)
+                  }
+                  onRevisePlan={revisePlan}
+                  onReviewFileChanges={reviewFileChanges}
+                  onSteerQueuedMessage={(action) =>
+                    steerQueuedMessageMutation.mutate(action)
+                  }
+                  onUndoFileChanges={undoFileChanges}
+                  planActionDisabled={isRunning}
+                  planActionPending={sendMutation.isPending}
+                  queuedMessageActionDisabled={
+                    steerQueuedMessageMutation.isPending
+                  }
+                  queuedMessageActionPendingId={
+                    steerQueuedMessageMutation.variables?.queueId ?? null
+                  }
+                  queuedMessageRemovePendingId={
+                    removeQueuedMessageMutation.variables?.queueId ?? null
+                  }
+                  session={session}
+                  showProcessingTail={
+                    isRunning && !stickyChatContext.pendingRequest
+                  }
                 />
-              </div>
+              ) : (
+                <div className="py-20 text-center text-sm text-muted-foreground">
+                  No messages yet.
+                </div>
+              )}
             </div>
-          ) : (
-            <>
-              <PinnedPlanTasksPanel message={pinnedPlanMessage} />
-              <QueuedMessagesPanel
-                disabled={steerQueuedMessageMutation.isPending}
-                messages={pendingQueuedMessages}
-                pendingQueueId={
-                  steerQueuedMessageMutation.variables?.queueId ?? null
-                }
-                pendingRemoveQueueId={
-                  removeQueuedMessageMutation.variables?.queueId ?? null
-                }
-                onRemoveQueuedMessage={(action) =>
-                  removeQueuedMessageMutation.mutate(action)
-                }
-                onSteerQueuedMessage={(action) =>
-                  steerQueuedMessageMutation.mutate(action)
-                }
-              />
-              <ActiveFileChangesPanel messages={activeFileChangeMessages} />
-              <ChatComposerContextPanel
-                chatId={chatId}
-                messages={messages}
-                session={session}
-              />
+          </ScrollArea>
+
+          <div
+            className={cn(
+              "min-w-0 border-t bg-background",
+              terminalOpen && chat?.workingDirectory
+                ? "overflow-y-auto max-sm:max-h-[calc(100svh-3.5rem)]"
+                : "overflow-hidden",
+            )}
+          >
+            {terminalOpen && chat?.workingDirectory ? (
               <div className="p-2">
-                <div className="mx-auto grid min-w-0 max-w-3xl gap-2 overflow-hidden rounded-xl border bg-background p-2 shadow-sm">
-                  <div className="relative min-w-0">
-                    <ChatInputPlanModeBadge
-                      visible={
-                        (chat?.collaborationMode ?? "default") === "plan"
+                <div className="mx-auto max-w-5xl">
+                  <TerminalDock
+                    onClosePanel={() => setTerminalOpen(false)}
+                    projectPath={chat.workingDirectory}
+                    socket={terminalSocket}
+                    socketConnected={terminalSocketConnected}
+                  />
+                </div>
+              </div>
+            ) : (
+              <>
+                <PinnedPlanTasksPanel message={pinnedPlanMessage} />
+                <QueuedMessagesPanel
+                  disabled={steerQueuedMessageMutation.isPending}
+                  messages={pendingQueuedMessages}
+                  pendingQueueId={
+                    steerQueuedMessageMutation.variables?.queueId ?? null
+                  }
+                  pendingRemoveQueueId={
+                    removeQueuedMessageMutation.variables?.queueId ?? null
+                  }
+                  onRemoveQueuedMessage={(action) =>
+                    removeQueuedMessageMutation.mutate(action)
+                  }
+                  onSteerQueuedMessage={(action) =>
+                    steerQueuedMessageMutation.mutate(action)
+                  }
+                />
+                <ActiveFileChangesPanel messages={activeFileChangeMessages} />
+                <ChatComposerContextPanel
+                  chatId={chatId}
+                  messages={messages}
+                  session={session}
+                />
+                <div className="p-2">
+                  <div className="mx-auto grid min-w-0 max-w-3xl gap-2 overflow-hidden rounded-xl border bg-background p-2 shadow-sm">
+                    <div className="relative min-w-0">
+                      <ChatInputPlanModeBadge
+                        visible={
+                          (chat?.collaborationMode ?? "default") === "plan"
+                        }
+                      />
+                      <Textarea
+                        className={cn(
+                          "max-h-32 min-h-12 bg-transparent! text-xs resize-none border-0 px-1 shadow-none focus-visible:ring-0",
+                          (chat?.collaborationMode ?? "default") === "plan" &&
+                            "pr-24",
+                        )}
+                        placeholder={
+                          !chat?.workingDirectory
+                            ? "Choose a directory first"
+                            : account
+                              ? "Message Codex"
+                              : "Choose an account first"
+                        }
+                        value={content}
+                        onChange={(event) => setContent(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" && !event.shiftKey) {
+                            event.preventDefault()
+                            if (composerCanSend) {
+                              sendMutation.mutate({
+                                attachments:
+                                  composerAttachmentsToRequest(attachments),
+                                clearComposer: true,
+                                delivery: isRunning ? "queue" : undefined,
+                              })
+                            }
+                          }
+                        }}
+                        onPaste={(event) => {
+                          const files = imageFilesFromClipboard(
+                            event.clipboardData,
+                          )
+                          if (files.length) {
+                            attachImages(files)
+                          }
+                        }}
+                      />
+                    </div>
+                    <AttachmentTray
+                      attachments={attachments}
+                      imageInputRef={imageInputRef}
+                      onAttachImages={attachImages}
+                      onRemove={(id) =>
+                        setAttachments((current) =>
+                          current.filter((attachment) => attachment.id !== id),
+                        )
                       }
                     />
-                    <Textarea
-                      className={cn(
-                        "max-h-32 min-h-12 bg-transparent! text-xs resize-none border-0 px-1 shadow-none focus-visible:ring-0",
-                        (chat?.collaborationMode ?? "default") === "plan" &&
-                          "pr-24",
-                      )}
-                      placeholder={
-                        !chat?.workingDirectory
-                          ? "Choose a directory first"
-                          : account
-                            ? "Message Codex"
-                            : "Choose an account first"
-                      }
-                      value={content}
-                      onChange={(event) => setContent(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" && !event.shiftKey) {
-                          event.preventDefault()
-                          if (composerCanSend) {
+                    <div className="flex items-center justify-between gap-1 sm:gap-2">
+                      <div className="flex min-w-0 flex-1 flex-nowrap items-center gap-1 overflow-hidden sm:flex-wrap">
+                        <PlanModeSelector
+                          attachmentDisabled={sendMutation.isPending}
+                          disabled={!chat}
+                          modeDisabled={isRunning}
+                          mode={chat?.collaborationMode ?? "default"}
+                          onAttachFile={attachWorkspaceFile}
+                          onAttachImage={() => imageInputRef.current?.click()}
+                          pending={updateRuntimeMutation.isPending}
+                          onSelectMode={(collaborationMode) =>
+                            updateRuntimeMutation.mutate({ collaborationMode })
+                          }
+                        />
+                        <CodexAccountSelector
+                          account={account}
+                          autoRotate={chat?.autoRotateAccount ?? false}
+                          autoRotateDisabled={
+                            !chat || isRunning || updateRuntimeMutation.isPending
+                          }
+                          connectedAccounts={connectedAccounts}
+                          disabled={!chat || !connectedAccounts.length}
+                          pending={updateAccountMutation.isPending}
+                          selectedAccountId={chat?.accountId ?? ""}
+                          selectionDisabled={!canSwitchAccount}
+                          usageSnapshots={accountRateLimitSnapshots}
+                          onAutoRotateChange={(autoRotateAccount) =>
+                            updateRuntimeMutation.mutate({ autoRotateAccount })
+                          }
+                          onSelect={(accountId) =>
+                            updateAccountMutation.mutate({ accountId })
+                          }
+                        />
+                        <ChatRuntimeSelector
+                          activeReasoningEffort={activeReasoningEffort}
+                          disabled={!chat || isRunning || !account}
+                          modelOptions={modelOptions}
+                          modelValue={chat?.model ?? ""}
+                          pending={
+                            modelsQuery.isFetching ||
+                            updateRuntimeMutation.isPending
+                          }
+                          reasoningOptions={reasoningOptions}
+                          reasoningValue={chat?.reasoningEffort ?? ""}
+                          selectedModel={selectedModel}
+                          serviceTierOptions={serviceTierOptions}
+                          serviceTierValue={chat?.serviceTier ?? ""}
+                          onSelectModel={(model) => {
+                            if (chat?.accountId) {
+                              updateAccountDefaultsMutation.mutate({
+                                accountId: chat.accountId,
+                                settings: {
+                                  defaultModel: model || null,
+                                  defaultReasoningEffort: null,
+                                  defaultServiceTier: null,
+                                },
+                              })
+                            }
+                            updateRuntimeMutation.mutate({
+                              model: model || null,
+                              reasoningEffort: null,
+                              serviceTier: null,
+                            })
+                          }}
+                          onSelectReasoning={(reasoningEffort) => {
+                            const nextReasoningEffort = reasoningEffort
+                              ? (reasoningEffort as CodexReasoningEffort)
+                              : null
+                            if (chat?.accountId) {
+                              updateAccountDefaultsMutation.mutate({
+                                accountId: chat.accountId,
+                                settings: {
+                                  defaultModel: chat.model ?? null,
+                                  defaultReasoningEffort: nextReasoningEffort,
+                                  defaultServiceTier: chat.serviceTier ?? null,
+                                },
+                              })
+                            }
+                            updateRuntimeMutation.mutate({
+                              reasoningEffort: nextReasoningEffort,
+                            })
+                          }}
+                          onSelectServiceTier={(serviceTier) => {
+                            const nextServiceTier = serviceTier
+                              ? (serviceTier as CodexServiceTier)
+                              : null
+                            if (chat?.accountId) {
+                              updateAccountDefaultsMutation.mutate({
+                                accountId: chat.accountId,
+                                settings: {
+                                  defaultModel: chat.model ?? null,
+                                  defaultReasoningEffort:
+                                    chat.reasoningEffort ?? null,
+                                  defaultServiceTier: nextServiceTier,
+                                },
+                              })
+                            }
+                            updateRuntimeMutation.mutate({
+                              serviceTier: nextServiceTier,
+                            })
+                          }}
+                        />
+                        <PermissionModeSelector
+                          disabled={!chat}
+                          mode={chat?.permissionMode ?? "default"}
+                          pending={updateRuntimeMutation.isPending}
+                          onSelectMode={(permissionMode) => {
+                            if (chat?.accountId) {
+                              updateAccountDefaultsMutation.mutate({
+                                accountId: chat.accountId,
+                                settings: {
+                                  defaultPermissionMode: permissionMode,
+                                },
+                              })
+                            }
+                            updateRuntimeMutation.mutate({ permissionMode })
+                          }}
+                        />
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1 sm:gap-2">
+                        <ContextWindowPill usage={contextWindowUsage} />
+                        <UsageCapacityPill
+                          pending={rateLimitPending}
+                          snapshot={rateLimitSnapshot}
+                        />
+                        <ComposerActionButton
+                          loading={sendMutation.isPending}
+                          running={isRunning}
+                          hasDraft={composerHasDraft}
+                          sendDisabled={!composerCanSend}
+                          stopPending={interruptMutation.isPending}
+                          onSend={() =>
                             sendMutation.mutate({
                               attachments:
                                 composerAttachmentsToRequest(attachments),
@@ -921,190 +1093,55 @@ export function ChatDetailPane() {
                               delivery: isRunning ? "queue" : undefined,
                             })
                           }
-                        }
-                      }}
-                      onPaste={(event) => {
-                        const files = imageFilesFromClipboard(
-                          event.clipboardData,
-                        )
-                        if (files.length) {
-                          attachImages(files)
-                        }
-                      }}
-                    />
-                  </div>
-                  <AttachmentTray
-                    attachments={attachments}
-                    imageInputRef={imageInputRef}
-                    onAttachImages={attachImages}
-                    onRemove={(id) =>
-                      setAttachments((current) =>
-                        current.filter((attachment) => attachment.id !== id),
-                      )
-                    }
-                  />
-                  <div className="flex items-center justify-between gap-1 sm:gap-2">
-                    <div className="flex min-w-0 flex-1 flex-nowrap items-center gap-1 overflow-hidden sm:flex-wrap">
-                      <PlanModeSelector
-                        attachmentDisabled={sendMutation.isPending}
-                        disabled={!chat}
-                        modeDisabled={isRunning}
-                        mode={chat?.collaborationMode ?? "default"}
-                        onAttachFile={attachWorkspaceFile}
-                        onAttachImage={() => imageInputRef.current?.click()}
-                        pending={updateRuntimeMutation.isPending}
-                        onSelectMode={(collaborationMode) =>
-                          updateRuntimeMutation.mutate({ collaborationMode })
-                        }
-                      />
-                      <CodexAccountSelector
-                        account={account}
-                        autoRotate={chat?.autoRotateAccount ?? false}
-                        autoRotateDisabled={
-                          !chat || isRunning || updateRuntimeMutation.isPending
-                        }
-                        connectedAccounts={connectedAccounts}
-                        disabled={!chat || !connectedAccounts.length}
-                        pending={updateAccountMutation.isPending}
-                        selectedAccountId={chat?.accountId ?? ""}
-                        selectionDisabled={!canSwitchAccount}
-                        usageSnapshots={accountRateLimitSnapshots}
-                        onAutoRotateChange={(autoRotateAccount) =>
-                          updateRuntimeMutation.mutate({ autoRotateAccount })
-                        }
-                        onSelect={(accountId) =>
-                          updateAccountMutation.mutate({ accountId })
-                        }
-                      />
-                      <ChatRuntimeSelector
-                        activeReasoningEffort={activeReasoningEffort}
-                        disabled={!chat || isRunning || !account}
-                        modelOptions={modelOptions}
-                        modelValue={chat?.model ?? ""}
-                        pending={
-                          modelsQuery.isFetching ||
-                          updateRuntimeMutation.isPending
-                        }
-                        reasoningOptions={reasoningOptions}
-                        reasoningValue={chat?.reasoningEffort ?? ""}
-                        selectedModel={selectedModel}
-                        serviceTierOptions={serviceTierOptions}
-                        serviceTierValue={chat?.serviceTier ?? ""}
-                        onSelectModel={(model) => {
-                          if (chat?.accountId) {
-                            updateAccountDefaultsMutation.mutate({
-                              accountId: chat.accountId,
-                              settings: {
-                                defaultModel: model || null,
-                                defaultReasoningEffort: null,
-                                defaultServiceTier: null,
-                              },
+                          steerDisabled={
+                            !isRunning ||
+                            sendMutation.isPending ||
+                            !composerCanSend
+                          }
+                          onSteer={() =>
+                            sendMutation.mutate({
+                              attachments:
+                                composerAttachmentsToRequest(attachments),
+                              clearComposer: true,
+                              delivery: "steer",
                             })
                           }
-                          updateRuntimeMutation.mutate({
-                            model: model || null,
-                            reasoningEffort: null,
-                            serviceTier: null,
-                          })
-                        }}
-                        onSelectReasoning={(reasoningEffort) => {
-                          const nextReasoningEffort = reasoningEffort
-                            ? (reasoningEffort as CodexReasoningEffort)
-                            : null
-                          if (chat?.accountId) {
-                            updateAccountDefaultsMutation.mutate({
-                              accountId: chat.accountId,
-                              settings: {
-                                defaultModel: chat.model ?? null,
-                                defaultReasoningEffort: nextReasoningEffort,
-                                defaultServiceTier: chat.serviceTier ?? null,
-                              },
-                            })
-                          }
-                          updateRuntimeMutation.mutate({
-                            reasoningEffort: nextReasoningEffort,
-                          })
-                        }}
-                        onSelectServiceTier={(serviceTier) => {
-                          const nextServiceTier = serviceTier
-                            ? (serviceTier as CodexServiceTier)
-                            : null
-                          if (chat?.accountId) {
-                            updateAccountDefaultsMutation.mutate({
-                              accountId: chat.accountId,
-                              settings: {
-                                defaultModel: chat.model ?? null,
-                                defaultReasoningEffort:
-                                  chat.reasoningEffort ?? null,
-                                defaultServiceTier: nextServiceTier,
-                              },
-                            })
-                          }
-                          updateRuntimeMutation.mutate({
-                            serviceTier: nextServiceTier,
-                          })
-                        }}
-                      />
-                      <PermissionModeSelector
-                        disabled={!chat}
-                        mode={chat?.permissionMode ?? "default"}
-                        pending={updateRuntimeMutation.isPending}
-                        onSelectMode={(permissionMode) => {
-                          if (chat?.accountId) {
-                            updateAccountDefaultsMutation.mutate({
-                              accountId: chat.accountId,
-                              settings: {
-                                defaultPermissionMode: permissionMode,
-                              },
-                            })
-                          }
-                          updateRuntimeMutation.mutate({ permissionMode })
-                        }}
-                      />
-                    </div>
-                    <div className="flex shrink-0 items-center gap-1 sm:gap-2">
-                      <ContextWindowPill usage={contextWindowUsage} />
-                      <UsageCapacityPill
-                        pending={rateLimitPending}
-                        snapshot={rateLimitSnapshot}
-                      />
-                      <ComposerActionButton
-                        loading={sendMutation.isPending}
-                        running={isRunning}
-                        hasDraft={composerHasDraft}
-                        sendDisabled={!composerCanSend}
-                        stopPending={interruptMutation.isPending}
-                        onSend={() =>
-                          sendMutation.mutate({
-                            attachments:
-                              composerAttachmentsToRequest(attachments),
-                            clearComposer: true,
-                            delivery: isRunning ? "queue" : undefined,
-                          })
-                        }
-                        steerDisabled={
-                          !isRunning ||
-                          sendMutation.isPending ||
-                          !composerCanSend
-                        }
-                        onSteer={() =>
-                          sendMutation.mutate({
-                            attachments:
-                              composerAttachmentsToRequest(attachments),
-                            clearComposer: true,
-                            delivery: "steer",
-                          })
-                        }
-                        onStop={() => interruptMutation.mutate()}
-                      />
+                          onStop={() => interruptMutation.mutate()}
+                        />
+                      </div>
                     </div>
                   </div>
                 </div>
-              </div>
-            </>
-          )}
+              </>
+            )}
+          </div>
         </div>
+        {chat && gitOpen ? (
+          <aside className="hidden min-h-0 w-[min(42rem,42vw)] min-w-80 shrink-0 border-l bg-background md:flex">
+            <GitPanel
+              chatId={chat.id}
+              disabled={isRunning}
+              session={session}
+              onClose={() => setGitOpen(false)}
+            />
+          </aside>
+        ) : null}
       </div>
+      {chat ? (
+        <Sheet open={gitOpen} onOpenChange={setGitOpen}>
+          <SheetContent
+            className="w-[min(100vw,46rem)] max-w-none gap-0 p-0 md:hidden [&>button]:hidden"
+            side="right"
+          >
+            <GitPanel
+              chatId={chat.id}
+              disabled={isRunning}
+              session={session}
+              onClose={() => setGitOpen(false)}
+            />
+          </SheetContent>
+        </Sheet>
+      ) : null}
       {chat ? (
         <div className="hidden min-h-9 shrink-0 items-center justify-end gap-1 bg-sidebar px-3 py-1 md:-mb-2 md:flex">
           <HeaderTerminalButton
@@ -1120,9 +1157,10 @@ export function ChatDetailPane() {
             onToggle={() => setTerminalOpen(!terminalOpen)}
           />
           <GitStatusChip
+            active={gitOpen}
             chatId={chat.id}
             className="text-sidebar-foreground/75 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground aria-expanded:bg-sidebar-accent aria-expanded:text-sidebar-accent-foreground"
-            disabled={isRunning}
+            onToggle={() => setGitOpen(!gitOpen)}
             session={session}
           />
         </div>

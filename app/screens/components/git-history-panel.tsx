@@ -34,7 +34,7 @@ export function GitHistoryPanel({
     )
   }
   return (
-    <ScrollArea className="min-h-0">
+    <ScrollArea className="h-full min-h-0">
       <div className="grid gap-1 p-2">
         {commits.map((commit) => (
           <button

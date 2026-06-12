@@ -1,6 +1,13 @@
-import type { CodexRateLimitSnapshot } from "@/types"
+import type { ChatResponse, CodexRateLimitSnapshot } from "@/types"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { Loader2, Menu, Settings, SquarePen } from "lucide-react"
+import {
+  ChevronDown,
+  Folder,
+  Loader2,
+  Menu,
+  Settings,
+  SquarePen,
+} from "lucide-react"
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { Navigate, Outlet, useNavigate, useParams } from "react-router"
 import {
@@ -9,6 +16,12 @@ import {
 } from "@/components/server-settings-dialog"
 import { ThemeSwitcher } from "@/components/theme-switcher"
 import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   Sidebar,
   SidebarContent,
@@ -40,6 +53,13 @@ import {
   HeaderTerminalButton,
 } from "@/screens/components/header-menu"
 import type { ShellContext } from "@/screens/shell-context"
+import {
+  chatFolderName,
+  chatFolderPath,
+  isConcreteFolderPath,
+} from "@/screens/chat-runtime-utils"
+
+const RECENT_FOLDER_LIMIT = 8
 
 export function AppShell() {
   const { loading, session } = useSession()
@@ -51,6 +71,7 @@ export function AppShell() {
   const [serverSettingsOpen, setServerSettingsOpen] = useState(false)
   const [serverSettingsTab, setServerSettingsTab] =
     useState<ServerSettingsTab>("accounts")
+  const [gitOpen, setGitOpen] = useState(false)
   const [terminalOpen, setTerminalOpen] = useState(false)
   const [workspacePicker, setWorkspacePicker] = useState<{
     initialPath?: string | null
@@ -110,6 +131,7 @@ export function AppShell() {
 
   const accounts = useMemo(() => accountsQuery.data ?? [], [accountsQuery.data])
   const chats = useMemo(() => chatsQuery.data ?? [], [chatsQuery.data])
+  const recentFolders = useMemo(() => recentChatFolders(chats), [chats])
   const activeChat = useMemo(() => {
     if (!chatId) {
       return null
@@ -204,6 +226,12 @@ export function AppShell() {
     }
   }, [activeProjectPath])
 
+  useEffect(() => {
+    if (!activeChat) {
+      setGitOpen(false)
+    }
+  }, [activeChat])
+
   if (loading) {
     return <FullScreenLoader />
   }
@@ -220,11 +248,13 @@ export function AppShell() {
     activeProjectPath,
     chats,
     connectedAccounts,
+    gitOpen,
     lastOpenedChat,
     openAccountManagement,
     openWorkspacePicker: setWorkspacePicker,
     session,
     setActiveProjectPath,
+    setGitOpen,
     setTerminalOpen,
     terminalCount: terminalConnection.count,
     terminalOpen,
@@ -237,14 +267,17 @@ export function AppShell() {
       <SidebarProvider className="h-svh min-h-0 overflow-hidden">
         <Sidebar collapsible="offcanvas" variant="inset">
           <SidebarHeader>
-            <Button
-              className="w-full justify-start"
-              variant="ghost"
-              onClick={() => navigate("/")}
-            >
-              <SquarePen />
-              <span>New chat</span>
-            </Button>
+            <NewChatSplitButton
+              folders={recentFolders}
+              onNewChat={(workingDirectory) =>
+                navigate(
+                  "/",
+                  workingDirectory
+                    ? { state: { workingDirectory } }
+                    : undefined,
+                )
+              }
+            />
           </SidebarHeader>
           <SidebarContent>
             <SidebarGroup className="p-0">
@@ -290,10 +323,11 @@ export function AppShell() {
                     onToggle={() => setTerminalOpen(!terminalOpen)}
                   />
                   <GitStatusChip
+                    active={gitOpen}
                     chatId={activeChat.id}
                     className="md:hidden"
                     compact
-                    disabled={activeChat.status === "RUNNING"}
+                    onToggle={() => setGitOpen(!gitOpen)}
                     session={session}
                   />
                 </>
@@ -350,6 +384,96 @@ export function AppShell() {
         />
       ) : null}
     </>
+  )
+}
+
+type RecentChatFolder = {
+  name: string
+  path: string
+}
+
+function NewChatSplitButton({
+  folders,
+  onNewChat,
+}: {
+  folders: RecentChatFolder[]
+  onNewChat: (workingDirectory?: string) => void
+}) {
+  return (
+    <div className="flex w-full min-w-0 items-center">
+      <Button
+        className="min-w-0 flex-1 justify-start rounded-r-none"
+        variant="ghost"
+        onClick={() => onNewChat()}
+      >
+        <SquarePen />
+        <span className="min-w-0 truncate">New chat</span>
+      </Button>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button
+              aria-label="New chat in recent folder"
+              className="w-8 shrink-0 rounded-l-none border-l border-sidebar-border px-0"
+              size="icon-sm"
+              variant="ghost"
+            />
+          }
+        >
+          <ChevronDown className="size-4" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-64">
+          <div className="px-1.5 py-1 text-xs font-medium text-muted-foreground">
+            Recent folders
+          </div>
+          {folders.length ? (
+            folders.map((folder) => (
+              <DropdownMenuItem
+                className="min-w-0"
+                key={folder.path}
+                title={folder.path}
+                onClick={() => onNewChat(folder.path)}
+              >
+                <Folder className="size-4" />
+                <span className="min-w-0 flex-1 truncate">{folder.name}</span>
+              </DropdownMenuItem>
+            ))
+          ) : (
+            <div className="px-1.5 py-2 text-xs text-muted-foreground">
+              No recent folders.
+            </div>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  )
+}
+
+function recentChatFolders(chats: ChatResponse[]): RecentChatFolder[] {
+  const folders: RecentChatFolder[] = []
+  const seen = new Set<string>()
+  for (const chat of [...chats].sort(compareChatsByCreated)) {
+    const path = chatFolderPath(chat.workingDirectory)
+    if (!isConcreteFolderPath(path) || seen.has(path)) {
+      continue
+    }
+    seen.add(path)
+    folders.push({
+      name: chatFolderName(path),
+      path,
+    })
+    if (folders.length >= RECENT_FOLDER_LIMIT) {
+      break
+    }
+  }
+  return folders
+}
+
+function compareChatsByCreated(left: ChatResponse, right: ChatResponse) {
+  return (
+    new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() ||
+    left.title.localeCompare(right.title, undefined, { sensitivity: "base" }) ||
+    left.id.localeCompare(right.id)
   )
 }
 

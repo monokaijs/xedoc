@@ -10,7 +10,7 @@ import {
   Pencil,
   Plus,
 } from "lucide-react"
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useNavigate, useParams } from "react-router"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
@@ -47,6 +47,9 @@ import {
 } from "@/screens/chat-runtime-utils"
 
 const CHAT_GROUP_VISIBLE_LIMIT = 4
+const CHAT_LIST_PAGE_SIZE = 50
+
+type ChatSidebarTab = "list" | "folders"
 
 type ChatSidebarItem = {
   chat: ChatResponse
@@ -78,6 +81,10 @@ export function ChatSidebar({
   const [renameTarget, setRenameTarget] = useState<ChatResponse | null>(null)
   const [renameTitle, setRenameTitle] = useState("")
   const [archiveTarget, setArchiveTarget] = useState<ChatResponse | null>(null)
+  const [activeTab, setActiveTab] = useState<ChatSidebarTab>("list")
+  const [visibleListCount, setVisibleListCount] =
+    useState(CHAT_LIST_PAGE_SIZE)
+  const loadMoreRef = useRef<HTMLLIElement | null>(null)
   const [collapsedFolderKeys, setCollapsedFolderKeys] = useState<Set<string>>(
     () => new Set(),
   )
@@ -85,13 +92,34 @@ export function ChatSidebar({
     () => new Set(),
   )
 
-  const orderedChats = useMemo(
+  const listOrderedChats = useMemo(
+    () => [...chats].sort(compareChatsByCreated),
+    [chats],
+  )
+  const listChatItems = useMemo(
+    () =>
+      listOrderedChats.map((chat, index) => ({
+        chat,
+        dateLabel: formatChatListDate(chat.createdAt),
+        folderKey: chatFolderKey(chat.workingDirectory),
+        folderName: chatFolderName(chat.workingDirectory),
+        folderPath: chatFolderPath(chat.workingDirectory),
+        order: index,
+      })),
+    [listOrderedChats],
+  )
+  const visibleListItems = useMemo(
+    () => listChatItems.slice(0, visibleListCount),
+    [listChatItems, visibleListCount],
+  )
+  const hasMoreListItems = visibleListItems.length < listChatItems.length
+  const folderOrderedChats = useMemo(
     () => [...chats].sort(compareChatsByActivity),
     [chats],
   )
-  const chatItems = useMemo(
+  const folderChatItems = useMemo(
     () =>
-      orderedChats.map((chat, index) => ({
+      folderOrderedChats.map((chat, index) => ({
         chat,
         dateLabel: formatChatListDate(chat.lastSentAt),
         folderKey: chatFolderKey(chat.workingDirectory),
@@ -99,11 +127,11 @@ export function ChatSidebar({
         folderPath: chatFolderPath(chat.workingDirectory),
         order: index,
       })),
-    [orderedChats],
+    [folderOrderedChats],
   )
   const chatGroups = useMemo<ChatSidebarGroup[]>(() => {
     const groups = new Map<string, ChatSidebarGroup>()
-    for (const item of chatItems) {
+    for (const item of folderChatItems) {
       const group = groups.get(item.folderKey)
       if (group) {
         group.items.push(item)
@@ -133,7 +161,45 @@ export function ChatSidebar({
           a.order - b.order ||
           a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
       )
-  }, [chatItems])
+  }, [folderChatItems])
+
+  useEffect(() => {
+    setVisibleListCount((current) => {
+      if (current <= CHAT_LIST_PAGE_SIZE) {
+        return CHAT_LIST_PAGE_SIZE
+      }
+      return Math.min(
+        current,
+        Math.max(CHAT_LIST_PAGE_SIZE, listChatItems.length),
+      )
+    })
+  }, [listChatItems.length])
+
+  useEffect(() => {
+    if (
+      activeTab !== "list" ||
+      !hasMoreListItems ||
+      typeof IntersectionObserver === "undefined"
+    ) {
+      return
+    }
+    const node = loadMoreRef.current
+    if (!node) {
+      return
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisibleListCount((current) =>
+            Math.min(current + CHAT_LIST_PAGE_SIZE, listChatItems.length),
+          )
+        }
+      },
+      { rootMargin: "160px 0px" },
+    )
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [activeTab, hasMoreListItems, listChatItems.length])
 
   const renameMutation = useMutation({
     mutationFn: () => {
@@ -164,172 +230,198 @@ export function ChatSidebar({
     },
   })
 
+  const openRenameDialog = (target: ChatResponse) => {
+    setRenameTarget(target)
+    setRenameTitle(target.title)
+  }
+
   return (
     <>
-      <SidebarMenu className="gap-1">
-        {chatGroups.length ? (
-          chatGroups.map((group) => {
-            const groupCollapsed = collapsedFolderKeys.has(group.key)
-            const groupExpanded = expandedFolderKeys.has(group.key)
-            const visibleItems = visibleChatItems(
-              group.items,
-              chatId,
-              groupExpanded,
-            )
-            const hiddenCount = group.items.length - visibleItems.length
-            const canStartInFolder = isConcreteFolderPath(group.path)
+      <div className="grid gap-2">
+        <div
+          aria-label="Chat sidebar view"
+          className="grid grid-cols-2 gap-1 rounded-lg bg-sidebar-accent/45 p-1"
+          role="tablist"
+        >
+          <ChatSidebarTabButton
+            active={activeTab === "list"}
+            label="List"
+            onClick={() => setActiveTab("list")}
+          />
+          <ChatSidebarTabButton
+            active={activeTab === "folders"}
+            label="Folders"
+            onClick={() => setActiveTab("folders")}
+          />
+        </div>
 
-            return (
-              <SidebarMenuItem key={group.key}>
-                <div className="flex min-w-0 items-center gap-1 pr-1">
-                  <button
-                    className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-xs font-medium text-sidebar-foreground/75 outline-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:bg-sidebar-accent"
-                    title={group.path}
-                    type="button"
-                    onClick={() =>
-                      setCollapsedFolderKeys((current) => {
-                        const next = new Set(current)
-                        if (next.has(group.key)) {
-                          next.delete(group.key)
-                        } else {
-                          next.add(group.key)
-                        }
-                        return next
-                      })
+        {activeTab === "list" ? (
+          <SidebarMenu className="gap-0.5">
+            {visibleListItems.length ? (
+              <>
+                {visibleListItems.map(({ chat, dateLabel, folderName }) => (
+                  <ChatSidebarChatRow
+                    active={chat.id === chatId}
+                    chat={chat}
+                    dateLabel={dateLabel}
+                    folderName={folderName}
+                    key={chat.id}
+                    onArchive={setArchiveTarget}
+                    onNavigate={(targetChatId) =>
+                      navigate(`/chat/${targetChatId}`)
                     }
+                    onRename={openRenameDialog}
+                  />
+                ))}
+                {hasMoreListItems ? (
+                  <li
+                    className="px-2 py-3 text-center text-xs text-muted-foreground"
+                    ref={loadMoreRef}
                   >
-                    <Folder className="size-3.5 shrink-0 text-cyan-500" />
-                    <span className="min-w-0 flex-1 truncate">
-                      {group.name}
-                    </span>
-                    <span className="shrink-0 text-[0.68rem] font-normal text-muted-foreground">
-                      {group.items.length}
-                    </span>
-                    <ChevronDown
-                      className={cn(
-                        "size-3 shrink-0 text-muted-foreground transition-transform",
-                        groupCollapsed && "-rotate-90",
-                      )}
-                    />
-                  </button>
-                  {canStartInFolder ? (
-                    <Button
-                      aria-label={`New chat in ${group.name}`}
-                      className="size-7 shrink-0"
-                      size="icon-sm"
-                      title={`New chat in ${group.path}`}
-                      type="button"
-                      variant="ghost"
-                      onClick={() =>
-                        navigate("/", {
-                          state: { workingDirectory: group.path },
-                        })
-                      }
-                    >
-                      <Plus className="size-3.5" />
-                    </Button>
-                  ) : null}
-                </div>
-                {groupCollapsed ? null : (
-                  <SidebarMenu className="gap-0.5 pl-4">
-                    {visibleItems.map(({ chat, dateLabel, folderName }) => (
-                      <SidebarMenuItem
-                        className="flex min-w-0 items-center"
-                        key={chat.id}
-                      >
-                        <SidebarMenuButton
-                          className="h-7 min-w-0 flex-1 px-2 pr-2! text-xs"
-                          isActive={chat.id === chatId}
-                          size="sm"
-                          tooltip={`${chat.title} · ${chatStatusLabel(chat.status)} · ${dateLabel} · ${folderName}`}
-                          onClick={() => navigate(`/chat/${chat.id}`)}
-                        >
-                          <ChatStatusIcon status={chat.status} />
-                          <span className="min-w-0 flex-1 truncate">
-                            {chat.title}
-                          </span>
-                        </SidebarMenuButton>
-                        <DropdownMenu>
-                          <DropdownMenuTrigger
-                            render={
-                              <Button
-                                aria-label="Chat actions"
-                                className="pointer-events-none h-7 w-0 shrink-0 overflow-hidden opacity-0 transition-[width,opacity] group-hover/menu-item:pointer-events-auto group-hover/menu-item:ml-1 group-hover/menu-item:w-7 group-hover/menu-item:opacity-100 group-focus-within/menu-item:pointer-events-auto group-focus-within/menu-item:ml-1 group-focus-within/menu-item:w-7 group-focus-within/menu-item:opacity-100 aria-expanded:pointer-events-auto aria-expanded:ml-1 aria-expanded:w-7 aria-expanded:opacity-100"
-                                size="icon-sm"
-                                variant="ghost"
-                              />
-                            }
-                          >
-                            <MoreHorizontal className="size-4" />
-                            <span className="sr-only">Chat actions</span>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end" className="w-40">
-                            <DropdownMenuItem
-                              onClick={() => {
-                                setRenameTarget(chat)
-                                setRenameTitle(chat.title)
-                              }}
-                            >
-                              <Pencil />
-                              Rename
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              onClick={() => setArchiveTarget(chat)}
-                            >
-                              <Archive />
-                              Archive
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      </SidebarMenuItem>
-                    ))}
-                    {hiddenCount > 0 ? (
-                      <li>
-                        <button
-                          className="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-xs text-muted-foreground outline-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:bg-sidebar-accent"
-                          type="button"
-                          onClick={() =>
-                            setExpandedFolderKeys((current) =>
-                              new Set(current).add(group.key),
-                            )
-                          }
-                        >
-                          <ChevronDown className="size-3.5 shrink-0" />
-                          <span className="min-w-0 truncate">
-                            Show {hiddenCount} more
-                          </span>
-                        </button>
-                      </li>
-                    ) : groupExpanded &&
-                      group.items.length > CHAT_GROUP_VISIBLE_LIMIT ? (
-                      <li>
-                        <button
-                          className="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-xs text-muted-foreground outline-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:bg-sidebar-accent"
-                          type="button"
-                          onClick={() =>
-                            setExpandedFolderKeys((current) => {
-                              const next = new Set(current)
+                    Loading more chats...
+                  </li>
+                ) : null}
+              </>
+            ) : (
+              <div className="px-2 py-3 text-sm text-muted-foreground">
+                No chats yet.
+              </div>
+            )}
+          </SidebarMenu>
+        ) : (
+          <SidebarMenu className="gap-1">
+            {chatGroups.length ? (
+              chatGroups.map((group) => {
+                const groupCollapsed = collapsedFolderKeys.has(group.key)
+                const groupExpanded = expandedFolderKeys.has(group.key)
+                const visibleItems = visibleChatItems(
+                  group.items,
+                  chatId,
+                  groupExpanded,
+                )
+                const hiddenCount = group.items.length - visibleItems.length
+                const canStartInFolder = isConcreteFolderPath(group.path)
+
+                return (
+                  <SidebarMenuItem key={group.key}>
+                    <div className="flex min-w-0 items-center gap-1 pr-1">
+                      <button
+                        className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-xs font-medium text-sidebar-foreground/75 outline-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:bg-sidebar-accent"
+                        title={group.path}
+                        type="button"
+                        onClick={() =>
+                          setCollapsedFolderKeys((current) => {
+                            const next = new Set(current)
+                            if (next.has(group.key)) {
                               next.delete(group.key)
-                              return next
+                            } else {
+                              next.add(group.key)
+                            }
+                            return next
+                          })
+                        }
+                      >
+                        <Folder className="size-3.5 shrink-0 text-cyan-500" />
+                        <span className="min-w-0 flex-1 truncate">
+                          {group.name}
+                        </span>
+                        <span className="shrink-0 text-[0.68rem] font-normal text-muted-foreground">
+                          {group.items.length}
+                        </span>
+                        <ChevronDown
+                          className={cn(
+                            "size-3 shrink-0 text-muted-foreground transition-transform",
+                            groupCollapsed && "-rotate-90",
+                          )}
+                        />
+                      </button>
+                      {canStartInFolder ? (
+                        <Button
+                          aria-label={`New chat in ${group.name}`}
+                          className="size-7 shrink-0"
+                          size="icon-sm"
+                          title={`New chat in ${group.path}`}
+                          type="button"
+                          variant="ghost"
+                          onClick={() =>
+                            navigate("/", {
+                              state: { workingDirectory: group.path },
                             })
                           }
                         >
-                          <ChevronDown className="size-3.5 shrink-0 rotate-180" />
-                          <span className="min-w-0 truncate">Show less</span>
-                        </button>
-                      </li>
-                    ) : null}
-                  </SidebarMenu>
-                )}
-              </SidebarMenuItem>
-            )
-          })
-        ) : (
-          <div className="px-2 py-3 text-sm text-muted-foreground">
-            No chats yet.
-          </div>
+                          <Plus className="size-3.5" />
+                        </Button>
+                      ) : null}
+                    </div>
+                    {groupCollapsed ? null : (
+                      <SidebarMenu className="gap-0.5 pl-4">
+                        {visibleItems.map(
+                          ({ chat, dateLabel, folderName }) => (
+                            <ChatSidebarChatRow
+                              active={chat.id === chatId}
+                              chat={chat}
+                              dateLabel={dateLabel}
+                              folderName={folderName}
+                              key={chat.id}
+                              onArchive={setArchiveTarget}
+                              onNavigate={(targetChatId) =>
+                                navigate(`/chat/${targetChatId}`)
+                              }
+                              onRename={openRenameDialog}
+                            />
+                          ),
+                        )}
+                        {hiddenCount > 0 ? (
+                          <li>
+                            <button
+                              className="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-xs text-muted-foreground outline-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:bg-sidebar-accent"
+                              type="button"
+                              onClick={() =>
+                                setExpandedFolderKeys((current) =>
+                                  new Set(current).add(group.key),
+                                )
+                              }
+                            >
+                              <ChevronDown className="size-3.5 shrink-0" />
+                              <span className="min-w-0 truncate">
+                                Show {hiddenCount} more
+                              </span>
+                            </button>
+                          </li>
+                        ) : groupExpanded &&
+                          group.items.length > CHAT_GROUP_VISIBLE_LIMIT ? (
+                          <li>
+                            <button
+                              className="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-xs text-muted-foreground outline-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:bg-sidebar-accent"
+                              type="button"
+                              onClick={() =>
+                                setExpandedFolderKeys((current) => {
+                                  const next = new Set(current)
+                                  next.delete(group.key)
+                                  return next
+                                })
+                              }
+                            >
+                              <ChevronDown className="size-3.5 shrink-0 rotate-180" />
+                              <span className="min-w-0 truncate">
+                                Show less
+                              </span>
+                            </button>
+                          </li>
+                        ) : null}
+                      </SidebarMenu>
+                    )}
+                  </SidebarMenuItem>
+                )
+              })
+            ) : (
+              <div className="px-2 py-3 text-sm text-muted-foreground">
+                No chats yet.
+              </div>
+            )}
+          </SidebarMenu>
         )}
-      </SidebarMenu>
+      </div>
 
       <Dialog
         open={!!renameTarget}
@@ -406,6 +498,91 @@ export function ChatSidebar({
   )
 }
 
+function ChatSidebarTabButton({
+  active,
+  label,
+  onClick,
+}: {
+  active: boolean
+  label: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      aria-selected={active}
+      className={cn(
+        "h-7 rounded-md px-2 text-xs font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring",
+        active
+          ? "bg-sidebar text-sidebar-foreground shadow-sm"
+          : "text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+      )}
+      role="tab"
+      type="button"
+      onClick={onClick}
+    >
+      {label}
+    </button>
+  )
+}
+
+function ChatSidebarChatRow({
+  active,
+  chat,
+  dateLabel,
+  folderName,
+  onArchive,
+  onNavigate,
+  onRename,
+}: {
+  active: boolean
+  chat: ChatResponse
+  dateLabel: string
+  folderName: string
+  onArchive: (chat: ChatResponse) => void
+  onNavigate: (chatId: string) => void
+  onRename: (chat: ChatResponse) => void
+}) {
+  return (
+    <SidebarMenuItem className="flex min-w-0 items-center">
+      <SidebarMenuButton
+        className="h-7 min-w-0 flex-1 px-2 pr-2! text-xs"
+        isActive={active}
+        size="sm"
+        tooltip={`${chat.title} · ${chatStatusLabel(chat.status)} · ${dateLabel} · ${folderName}`}
+        onClick={() => onNavigate(chat.id)}
+      >
+        <ChatStatusIcon status={chat.status} />
+        <span className="min-w-0 flex-1 truncate">{chat.title}</span>
+      </SidebarMenuButton>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button
+              aria-label="Chat actions"
+              className="pointer-events-none h-7 w-0 shrink-0 overflow-hidden opacity-0 transition-[width,opacity] group-hover/menu-item:pointer-events-auto group-hover/menu-item:ml-1 group-hover/menu-item:w-7 group-hover/menu-item:opacity-100 group-focus-within/menu-item:pointer-events-auto group-focus-within/menu-item:ml-1 group-focus-within/menu-item:w-7 group-focus-within/menu-item:opacity-100 aria-expanded:pointer-events-auto aria-expanded:ml-1 aria-expanded:w-7 aria-expanded:opacity-100"
+              size="icon-sm"
+              variant="ghost"
+            />
+          }
+        >
+          <MoreHorizontal className="size-4" />
+          <span className="sr-only">Chat actions</span>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-40">
+          <DropdownMenuItem onClick={() => onRename(chat)}>
+            <Pencil />
+            Rename
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={() => onArchive(chat)}>
+            <Archive />
+            Archive
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </SidebarMenuItem>
+  )
+}
+
 function ChatStatusIcon({ status }: { status: ChatStatus }) {
   if (status === "RUNNING") {
     return (
@@ -420,6 +597,14 @@ function ChatStatusIcon({ status }: { status: ChatStatus }) {
       aria-label={chatStatusLabel(status)}
       className="size-3.5 shrink-0 text-muted-foreground"
     />
+  )
+}
+
+function compareChatsByCreated(left: ChatResponse, right: ChatResponse) {
+  return (
+    new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() ||
+    left.title.localeCompare(right.title, undefined, { sensitivity: "base" }) ||
+    left.id.localeCompare(right.id)
   )
 }
 

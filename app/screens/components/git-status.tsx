@@ -16,17 +16,12 @@ import {
   Plus,
   RefreshCw,
   Upload,
+  X,
 } from "lucide-react"
+import type { ReactNode } from "react"
 import { useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import {
   Popover,
@@ -55,20 +50,22 @@ import {
 } from "@/screens/components/git-history-panel"
 
 export function GitStatusChip({
+  active = false,
   chatId,
   className,
   compact = false,
   disabled,
+  onToggle,
   session,
 }: {
+  active?: boolean
   chatId: string
   className?: string
   compact?: boolean
   disabled?: boolean
+  onToggle: () => void
   session: WebSession
 }) {
-  const [open, setOpen] = useState(false)
-  const queryClient = useQueryClient()
   const statusQuery = useQuery({
     enabled: !!chatId,
     queryKey: ["git-status", chatId],
@@ -84,73 +81,67 @@ export function GitStatusChip({
   const dirty = status ? !status.clean : false
   const aheadBehind = status ? formatAheadBehind(status) : ""
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <Button
-        aria-label={`Git${label ? `: ${label}` : ""}`}
-        className={cn(
-          compact
-            ? "relative"
-            : "h-7 max-w-56 justify-start gap-1.5 px-2 text-xs",
-          className,
-        )}
-        disabled={statusQuery.isLoading && !status}
-        size={compact ? "icon" : "sm"}
-        title={label}
-        type="button"
-        variant="ghost"
-        onClick={() => setOpen(true)}
-      >
-        <GitBranch className="size-3.5" />
-        {compact && status ? (
+    <Button
+      aria-label={`Git${label ? `: ${label}` : ""}`}
+      aria-pressed={active}
+      className={cn(
+        compact
+          ? "relative"
+          : "h-7 max-w-56 justify-start gap-1.5 px-2 text-xs",
+        active && "text-foreground",
+        className,
+      )}
+      disabled={disabled || (statusQuery.isLoading && !status)}
+      size={compact ? "icon" : "sm"}
+      title={label}
+      type="button"
+      variant="ghost"
+      onClick={onToggle}
+    >
+      <GitBranch className="size-3.5" />
+      {compact && status ? (
+        <span
+          className={cn(
+            "absolute -right-0.5 -top-0.5 size-2 rounded-full ring-2 ring-background",
+            dirty ? "bg-amber-500" : "bg-emerald-500",
+          )}
+        />
+      ) : (
+        <>
+          <span className="min-w-0 truncate">{label}</span>
+          {aheadBehind ? (
+            <span className="shrink-0 text-muted-foreground">
+              {aheadBehind}
+            </span>
+          ) : null}
           <span
             className={cn(
-              "absolute -right-0.5 -top-0.5 size-2 rounded-full ring-2 ring-background",
+              "ml-0.5 size-1.5 shrink-0 rounded-full",
               dirty ? "bg-amber-500" : "bg-emerald-500",
             )}
           />
-        ) : (
-          <>
-            <span className="min-w-0 truncate">{label}</span>
-            {aheadBehind ? (
-              <span className="shrink-0 text-muted-foreground">
-                {aheadBehind}
-              </span>
-            ) : null}
-            <span
-              className={cn(
-                "ml-0.5 size-1.5 shrink-0 rounded-full",
-                dirty ? "bg-amber-500" : "bg-emerald-500",
-              )}
-            />
-          </>
-        )}
-      </Button>
-      {open ? (
-        <GitDialog
-          chatId={chatId}
-          disabled={disabled}
-          queryClient={queryClient}
-          session={session}
-          status={status}
-        />
-      ) : null}
-    </Dialog>
+        </>
+      )}
+    </Button>
   )
 }
 
-function GitDialog({
+export function GitPanel({
   chatId,
+  className,
   disabled,
-  queryClient,
+  onClose,
   session,
   status,
 }: {
   chatId: string
+  className?: string
   disabled?: boolean
-  queryClient: ReturnType<typeof useQueryClient>
+  onClose?: () => void
   session: WebSession
   status?: GitStatusResponse
 }) {
+  const queryClient = useQueryClient()
   const [branchFilter, setBranchFilter] = useState("")
   const [commitMessage, setCommitMessage] = useState("")
   const [newBranchName, setNewBranchName] = useState("")
@@ -158,20 +149,29 @@ function GitDialog({
     null,
   )
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null)
-  const branchesQuery = useQuery({
+  const statusQuery = useQuery({
     enabled: !!chatId,
+    queryKey: ["git-status", chatId],
+    queryFn: () => getGitStatus(session, chatId),
+    refetchInterval: 20_000,
+    retry: false,
+    initialData: status,
+  })
+  const gitQueriesEnabled = !!chatId && statusQuery.data?.isRepo === true
+  const branchesQuery = useQuery({
+    enabled: gitQueriesEnabled,
     queryKey: ["git-branches", chatId],
     queryFn: () => getGitBranches(session, chatId),
     retry: false,
   })
   const diffQuery = useQuery({
-    enabled: !!chatId,
+    enabled: gitQueriesEnabled,
     queryKey: ["git-diff", chatId, selectedFilePath],
     queryFn: () => getGitDiff(session, chatId, selectedFilePath),
     retry: false,
   })
   const historyQuery = useQuery({
-    enabled: !!chatId,
+    enabled: gitQueriesEnabled,
     queryKey: ["git-history", chatId],
     queryFn: () => getGitHistory(session, chatId),
     retry: false,
@@ -190,7 +190,7 @@ function GitDialog({
     },
   })
   const branches = filterGitBranches(branchesQuery.data, branchFilter)
-  const currentStatus = actionMutation.data?.status ?? status
+  const currentStatus = actionMutation.data?.status ?? statusQuery.data
   const changedFiles = useMemo(
     () => currentStatus?.changedFiles ?? [],
     [currentStatus],
@@ -238,100 +238,85 @@ function GitDialog({
     return runGitAction(session, chatId, body)
   }
 
+  const refreshGit = () => {
+    void queryClient.invalidateQueries({
+      queryKey: ["git-status", chatId],
+    })
+    void queryClient.invalidateQueries({
+      queryKey: ["git-branches", chatId],
+    })
+    void queryClient.invalidateQueries({
+      queryKey: ["git-diff", chatId],
+    })
+    void queryClient.invalidateQueries({
+      queryKey: ["git-history", chatId],
+    })
+  }
+
   return (
-    <DialogContent className="flex h-[min(90vh,760px)] w-[min(1180px,calc(100vw-1rem))] max-w-none flex-col overflow-hidden p-0">
-      <DialogHeader className="gap-2 px-4 pb-3 pr-12 pt-4">
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <DialogTitle className="flex min-w-0 items-center gap-2 text-base">
-            <GitCommitHorizontal className="size-4 shrink-0 text-muted-foreground" />
-            <span>Git</span>
-          </DialogTitle>
-          <GitBranchPopover
-            branches={branches}
-            branchFilter={branchFilter}
-            currentBranch={currentStatus?.branch}
-            loading={branchesQuery.isFetching && !branchesQuery.data}
-            locked={locked}
-            newBranchName={newBranchName}
-            onBranchFilterChange={setBranchFilter}
-            onCheckout={(branch) => {
-              if (window.confirm(`Switch to ${branch}?`)) {
-                actionMutation.mutate({ action: "checkout", branch })
-              }
-            }}
-            onCreateBranch={() =>
-              actionMutation.mutate({
-                action: "createBranch",
-                branch: newBranchName.trim(),
-              })
-            }
-            onNewBranchNameChange={setNewBranchName}
-          />
-          <span
-            className={cn(
-              "size-2 shrink-0 rounded-full",
-              currentStatus
-                ? currentStatus.clean
-                  ? "bg-emerald-500"
-                  : "bg-amber-500"
-                : "bg-muted-foreground/40",
-            )}
-          />
-          <span className="min-w-0 truncate text-xs text-muted-foreground">
-            {actionMutation.isPending
-              ? "Running git..."
-              : currentStatus
-                ? formatGitSummary(currentStatus)
-                : "Loading..."}
-          </span>
-          <div className="ml-auto flex min-w-0 items-center gap-1">
-            <Button
-              disabled={locked}
-              size="sm"
-              type="button"
-              variant="outline"
-              onClick={() => {
-                if (window.confirm("Pull with rebase and autostash?")) {
-                  actionMutation.mutate({ action: "pull" })
+    <div
+      className={cn(
+        "flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-background",
+        className,
+      )}
+    >
+      <header className="shrink-0 border-b bg-sidebar/55 px-3 py-2">
+        <div className="flex min-w-0 items-start gap-2">
+          <div className="flex size-8 shrink-0 items-center justify-center rounded-md border bg-background">
+            <GitCommitHorizontal className="size-4 text-muted-foreground" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 items-center gap-2">
+              <div className="truncate text-sm font-semibold">Git</div>
+              <span
+                className={cn(
+                  "size-2 shrink-0 rounded-full",
+                  currentStatus
+                    ? currentStatus.clean
+                      ? "bg-emerald-500"
+                      : "bg-amber-500"
+                    : "bg-muted-foreground/40",
+                )}
+              />
+              <span className="min-w-0 truncate text-xs text-muted-foreground">
+                {actionMutation.isPending
+                  ? "Running git..."
+                  : currentStatus
+                    ? formatGitSummary(currentStatus)
+                    : "Loading..."}
+              </span>
+            </div>
+            <div className="mt-2">
+              <GitBranchPopover
+                branches={branches}
+                branchFilter={branchFilter}
+                currentBranch={currentStatus?.branch}
+                loading={branchesQuery.isFetching && !branchesQuery.data}
+                locked={locked}
+                newBranchName={newBranchName}
+                onBranchFilterChange={setBranchFilter}
+                onCheckout={(branch) => {
+                  if (window.confirm(`Switch to ${branch}?`)) {
+                    actionMutation.mutate({ action: "checkout", branch })
+                  }
+                }}
+                onCreateBranch={() =>
+                  actionMutation.mutate({
+                    action: "createBranch",
+                    branch: newBranchName.trim(),
+                  })
                 }
-              }}
-            >
-              <Download />
-              Pull
-            </Button>
-            <Button
-              disabled={locked}
-              size="sm"
-              type="button"
-              variant="outline"
-              onClick={() => {
-                if (window.confirm("Push this branch?")) {
-                  actionMutation.mutate({ action: "push" })
-                }
-              }}
-            >
-              <Upload />
-              Push
-            </Button>
+                onNewBranchNameChange={setNewBranchName}
+              />
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
             <Button
               size="icon-sm"
               title="Refresh git"
               type="button"
               variant="ghost"
-              onClick={() => {
-                void queryClient.invalidateQueries({
-                  queryKey: ["git-status", chatId],
-                })
-                void queryClient.invalidateQueries({
-                  queryKey: ["git-branches", chatId],
-                })
-                void queryClient.invalidateQueries({
-                  queryKey: ["git-diff", chatId],
-                })
-                void queryClient.invalidateQueries({
-                  queryKey: ["git-history", chatId],
-                })
-              }}
+              onClick={refreshGit}
             >
               <RefreshCw
                 className={cn(
@@ -342,125 +327,201 @@ function GitDialog({
                 )}
               />
             </Button>
-          </div>
-        </div>
-        <DialogDescription className="sr-only">
-          Manage repository changes, branches, commits, pull, push, and history.
-        </DialogDescription>
-      </DialogHeader>
-      <div className="grid min-h-0 flex-1 overflow-y-auto border-t lg:grid-cols-[18rem_minmax(0,1fr)_19rem] lg:overflow-hidden">
-        <section className="grid min-h-[20rem] grid-rows-[auto_minmax(0,1fr)_auto] border-b lg:min-h-0 lg:border-b-0 lg:border-r">
-          <div className="flex items-center justify-between gap-2 border-b px-3 py-2">
-            <div className="flex min-w-0 items-center gap-2">
-              <ListChecks className="size-4 text-muted-foreground" />
-              <div className="truncate text-sm font-medium">Local Changes</div>
-            </div>
-            <span className="text-xs text-muted-foreground">
-              {changedFiles.length}
-            </span>
-          </div>
-          <ScrollArea className="min-h-0">
-            <ChangedFilesList
-              files={changedFiles}
-              loading={!currentStatus}
-              selectedPath={selectedFilePath}
-              onSelect={setSelectedFilePath}
-            />
-          </ScrollArea>
-          <div className="grid gap-2 border-t p-3">
-            <Textarea
-              className="min-h-20 resize-none text-sm"
-              placeholder="Commit message"
-              value={commitMessage}
-              onChange={(event) => setCommitMessage(event.target.value)}
-            />
-            <Button
-              className="justify-center"
-              disabled={locked || !commitMessage.trim() || currentStatus?.clean}
-              type="button"
-              onClick={() => {
-                if (window.confirm("Commit all changed files?")) {
-                  actionMutation.mutate({
-                    action: "commit",
-                    message: commitMessage.trim(),
-                  })
-                }
-              }}
-            >
-              <GitCommitHorizontal />
-              Commit All
-            </Button>
-          </div>
-        </section>
-
-        <section className="grid min-h-[24rem] min-w-0 grid-rows-[auto_minmax(0,1fr)] border-b lg:min-h-0 lg:border-b-0 lg:border-r">
-          <div className="flex min-w-0 items-center gap-2 border-b px-3 py-2">
-            <FileDiff className="size-4 shrink-0 text-muted-foreground" />
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-sm font-medium">Diff Preview</div>
-              <div className="truncate font-mono text-xs text-muted-foreground">
-                {diffTitle}
-              </div>
-            </div>
-            {selectedFilePath ? (
+            {onClose ? (
               <Button
-                size="xs"
+                size="icon-sm"
+                title="Close git panel"
                 type="button"
                 variant="ghost"
-                onClick={() => setSelectedFilePath(null)}
+                onClick={onClose}
               >
-                All
+                <X />
               </Button>
             ) : null}
           </div>
-          <div className="min-h-0 min-w-0 overflow-auto bg-muted/20">
-            <GitDiffViewer
-              diff={diffQuery.data?.diff ?? ""}
-              error={diffQuery.error}
-              fallback={diffQuery.data?.stat ?? ""}
-              loading={diffQuery.isFetching && !diffText}
-            />
-          </div>
-        </section>
+        </div>
+        <div className="mt-2 grid grid-cols-2 gap-1">
+          <Button
+            disabled={locked}
+            size="sm"
+            type="button"
+            variant="outline"
+            onClick={() => {
+              if (window.confirm("Pull with rebase and autostash?")) {
+                actionMutation.mutate({ action: "pull" })
+              }
+            }}
+          >
+            <Download />
+            Pull
+          </Button>
+          <Button
+            disabled={locked}
+            size="sm"
+            type="button"
+            variant="outline"
+            onClick={() => {
+              if (window.confirm("Push this branch?")) {
+                actionMutation.mutate({ action: "push" })
+              }
+            }}
+          >
+            <Upload />
+            Push
+          </Button>
+        </div>
+      </header>
 
-        <section className="grid min-h-[22rem] grid-rows-[auto_minmax(0,1fr)_auto] lg:min-h-0">
-          <div className="flex min-w-0 items-center justify-between gap-2 border-b px-3 py-2">
-            <div className="flex min-w-0 items-center gap-2">
-              <Clock className="size-4 text-muted-foreground" />
-              <div className="truncate text-sm font-medium">History</div>
+      <ScrollArea className="min-h-0 flex-1">
+        <div className="grid gap-2 p-2">
+          <section className="overflow-hidden rounded-lg border bg-card">
+            <PanelSectionHeader
+              count={changedFiles.length}
+              icon={<ListChecks className="size-4 text-muted-foreground" />}
+              title="Local Changes"
+            />
+            <ChangedFilesList
+              files={changedFiles}
+              loading={statusQuery.isFetching && !currentStatus}
+              selectedPath={selectedFilePath}
+              onSelect={setSelectedFilePath}
+            />
+          </section>
+
+          <section className="overflow-hidden rounded-lg border bg-card">
+            <PanelSectionHeader
+              action={
+                selectedFilePath ? (
+                  <Button
+                    size="xs"
+                    type="button"
+                    variant="ghost"
+                    onClick={() => setSelectedFilePath(null)}
+                  >
+                    All
+                  </Button>
+                ) : null
+              }
+              icon={<FileDiff className="size-4 text-muted-foreground" />}
+              subtitle={diffTitle}
+              title="Diff Preview"
+            />
+            <div className="max-h-[42svh] min-h-48 min-w-0 overflow-auto bg-muted/20">
+              <GitDiffViewer
+                diff={diffQuery.data?.diff ?? ""}
+                error={diffQuery.error}
+                fallback={diffQuery.data?.stat ?? ""}
+                loading={diffQuery.isFetching && !diffText}
+              />
             </div>
-            <span className="text-xs text-muted-foreground">
-              {commits.length}
-            </span>
-          </div>
-          <GitHistoryPanel
-            commits={commits}
-            error={historyQuery.error}
-            fetching={historyQuery.isFetching}
-            selectedHash={selectedCommitHash}
-            onSelect={setSelectedCommitHash}
-          />
-          <div className="min-h-20 border-t p-3 text-xs">
-            {selectedCommit ? (
-              <div className="grid gap-1">
-                <div className="line-clamp-2 font-medium">
-                  {selectedCommit.subject}
+          </section>
+
+          <section className="overflow-hidden rounded-lg border bg-card">
+            <PanelSectionHeader
+              icon={
+                <GitCommitHorizontal className="size-4 text-muted-foreground" />
+              }
+              title="Commit"
+            />
+            <div className="grid gap-2 p-2">
+              <Textarea
+                className="min-h-20 resize-none text-sm"
+                placeholder="Commit message"
+                value={commitMessage}
+                onChange={(event) => setCommitMessage(event.target.value)}
+              />
+              <Button
+                className="justify-center"
+                disabled={
+                  locked || !commitMessage.trim() || currentStatus?.clean
+                }
+                type="button"
+                onClick={() => {
+                  if (window.confirm("Commit all changed files?")) {
+                    actionMutation.mutate({
+                      action: "commit",
+                      message: commitMessage.trim(),
+                    })
+                  }
+                }}
+              >
+                <GitCommitHorizontal />
+                Commit All
+              </Button>
+            </div>
+          </section>
+
+          <section className="overflow-hidden rounded-lg border bg-card">
+            <PanelSectionHeader
+              count={commits.length}
+              icon={<Clock className="size-4 text-muted-foreground" />}
+              title="History"
+            />
+            <div className="h-80 min-h-44 overflow-hidden">
+              <GitHistoryPanel
+                commits={commits}
+                error={historyQuery.error}
+                fetching={historyQuery.isFetching}
+                selectedHash={selectedCommitHash}
+                onSelect={setSelectedCommitHash}
+              />
+            </div>
+            <div className="min-h-20 border-t p-3 text-xs">
+              {selectedCommit ? (
+                <div className="grid gap-1">
+                  <div className="line-clamp-2 font-medium">
+                    {selectedCommit.subject}
+                  </div>
+                  <div className="truncate font-mono text-muted-foreground">
+                    {selectedCommit.hash}
+                  </div>
+                  <div className="truncate text-muted-foreground">
+                    {selectedCommit.authorName || "Unknown author"} ·{" "}
+                    {formatGitCommitDate(selectedCommit.authoredAt)}
+                  </div>
                 </div>
-                <div className="truncate font-mono text-muted-foreground">
-                  {selectedCommit.hash}
-                </div>
-                <div className="truncate text-muted-foreground">
-                  {selectedCommit.authorName || "Unknown author"} ·{" "}
-                  {formatGitCommitDate(selectedCommit.authoredAt)}
-                </div>
-              </div>
-            ) : (
-              <div className="text-muted-foreground">No commit selected.</div>
-            )}
-          </div>
-        </section>
+              ) : (
+                <div className="text-muted-foreground">No commit selected.</div>
+              )}
+            </div>
+          </section>
+        </div>
+      </ScrollArea>
+    </div>
+  )
+}
+
+function PanelSectionHeader({
+  action,
+  count,
+  icon,
+  subtitle,
+  title,
+}: {
+  action?: ReactNode
+  count?: number
+  icon: ReactNode
+  subtitle?: string
+  title: string
+}) {
+  return (
+    <div className="flex min-w-0 items-center justify-between gap-2 border-b bg-muted/25 px-3 py-2">
+      <div className="flex min-w-0 items-center gap-2">
+        {icon}
+        <div className="min-w-0">
+          <div className="truncate text-sm font-medium">{title}</div>
+          {subtitle ? (
+            <div className="truncate font-mono text-xs text-muted-foreground">
+              {subtitle}
+            </div>
+          ) : null}
+        </div>
       </div>
-    </DialogContent>
+      {action ??
+        (typeof count === "number" ? (
+          <span className="text-xs text-muted-foreground">{count}</span>
+        ) : null)}
+    </div>
   )
 }
 

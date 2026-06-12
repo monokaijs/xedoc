@@ -15,6 +15,7 @@ export interface ShellContext {
   accountUsageSummaries: Record<string, string>
   activeProjectPath: string
   connectedAccounts: AccountResponse[]
+  gitOpen: boolean
   lastOpenedChat: ChatResponse | null
   openAccountManagement: (options?: { focusCreate?: boolean }) => void
   openWorkspacePicker: (options: {
@@ -24,6 +25,7 @@ export interface ShellContext {
   }) => void
   session: WebSession
   setActiveProjectPath: (path: string) => void
+  setGitOpen: (open: boolean) => void
   setTerminalOpen: (open: boolean) => void
   terminalCount: number
   terminalOpen: boolean
