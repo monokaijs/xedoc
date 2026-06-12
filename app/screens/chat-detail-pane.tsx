@@ -16,6 +16,7 @@ import type {
 } from "@/types"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Loader2 } from "lucide-react"
+import type { PointerEvent as ReactPointerEvent } from "react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Navigate, useParams } from "react-router"
 import { toast } from "sonner"
@@ -108,6 +109,26 @@ function reviseLatestPlanPrompt(feedback: string) {
   ].join("\n")
 }
 
+const DEFAULT_GIT_PANEL_WIDTH = 360
+const MIN_GIT_PANEL_WIDTH = 288
+const MAX_GIT_PANEL_WIDTH = 720
+const MAX_GIT_PANEL_VIEWPORT_RATIO = 0.55
+
+function clampGitPanelWidth(width: number): number {
+  const viewportMax =
+    typeof window === "undefined"
+      ? MAX_GIT_PANEL_WIDTH
+      : Math.max(
+          MIN_GIT_PANEL_WIDTH,
+          Math.min(
+            MAX_GIT_PANEL_WIDTH,
+            Math.round(window.innerWidth * MAX_GIT_PANEL_VIEWPORT_RATIO),
+          ),
+        )
+
+  return Math.min(viewportMax, Math.max(MIN_GIT_PANEL_WIDTH, width))
+}
+
 export function ChatDetailPane() {
   const { chatId } = useParams()
   const {
@@ -131,10 +152,12 @@ export function ChatDetailPane() {
   const [olderMessagesPending, setOlderMessagesPending] = useState(false)
   const [contextWindowUsage, setContextWindowUsage] =
     useState<ContextWindowUsagePayload | null>(null)
+  const [gitPanelWidth, setGitPanelWidth] = useState(DEFAULT_GIT_PANEL_WIDTH)
   const scrollViewportRef = useRef<HTMLDivElement | null>(null)
   const imageInputRef = useRef<HTMLInputElement | null>(null)
   const stickToBottomRef = useRef(true)
   const isMobile = useIsMobile()
+  const gitPanelWidthRef = useRef(DEFAULT_GIT_PANEL_WIDTH)
   const notifiedRunIdsRef = useRef(new Set<string>())
   const notifiedRequestIdsRef = useRef(new Set<string>())
   const queryClient = useQueryClient()
@@ -150,6 +173,52 @@ export function ChatDetailPane() {
     notifiedRunIdsRef.current.clear()
     notifiedRequestIdsRef.current.clear()
   }, [chatId])
+
+  useEffect(() => {
+    gitPanelWidthRef.current = gitPanelWidth
+  }, [gitPanelWidth])
+
+  useEffect(() => {
+    const handleResize = () => {
+      setGitPanelWidth((current) => {
+        const nextWidth = clampGitPanelWidth(current)
+        gitPanelWidthRef.current = nextWidth
+        return nextWidth
+      })
+    }
+    window.addEventListener("resize", handleResize)
+    return () => window.removeEventListener("resize", handleResize)
+  }, [])
+
+  const startGitPanelResize = useCallback(
+    (event: ReactPointerEvent<HTMLButtonElement>) => {
+      event.preventDefault()
+      event.currentTarget.setPointerCapture(event.pointerId)
+      const startX = event.clientX
+      const startWidth = gitPanelWidth
+      const previousCursor = document.body.style.cursor
+      const previousUserSelect = document.body.style.userSelect
+      document.body.style.cursor = "col-resize"
+      document.body.style.userSelect = "none"
+
+      const handlePointerMove = (moveEvent: PointerEvent) => {
+        const nextWidth = clampGitPanelWidth(
+          startWidth + startX - moveEvent.clientX,
+        )
+        gitPanelWidthRef.current = nextWidth
+        setGitPanelWidth(nextWidth)
+      }
+      const stopResize = () => {
+        document.body.style.cursor = previousCursor
+        document.body.style.userSelect = previousUserSelect
+        document.removeEventListener("pointermove", handlePointerMove)
+        document.removeEventListener("pointerup", stopResize)
+      }
+      document.addEventListener("pointermove", handlePointerMove)
+      document.addEventListener("pointerup", stopResize)
+    },
+    [gitPanelWidth],
+  )
 
   const chatQuery = useQuery({
     enabled: !!chatId,
@@ -1119,9 +1188,21 @@ export function ChatDetailPane() {
           </div>
         </div>
         {chat && gitOpen ? (
-          <aside className="hidden min-h-0 w-[min(42rem,42vw)] min-w-80 shrink-0 border-l bg-background md:flex">
+          <aside
+            className="relative hidden min-h-0 shrink-0 border-l bg-background md:flex"
+            style={{ width: gitPanelWidth }}
+          >
+            <button
+              aria-label="Resize git panel"
+              className="group absolute inset-y-0 left-0 z-20 flex w-3 -translate-x-1/2 cursor-col-resize items-center justify-center"
+              type="button"
+              onPointerDown={startGitPanelResize}
+            >
+              <span className="h-12 w-0.5 rounded-full bg-border transition-colors group-hover:bg-muted-foreground/70" />
+            </button>
             <GitPanel
               chatId={chat.id}
+              className="w-full"
               disabled={isRunning}
               session={session}
               onClose={() => setGitOpen(false)}
