@@ -503,7 +503,7 @@ export async function listMessages(
   await syncThreadFromAccountBestEffort(threadId, chat.accountId)
   const afterSequence = Math.max(options.afterSequence ?? 0, 0)
   const beforeSequence = Math.max(options.beforeSequence ?? 0, 0)
-  const safeLimit = Math.min(Math.max(options.limit ?? 50, 1), 200)
+  const safeLimit = Math.min(Math.max(options.limit ?? 1000, 1), 1000)
   const sourceMessages = await readCodexTranscriptMessages(threadId)
   const sourceResponses = sourceMessages.map((source, index) =>
     sourceTranscriptResponse(threadId, chat, source, index, index + 1),
@@ -1333,9 +1333,86 @@ function overlayMessagesForList(
     return []
   }
   if (!sourceMessages.length) {
-    return state.messages
+    return collapseDuplicateOverlayMessages(state.messages)
   }
-  return state.messages.filter((message) => keepOverlayMessage(message, sourceMessages))
+  return collapseDuplicateOverlayMessages(
+    state.messages.filter((message) => keepOverlayMessage(message, sourceMessages)),
+  )
+}
+
+function collapseDuplicateOverlayMessages(
+  messages: ChatMessageResponse[],
+): ChatMessageResponse[] {
+  const collapsed: ChatMessageResponse[] = []
+  const indexByKey = new Map<string, number>()
+
+  for (const message of messages) {
+    const key = duplicateOverlayKey(message)
+    if (!key) {
+      collapsed.push(message)
+      continue
+    }
+
+    const existingIndex = indexByKey.get(key)
+    if (existingIndex === undefined) {
+      indexByKey.set(key, collapsed.length)
+      collapsed.push(message)
+      continue
+    }
+
+    collapsed[existingIndex] = chooseOverlayDuplicate(
+      collapsed[existingIndex],
+      message,
+    )
+  }
+
+  return collapsed
+}
+
+function duplicateOverlayKey(message: ChatMessageResponse): string | null {
+  if (message.role !== "ASSISTANT" || message.kind !== "CHAT") {
+    return null
+  }
+  const content = normalizedComparableContent(message.content)
+  if (!content) {
+    return null
+  }
+  return [
+    message.chatId,
+    message.runId ?? message.turnId ?? "unknown-run",
+    message.role,
+    message.kind,
+    content,
+  ].join(":")
+}
+
+function chooseOverlayDuplicate(
+  existing: ChatMessageResponse,
+  next: ChatMessageResponse,
+): ChatMessageResponse {
+  const statusDelta =
+    messageStatusPriority(next.status) - messageStatusPriority(existing.status)
+  if (statusDelta > 0) {
+    return next
+  }
+  if (statusDelta < 0) {
+    return existing
+  }
+  return next.sequence >= existing.sequence ? next : existing
+}
+
+function messageStatusPriority(status: ChatMessageResponse["status"]): number {
+  switch (status) {
+    case "FAILED":
+      return 4
+    case "COMPLETED":
+      return 3
+    case "STREAMING":
+      return 2
+    case "PENDING":
+    default:
+      return 1
+  }
 }
 
 function keepOverlayMessage(

@@ -34,6 +34,9 @@ import type {
   GitDiffResponse,
   GitHistoryResponse,
   GitStatusResponse,
+  ServerUpdateRequest,
+  ServerUpdateResponse,
+  ServerUpdateStatusResponse,
   WorkspaceDirectoryResponse,
   WorkspaceFileResponse,
 } from "@/types"
@@ -290,6 +293,27 @@ export async function readCodexAccountRateLimits(
   )
 }
 
+export async function getServerUpdateStatus(
+  session: ApiSession,
+): Promise<ServerUpdateStatusResponse> {
+  return fetchJson<ServerUpdateStatusResponse>(
+    session.serverUrl,
+    "/api/server/update",
+    { token: session.token },
+  )
+}
+
+export async function updateServerPackage(
+  session: ApiSession,
+  body: ServerUpdateRequest,
+): Promise<ServerUpdateResponse> {
+  return fetchJson<ServerUpdateResponse>(
+    session.serverUrl,
+    "/api/server/update",
+    { body, token: session.token },
+  )
+}
+
 export async function completeAccountLogin(
   session: ApiSession,
   accountId: string,
@@ -388,7 +412,7 @@ export async function getChatMessages(
   const normalized =
     typeof options === "number" ? { afterSequence: options } : options
   const query = new URLSearchParams()
-  query.set("limit", String(normalized.limit ?? 200))
+  query.set("limit", String(normalized.limit ?? 1000))
   if (normalized.afterSequence) {
     query.set("afterSequence", String(normalized.afterSequence))
   }

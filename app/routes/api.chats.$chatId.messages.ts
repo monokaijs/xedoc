@@ -33,7 +33,7 @@ export async function loader({ request, params }: RouteArgs) {
         {
           afterSequence: readNumberQuery(url, "afterSequence", 0),
           beforeSequence: readNumberQuery(url, "beforeSequence", 0),
-          limit: readNumberQuery(url, "limit", 50),
+          limit: readNumberQuery(url, "limit", 1000),
         },
       ),
     )

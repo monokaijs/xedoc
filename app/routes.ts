@@ -64,5 +64,6 @@ export default [
     "api/chats/:chatId/server-requests/:requestId/respond",
     "routes/api.chats.$chatId.server-requests.$requestId.respond.ts",
   ),
+  route("api/server/update", "routes/api.server.update.ts"),
   route("api/workspaces/directories", "routes/api.workspaces.directories.ts"),
 ] satisfies RouteConfig

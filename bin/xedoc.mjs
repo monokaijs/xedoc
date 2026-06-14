@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { createRequire } from "node:module"
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..")
+const SERVER_RESTART_EXIT_CODE = 42
 const require = createRequire(import.meta.url)
 const packageJson = JSON.parse(
   await readFile(join(packageRoot, "package.json"), "utf8"),
@@ -51,7 +52,10 @@ console.log(`History store: ${runtime.historyHome}`)
 console.log(`External Codex sync: ${runtime.sharedChatHome}`)
 console.log("Press Ctrl+C to stop.")
 
-await runServer(runtime.env)
+const serverResult = await runServer(runtime.env)
+if (serverResult.restartRequested) {
+  restartSelf(process.argv.slice(2), runtime.env)
+}
 
 function parseArgs(argv) {
   const parsed = {}
@@ -664,14 +668,19 @@ async function runPrisma(args, env) {
 }
 
 async function runServer(env) {
-  await run(process.execPath, [
+  const result = await run(process.execPath, [
     join(packageRoot, "server/index.mjs"),
     ...(isDebugEnabled(env.XEDOC_DEBUG) ? ["--debug"] : []),
   ], {
     cwd: packageRoot,
     env,
     stdio: "inherit",
+  }, {
+    allowedExitCodes: [SERVER_RESTART_EXIT_CODE],
   })
+  return {
+    restartRequested: result.code === SERVER_RESTART_EXIT_CODE,
+  }
 }
 
 async function setupSqliteDatabase(env) {
@@ -699,7 +708,7 @@ async function setupSqliteDatabase(env) {
   }
 }
 
-function run(command, args, options) {
+function run(command, args, options, runOptions = {}) {
   return new Promise((resolveRun, rejectRun) => {
     const child = spawn(command, args, options)
     const forwardSigint = () => child.kill("SIGINT")
@@ -709,14 +718,47 @@ function run(command, args, options) {
     child.on("exit", (code, signal) => {
       process.removeListener("SIGINT", forwardSigint)
       process.removeListener("SIGTERM", forwardSigterm)
-      if (code === 0 || signal) {
-        resolveRun()
+      if (
+        code === 0 ||
+        signal ||
+        (typeof code === "number" &&
+          runOptions.allowedExitCodes?.includes(code))
+      ) {
+        resolveRun({ code, signal })
       } else {
         rejectRun(new Error(`${command} exited with code ${code}`))
       }
     })
     child.on("error", rejectRun)
   })
+}
+
+function restartSelf(argv, env) {
+  const restart = restartCommand(argv)
+  console.log("xedoc: restarting after update...")
+  const child = spawn(restart.command, restart.args, {
+    cwd: packageRoot,
+    detached: true,
+    env,
+    stdio: "ignore",
+  })
+  child.on("error", (error) => {
+    console.error(`xedoc: restart failed: ${error.message}`)
+  })
+  child.unref()
+}
+
+function restartCommand(argv) {
+  if (/[\\/]_npx[\\/]/u.test(packageRoot)) {
+    return {
+      command: process.platform === "win32" ? "npx.cmd" : "npx",
+      args: ["-y", `${packageJson.name}@latest`, ...argv],
+    }
+  }
+  return {
+    command: process.execPath,
+    args: [join(packageRoot, "bin", "xedoc.mjs"), ...argv],
+  }
 }
 
 function resolveHomePath(path) {
